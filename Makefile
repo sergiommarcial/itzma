@@ -7,13 +7,23 @@ RUST_MIN := $(shell sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
 # Where compose.yaml publishes its MinIO container.
 S3_ENDPOINT := http://127.0.0.1:9000
 
+# The Python package and its virtualenv (uv).
+PY_DIR := py-itzma
+PY_VENV_PYTHON := $(CURDIR)/$(PY_DIR)/.venv/bin/python
+# The itzma-python test binary links libpython; the loader has to find it.
+PY_LIBDIR = $(shell $(PY_VENV_PYTHON) -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')
+# PyO3 detects the interpreter again only when PYO3_PYTHON changes. The venv
+# path never does, so a cached target/ can keep a libpython directory from
+# another Python. The real path carries the version, and a new one rebuilds.
+PY_BASE_PYTHON = $(shell $(PY_VENV_PYTHON) -c 'import os, sys; print(os.path.realpath(sys.executable))')
 
-.PHONY: help check-tools check-cargo check-cargo-deny check-cargo-machete check-docker \
+.PHONY: help check-tools check-cargo check-cargo-deny check-cargo-machete check-docker check-uv \
 	install install-tools \
 	build build-release \
 	test test-fast test-msrv test-s3 s3-up s3-down bench \
 	lint fmt-check clippy doc deny machete \
 	format doc-open \
+	py-env py-dev py-rust py-rust-one py-lint py-test py \
 	ci clean
 
 ##@ General
@@ -48,6 +58,10 @@ check-docker: ## Verify docker and docker compose are installed and the daemon i
 	@docker compose version >/dev/null 2>&1 || { echo "docker compose not found"; exit 1; }
 	@docker info >/dev/null 2>&1 || { echo "docker daemon is not running"; exit 1; }
 	@echo "docker: OK ($$(docker --version))"
+
+check-uv: ## Verify uv is installed (the Python targets use it)
+	@command -v uv >/dev/null 2>&1 || { echo "uv not found — install: https://docs.astral.sh/uv/"; exit 1; }
+	@echo "uv: OK ($$(uv --version))"
 
 ##@ Setup
 
@@ -118,9 +132,36 @@ format: check-cargo ## Reformat the code with rustfmt, writing changes
 doc-open: check-cargo ## Build rustdoc and open it in the browser
 	cargo doc --locked --no-deps -p itzma-core --open
 
+##@ Python bridge
+
+py-env: check-uv ## Create py-itzma/.venv with the dev dependencies
+	cd $(PY_DIR) && uv sync --locked --no-install-project
+
+py-dev: py-env ## Build the extension and install it into py-itzma/.venv (maturin develop)
+	cd $(PY_DIR) && uv run --no-sync maturin develop --uv
+
+py-rust: py-env ## Test and lint the itzma-python crate against the venv's interpreter
+	PYO3_PYTHON=$(PY_BASE_PYTHON) LD_LIBRARY_PATH=$(PY_LIBDIR) DYLD_LIBRARY_PATH=$(PY_LIBDIR) \
+		cargo test --locked -p itzma-python
+	PYO3_PYTHON=$(PY_BASE_PYTHON) cargo clippy --locked -p itzma-python --all-targets -- -D warnings
+
+py-rust-one: py-env ## Run some itzma-python tests: make py-rust-one TESTS=<filter>
+	PYO3_PYTHON=$(PY_BASE_PYTHON) LD_LIBRARY_PATH=$(PY_LIBDIR) DYLD_LIBRARY_PATH=$(PY_LIBDIR) \
+		cargo test --locked -p itzma-python $(TESTS)
+
+py-lint: py-dev ## ruff, mypy --strict and stubtest on the Python package
+	cd $(PY_DIR) && uv run --no-sync ruff check . && uv run --no-sync ruff format --check .
+	cd $(PY_DIR) && uv run --no-sync mypy
+	cd $(PY_DIR) && uv run --no-sync python -m mypy.stubtest itzma._itzma --allowlist stubtest-allowlist.txt
+
+py-test: py-dev ## Run the Python tests (MinIO too when ITZMA_TEST_S3_ENDPOINT is set)
+	cd $(PY_DIR) && uv run --no-sync pytest
+
+py: py-rust py-lint py-test ## Everything CI's python job runs
+
 ##@ CI
 
-ci: lint test ## Run what .github/workflows/ci.yml runs on stable, without docker (test-s3 and test-msrv cover the other two test jobs)
+ci: lint test py ## Run what .github/workflows/ci.yml runs on stable, without docker (test-s3 and test-msrv cover the other two test jobs)
 
 ##@ Cleanup
 

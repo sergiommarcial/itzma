@@ -1,0 +1,52 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "itzma"
+version = "0.1.0"
+description = "Vector retrieval on object storage, embedded in a Python service"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.22"]
+
+[project.optional-dependencies]
+pyarrow = ["pyarrow>=14"]
+polars = ["polars>=1.4"]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.9,<2",
+    "mypy>=1.11",
+    "polars>=1.4",
+    "pyarrow>=14",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
+[tool.maturin]
+manifest-path = "../crates/itzma-python/Cargo.toml"
+module-name = "itzma._itzma"
+python-source = "src"
+features = ["extension-module"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["tests"]
+
+[tool.mypy]
+strict = true
+files = ["src/itzma"]
+
+[[tool.mypy.overrides]]
+module = ["pyarrow.*", "polars.*"]
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

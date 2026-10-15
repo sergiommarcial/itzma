@@ -91,3 +91,32 @@ jobs:
         with:
           tool: cargo-machete
       - run: cargo machete
+
+  python:
+    name: python (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # One cache per Python: target/ holds PyO3's view of the interpreter.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python-${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: start MinIO and create the bucket
+        run: docker compose up -d --wait
+      - name: bridge crate tests, lint, Python tests (memory, file, MinIO)
+        run: make py
+        env:
+          ITZMA_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      - name: MinIO logs
+        if: failure()
+        run: docker compose logs minio

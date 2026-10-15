@@ -1,6 +1,6 @@
 # Itzma
 
-Itzma is vector retrieval on top of object storage, written in Rust. Vectors are stored as plain objects in a bucket. There is no server between the caller and the data: any process that can reach the bucket can write, and any process can query. Correctness rests on two things the object store already does, put-if-absent and conditional update.
+Itzma is vector retrieval on top of object storage, written in Rust, with Python bindings. Vectors are stored as plain objects in a bucket. There is no server between the caller and the data: any process that can reach the bucket can write, and any process can query. Correctness rests on two things the object store already does, put-if-absent and conditional update.
 
 It is a library. You embed it in your process, open a namespace, and S3 (or a local directory, or memory) holds the data.
 
@@ -30,6 +30,7 @@ It is a library. You embed it in your process, open a namespace, and S3 (or a lo
 - S3 (and anything else `object_store` supports), local disk and in-memory stores.
 - Compaction, garbage collection and manifest recovery.
 - A RAM and NVMe read cache and a cache of decoded structures.
+- Rust and Python APIs; NumPy and Arrow input in Python.
 - A read-only health report and a byte budget on every read.
 
 ## Quick start
@@ -90,6 +91,26 @@ async fn main() -> itzma_core::Result<()> {
 }
 ```
 
+The same in Python (build it with `make py-dev`, see [py-itzma/README.md](py-itzma/README.md)):
+
+```python
+import itzma
+from itzma import attr
+
+store = itzma.Store("memory://")  # or "file:///var/lib/itzma", "s3://bucket/prefix"
+schema = itzma.Schema(dim=3, metric=itzma.Metric.COSINE, attrs={"year": itzma.AttrType.NUMBER})
+ns = itzma.Namespace.create(store, "articles", schema)
+
+ns.upsert([
+    {"id": "intro", "vector": [0.9, 0.1, 0.0], "attrs": {"year": 2024}},
+    {"id": "faq", "vector": [0.0, 1.0, 0.2], "attrs": {"year": 2021}},
+])
+hits = ns.query([1.0, 0.0, 0.0], top_k=2, filter=attr("year") >= 2022)
+print(hits.ids, hits.distances)
+```
+
+Writes also take NumPy arrays (`ids=`, `vectors=`, `attrs=`) and Arrow, Polars or DuckDB tables.
+
 ## Concepts
 
 **Namespace.** A collection of documents that share a schema. On storage it is a key prefix, `<id>/`. Ids match `[a-z0-9_-]{1,64}`. A namespace is created explicitly with `Namespace::create`, since its dimension and metric must be declared first.
@@ -141,7 +162,7 @@ A filter on `query_with` is applied after shadowing, and a source short of match
 
 ## Indexing
 
-`Namespace::index(&IndexOptions)` builds an SQ8 index for each live segment with at least `min_rows` rows (default 4,096) that has none yet, and publishes it in the manifest. Neither `compact` nor `maintain` builds indexes, so schedule `index` after them.
+`Namespace::index(&IndexOptions)` builds an SQ8 index for each live segment with at least `min_rows` rows (default 4,096) that has none yet, and publishes it in the manifest. Neither `compact` nor `maintain` builds indexes, so schedule `index` after them (the Python maintainer can run it for you).
 
 SQ8 stores each vector as one byte per dimension. Segments of 100,000 rows or more are clustered into about `sqrt(rows)` partitions (`IndexOptions::nlist` overrides), and a query reads about `2 * sqrt(nlist)` of them by default. On SIFT1M and GloVe-25 the defaults gave recall@10 of 0.99 or more. `rebuild: true` builds again over existing indexes. An index needs `segment_format` 2 or above.
 
@@ -151,7 +172,7 @@ SQ8 stores each vector as one byte per dimension. Segments of 100,000 rows or mo
 
 **`gc`** deletes segments that a merge or a later fold replaced, once they and their replacement are at least `min_age` old (default 24 hours), so readers still holding an old manifest have time to finish. With `fence_wal: true` it also replaces folded WAL objects with 8-byte fences, which keep put-if-absent working at their keys. WAL objects are never deleted. `dry_run` reports what it would do.
 
-**`maintain`** is the one call to schedule (from cron, a loop, a worker): it compacts when the tail is long enough (64 objects, 64 MiB, or an optional age) or there are too many segments, then runs `gc`. The library starts no background task itself.
+**`maintain`** is the one call to schedule (from cron, a loop, a worker): it compacts when the tail is long enough (64 objects, 64 MiB, or an optional age) or there are too many segments, then runs `gc`. The library starts no background task itself; the Python bridge has an optional maintainer.
 
 **`recover`** writes a new manifest for a namespace that lost its own, from `schema.json`, the segment names and the WAL. It refuses if a manifest exists, and stops with `Unrecoverable` and the keys to restore if a range has no readable copy. It does not restore indexes; run `index` again.
 
@@ -261,6 +282,7 @@ make test             # unit, integration and doctests, each benchmark once
 make test-fast TESTS="query filter"   # library unit tests plus the named files
 make test-s3          # the tests against MinIO (needs docker)
 make lint             # fmt, clippy, rustdoc, cargo-deny, cargo-machete
+make py               # the Python bridge's checks (needs uv)
 make ci               # what CI runs on stable
 make bench            # timings, in-memory store
 ```
