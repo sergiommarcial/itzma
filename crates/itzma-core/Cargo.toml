@@ -6,3 +6,35 @@ rust-version.workspace = true
 description = "Object-storage-backed vector retrieval engine core"
 publish = false
 
+[dependencies]
+# Needed to implement `ObjectStore` for `CacheStore` (cache.rs) and the
+# fault-injecting test store.
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+# The RAM tier of the tiered read cache (cache.rs). Bounds by entry
+# count, not bytes, so CacheStore tracks used bytes itself. At least 0.18.2,
+# which fixes RUSTSEC-2026-0002 and RUSTSEC-2026-0253.
+lru = "0.18.2"
+object_store = "0.14"
+# The compute pools (cpu.rs): CPU work runs off the tokio workers.
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The streaming ingest's channel (stream.rs). Already in the tree through
+# object_store; only the sync primitives are used.
+tokio = { version = "1", default-features = false, features = ["sync"] }
+thiserror = "2"
+# C-backed ZSTD for WAL objects. Default features are legacy-format
+# support and dictionary training, neither of which is used.
+zstd = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+# `aws` is only for the S3 test backend in tests/common; the library itself
+# takes any ObjectStore and does not depend on it.
+object_store = { version = "0.14", features = ["aws"] }
+# For cache.rs's tests, which build an ObjectMeta by hand.
+chrono = "0.4"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+

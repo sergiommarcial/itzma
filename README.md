@@ -1,6 +1,251 @@
 # Itzma
 
-Itzma is vector retrieval on top of object storage, written in Rust, with Python bindings. Vectors are stored as plain objects in a bucket. There is no server between the caller and the data: any process that can reach the bucket can write, and any process can query. Correctness rests on two things the object store already does, put-if-absent and conditional update.
+Itzma is vector retrieval on top of object storage, written in Rust. Vectors are stored as plain objects in a bucket. There is no server between the caller and the data: any process that can reach the bucket can write, and any process can query. Correctness rests on two things the object store already does, put-if-absent and conditional update.
+
+It is a library. You embed it in your process, open a namespace, and S3 (or a local directory, or memory) holds the data.
+
+- [What it does](#what-it-does)
+- [Quick start](#quick-start)
+- [Concepts](#concepts)
+- [Writing](#writing)
+- [Querying](#querying)
+- [Filtering](#filtering)
+- [Indexing](#indexing)
+- [Compaction, garbage collection and maintenance](#compaction-garbage-collection-and-maintenance)
+- [Caching and read budgets](#caching-and-read-budgets)
+- [Looking inside a namespace](#looking-inside-a-namespace)
+- [Guarantees](#guarantees)
+- [Storage layout and formats](#storage-layout-and-formats)
+- [Errors](#errors)
+- [Storage backends](#storage-backends)
+- [Limits](#limits)
+- [Develop](#develop)
+
+## What it does
+
+- Namespaces with a fixed dimension and metric (L2, cosine, dot product).
+- Dense vector search, exact or through an SQ8 index with clustered partitions.
+- Typed attributes, declared at create, and filtering on them, alone or narrowing a vector query.
+- Batched upserts and deletes, safe with many concurrent writers, with optional idempotency keys.
+- S3 (and anything else `object_store` supports), local disk and in-memory stores.
+- Compaction, garbage collection and manifest recovery.
+- A RAM and NVMe read cache and a cache of decoded structures.
+- A read-only health report and a byte budget on every read.
+
+## Quick start
+
+`itzma-core` is not published, so depend on it by path. This example uses the in-memory store.
+
+```toml
+[dependencies]
+itzma-core = { path = "crates/itzma-core" }
+object_store = "0.14"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde_json = "1"
+```
+
+```rust
+use std::sync::Arc;
+
+use itzma_core::{AttrSchema, AttrType, Document, Metric, Namespace, Schema};
+use object_store::memory::InMemory;
+
+#[tokio::main]
+async fn main() -> itzma_core::Result<()> {
+    let store = Arc::new(InMemory::new());
+
+    // Dimension, metric and the type of every attribute are fixed for the life
+    // of the namespace.
+    let schema = Schema::new(3, Metric::Cosine)
+        .with_attrs(AttrSchema::new().field("title", AttrType::Text));
+    let ns = Namespace::create(store.clone(), "articles", schema).await?;
+
+    // One call is one atomic write. It returns the sequence number.
+    let seq = ns
+        .upsert(vec![
+            Document {
+                id: "intro".into(),
+                vector: vec![0.9, 0.1, 0.0],
+                attrs: Some(serde_json::json!({ "title": "Introduction" })),
+            },
+            Document {
+                id: "faq".into(),
+                vector: vec![0.0, 1.0, 0.2],
+                attrs: None,
+            },
+        ])
+        .await?;
+    assert_eq!(seq, 1);
+
+    // Closest first. Lower distance means closer, for every metric.
+    let hits = ns.query(&[1.0, 0.0, 0.0], 2).await?;
+    assert_eq!(hits[0].id, "intro");
+
+    ns.delete(vec!["faq".into()]).await?;
+
+    // Another handle, possibly in another process, sees the same data.
+    let other = Namespace::open(store, "articles").await?;
+    assert_eq!(other.query(&[0.0, 1.0, 0.0], 5).await?.len(), 1);
+    Ok(())
+}
+```
+
+## Concepts
+
+**Namespace.** A collection of documents that share a schema. On storage it is a key prefix, `<id>/`. Ids match `[a-z0-9_-]{1,64}`. A namespace is created explicitly with `Namespace::create`, since its dimension and metric must be declared first.
+
+**Document.** An `id` (any string of 1 to 512 bytes), a `vector` and optional `attrs`, a JSON object whose fields the schema declares. Upserting an existing id replaces the whole document.
+
+**Schema.** `{ dim, metric, attrs }`. Every vector written or queried must have exactly `dim` finite components; under cosine an all-zero vector is refused too. The schema lives in the manifest and again in `schema.json`, which is written once and never changed, so losing the manifest does not lose it.
+
+**WAL entry.** One `upsert` or `delete` call becomes one entry in the write-ahead log, committed as a whole. Entries are numbered 1, 2, 3, and so on.
+
+**Manifest.** The one object that is ever overwritten. It holds the schema, the live segments, how far the WAL has been folded into them, and which segments have an index.
+
+**Segment.** An immutable object holding the live documents and deletions of a range of WAL entries, named by that range. A query reads the segments plus the WAL entries not folded yet (the tail).
+
+**Handle.** A `Namespace` value holds the store, the id, the schema and a few hints. It holds no lock, so any number of handles, in one process or many, can work on one namespace.
+
+## Writing
+
+`upsert(docs)` and `delete(ids)` validate everything first, so one bad document refuses the whole call with nothing written. Then the batch is written as one object with put-if-absent at the next sequence number. If another writer took that number, the writer looks past it and tries again, up to 32 times (`WriteContention`). There is no coordinator, lock or leader.
+
+A batch is one object and is refused above 64 MiB uncompressed (`BatchTooLarge`). Split bigger loads into several batches; each is atomic, the whole is not.
+
+A write that fails after the request was sent may or may not have landed. A plain retry can append it twice, which is harmless for the end state of upserts and deletes but can overwrite a newer write to the same id. For loads that must land once, use the keyed forms, `upsert_keyed` and `delete_keyed`, with a `WriteKey`: `WriteKey::new(key)` on the first attempt, `WriteKey::retry(key, from)` on a retry, which looks for the key from sequence `from` on and returns the original's sequence number if it finds it.
+
+## Querying
+
+`query(vector, top_k)` returns up to `top_k` hits, closest first, each with its id, distance and attributes. `query_with` takes `QueryOptions`:
+
+- `rerank` (default `Some(4)`): an index proposes `rerank * top_k` candidates, which are then rescored against their exact vectors. `None` proposes every row.
+- `nprobe` (default `None`, chosen from the index): how many SQ8 partitions to read.
+- `exact` (default `false`): skip indexes and scan every live document.
+- `filter`: a `Predicate` the hits must match.
+
+Each segment with an index proposes candidates through it; segments without one and the WAL tail are scanned. A candidate that a newer segment or the tail overwrote or deleted is dropped, the survivors are reranked on exact vectors, and the closest `top_k` across all sources win. The answer never carries an approximate distance.
+
+Distances: L2 is squared Euclidean, cosine is `1 - cos`, dot product is negated, so lower is closer for all three. Distances are comparable only within one query.
+
+## Filtering
+
+Attribute fields are declared at create, each with a type: `Bool`, `Number`, `Text`, `TextSet` or `NumberSet`. Writes are checked against the schema: an undeclared field is `UnknownAttr`, a wrong type `AttrTypeMismatch`. `null` is allowed for any field.
+
+`Predicate` is a typed tree: `And`, `Or`, `Not`, null and boolean tests, number comparisons, `In` lists and ranges, text comparisons, and set tests (`Contains`, `ContainsAny`, `ContainsAll`, `IsEmpty`). A comparison against a null or missing field is false, and `Not` flips it.
+
+`Namespace::filter(&predicate, &FilterOptions)` returns matching rows in id order, a page at a time (`limit` 1 to 10,000, default 100; pass the returned `next` as `after` for the next page). It reads no vectors. Paging is not a snapshot.
+
+A filter on `query_with` is applied after shadowing, and a source short of matches is asked again for more, so the answer is the true filtered top `top_k`, short only when fewer documents match.
+
+## Indexing
+
+`Namespace::index(&IndexOptions)` builds an SQ8 index for each live segment with at least `min_rows` rows (default 4,096) that has none yet, and publishes it in the manifest. Neither `compact` nor `maintain` builds indexes, so schedule `index` after them.
+
+SQ8 stores each vector as one byte per dimension. Segments of 100,000 rows or more are clustered into about `sqrt(rows)` partitions (`IndexOptions::nlist` overrides), and a query reads about `2 * sqrt(nlist)` of them by default. On SIFT1M and GloVe-25 the defaults gave recall@10 of 0.99 or more. `rebuild: true` builds again over existing indexes. An index needs `segment_format` 2 or above.
+
+## Compaction, garbage collection and maintenance
+
+**`compact`** folds the WAL tail into a new segment and publishes it with one conditional manifest update. When there are more than `max_segments` (default 8) live segments, or one is at `max_segment_bytes` (default 128 MiB), it merges instead, into size-capped segments, streaming the inputs. A segment's bytes depend only on its WAL range, so a rerun after a crash writes the same object, and racing compactors cannot publish different answers. Compaction never deletes anything.
+
+**`gc`** deletes segments that a merge or a later fold replaced, once they and their replacement are at least `min_age` old (default 24 hours), so readers still holding an old manifest have time to finish. With `fence_wal: true` it also replaces folded WAL objects with 8-byte fences, which keep put-if-absent working at their keys. WAL objects are never deleted. `dry_run` reports what it would do.
+
+**`maintain`** is the one call to schedule (from cron, a loop, a worker): it compacts when the tail is long enough (64 objects, 64 MiB, or an optional age) or there are too many segments, then runs `gc`. The library starts no background task itself.
+
+**`recover`** writes a new manifest for a namespace that lost its own, from `schema.json`, the segment names and the WAL. It refuses if a manifest exists, and stops with `Unrecoverable` and the keys to restore if a range has no readable copy. It does not restore indexes; run `index` again.
+
+**Format levels.** The manifest records the newest WAL and segment formats the namespace may hold. A build that reads less refuses the namespace before touching it. `upgrade_wal_format(level)` and `upgrade_segment_format(level)` raise a level, one way. New namespaces start at WAL level 4 and segment level 2; `upgrade_segment_format(3)` turns on the typed attribute columns of segment format 3.
+
+## Caching and read budgets
+
+**Read cache.** `CacheStore` wraps any store with a RAM tier and an optional NVMe tier, keyed by object and byte range. Give it to a handle with `Namespace::with_cache`; only queries read through it. The manifest is never cached, so a query always sees the latest writes. Objects are immutable once written, so there is no invalidation, only eviction.
+
+**Decoded cache.** `DecodedCache` keeps parsed structures (segment directories, blocks, index heads and partitions, whole small segments) so a warm query skips decoding. Share one between handles with `Namespace::with_decoded_cache`. Default 256 MiB.
+
+**Read budget.** Every query attempt, and each unit of a compaction, may read at most a byte budget (`DEFAULT_READ_BUDGET`, 1 GiB, or `Namespace::with_read_budget`). Past it the call fails with `ReadBudgetExceeded` before anything is written. An indexed segment is charged only for what it fetches, so a namespace bigger than the budget can still be queried once its large segments are indexed.
+
+`configure_cpu` sizes the two thread pools CPU work runs on (queries on every core, maintenance on a quarter), once, before the first call that uses them.
+
+## Looking inside a namespace
+
+`inspect::report(store, id)` lists what a namespace holds (manifest, segments, indexes, WAL, fences) and what looks wrong, without changing anything. Damage is a line in the report; only a failing store is an error.
+
+```bash
+cargo run --example dump -- <namespace> --dir <path>
+```
+
+prints that report for a namespace on local disk and exits 1 if it found a problem.
+
+## Guarantees
+
+- **Durability.** Once `upsert` or `delete` returns, the write is in the object store.
+- **Read your writes.** A query that starts after a write returned sees it, from any handle or process.
+- **Atomic batches.** Readers see all of a batch or none.
+- **Consistent prefix.** Readers see entries 1 through n, never a later entry without an earlier one.
+- **Total order.** Concurrent writers get distinct sequence numbers; the higher one wins for the same id.
+- **No lost manifest updates.** Every manifest change is a compare-and-swap, retried on fresh contents up to 32 times.
+- **Compaction is invisible.** A query returns the same documents before, during and after a compaction, including when a compactor is killed or two race.
+- **No partial writes on bad input.** Validation runs before any storage call.
+
+Not guaranteed: exactly-once for plain writes (see [Writing](#writing)), and keyed writes do not stop two submits of one key running at the same time.
+
+## Storage layout and formats
+
+```text
+<namespace>/
+  schema.json                         dimension, metric, attribute types; written once
+  manifest/current.json               live segments, fold point, indexes, format levels
+  wal/00000000000000000001.json       one object per batch (binary despite the name)
+  segments/<lo>-<hi>/data.bin         a segment, named by the WAL range it covers
+  segments/<lo>-<hi>/index-<n>.bin    its SQ8 index, generation n
+  segments/<lo>-<hi>/generation       the highest index generation ever used
+  gc/fenced-through                   a hint for gc, only with fence_wal
+```
+
+`schema.json` and the manifest are JSON. Everything else is binary and starts with a four-byte magic:
+
+| Object | Magic | Versions |
+|---|---|---|
+| WAL batch | `ITZW` | 2, or 3 with an idempotency key; ZSTD-compressed when smaller |
+| WAL fence | `ITZF` | 4 |
+| Segment | `ITZS`, ending in `ITZE` | 2 (block-addressable, Bloom filter); 3 adds typed attribute columns and zone maps |
+| Index | `ITZI` | 1, kind 1 (SQ8) |
+
+A reader that meets a version or kind it does not know refuses it instead of guessing; a segment whose index kind is unknown is scanned flat.
+
+## Errors
+
+Every fallible call returns `itzma_core::Result<T>` with `ItzmaError`, which is `#[non_exhaustive]`. The library does not panic on bad input. The ones a caller usually handles:
+
+| Variant | When |
+|---|---|
+| `NamespaceExists`, `NamespaceNotFound` | `create` on a taken id, `open` on a missing one |
+| `DimensionMismatch`, `InvalidVector` | a vector of the wrong length, non-finite, or zero under cosine |
+| `UnknownAttr`, `AttrTypeMismatch`, `InvalidAttrs` | attributes or a predicate that do not fit the schema |
+| `InvalidQuery`, `InvalidId`, `InvalidKey`, `InvalidColumns`, `InvalidConfig` | bad arguments, refused before any storage call |
+| `BatchTooLarge` | a batch over 64 MiB |
+| `WriteContention`, `ManifestContention` | 32 lost races in a row; nothing was written |
+| `KeyConflict` | a keyed retry found its key on a different batch |
+| `ReadBudgetExceeded` | a read past the handle's budget |
+| `WalFormatTooNew`, `SegmentFormatTooNew` | the namespace is at a level this build does not read; upgrade the build |
+| `WalFormatTooOld`, `SegmentFormatTooOld` | the call needs a higher level; run the matching `upgrade_*` |
+| `CorruptWal`, `CorruptSegment`, `CorruptIndex`, `CorruptManifest` | an object is damaged or does not match; a query never falls back to a flat scan over a damaged index |
+| `ManifestExists`, `Unrecoverable` | from `recover` |
+| `Storage` | the backend failed |
+
+## Storage backends
+
+Anything that implements `object_store::ObjectStore` works: S3, GCS, Azure, local disk, memory. Itzma needs put-if-absent (writes, create) and conditional update (every manifest change: compaction, indexing, format upgrades). `InMemory` and S3 have both. `LocalFileSystem` has no conditional update, so on local disk you can create, write and query, but `compact`, `index` and the upgrades fail with a storage error.
+
+## Limits
+
+- A query without an index, or with `exact: true`, reads every live vector of the unindexed segments, bounded by the read budget.
+- A clustered index is approximate unless `nprobe` reaches its partition count; recall is measured on SIFT1M and GloVe-25 only.
+- Compaction and indexing are explicit; nothing runs them for you.
+- Filtering without a vector scans ids and attributes until a page is full.
+- Vector queries do not paginate.
+- One batch is one object, at most 64 MiB.
+- WAL objects are never deleted; fencing them is opt-in.
+- Attribute fields cannot be added after create.
 
 ## Develop
 
