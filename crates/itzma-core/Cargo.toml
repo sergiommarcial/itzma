@@ -1,0 +1,8 @@
+[package]
+name = "itzma-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Object-storage-backed vector retrieval engine core"
+publish = false
+

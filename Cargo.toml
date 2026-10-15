@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/itzma-core",
+]
+
+[workspace.package]
+edition = "2024"
+# 1.87, not object_store's declared 1.85: yoke-derive (via url and icu) uses
+# str::from_utf8, stable in 1.87, but declares no rust-version of its own.
+rust-version = "1.87"
+
+# One codegen unit and thin LTO let the distance kernels inline into
+# their callers across crates. Debug and test builds are untouched.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"

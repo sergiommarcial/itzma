@@ -1,0 +1,56 @@
+# cargo-deny policy. Run with `cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+# Cargo.lock is checked against the RustSec advisory database. Known
+# vulnerabilities always fail; yanked releases are set to fail here too.
+yanked = "deny"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    # ISC and CDLA-Permissive-2.0 come only from the TLS stack that
+    # object_store's `aws` feature pulls in for the S3 test backend (a
+    # dev-dependency): ISC from ring, aws-lc-rs and rustls-webpki;
+    # CDLA-Permissive-2.0 from webpki-root-certs. BSD-3-Clause comes from
+    # aws-lc-sys and subtle there, and from zstd-safe and zstd-sys, which the
+    # WAL codec uses.
+    "ISC",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    # foldhash, hashbrown's default hasher as of a recent version, pulled in
+    # transitively by `lru` (the RAM tier of the read cache, cache.rs).
+    # OSI-approved and FSF-free, same permissive category as the
+    # licenses already allowed above.
+    "Zlib",
+    # rust-numpy (the Python bridge, crates/itzma-python) is BSD-2-Clause.
+    "BSD-2-Clause",
+    # tiny-keccak, which the arrow crates of the Python bridge pull in through
+    # const-random. A public-domain dedication, the most permissive there is.
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+
+# target-lexicon is a build dependency of pyo3 (the Python bridge). Its
+# license is Apache-2.0 plus the LLVM exception, an extra permission. Allowed
+# for this crate only, so the exception does not widen for anything else.
+[[licenses.exceptions]]
+crate = "target-lexicon"
+allow = ["Apache-2.0 WITH LLVM-exception"]
+
+# Our own crates are unpublished and carry no license yet.
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
