@@ -304,7 +304,7 @@ class Namespace(_Handle):
     def index(
         self,
         *,
-        kind: Literal["sq8"] = "sq8",
+        kind: Literal["sq8", "hnsw"] = "hnsw",
         min_rows: int = 4096,
         nlist: int | None = None,
         rebuild: bool = False,
@@ -465,7 +465,7 @@ class AsyncNamespace(_Handle):
     async def index(
         self,
         *,
-        kind: Literal["sq8"] = "sq8",
+        kind: Literal["sq8", "hnsw"] = "hnsw",
         min_rows: int = 4096,
         nlist: int | None = None,
         rebuild: bool = False,

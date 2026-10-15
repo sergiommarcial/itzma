@@ -70,12 +70,13 @@ pub(crate) enum What {
     IdBlock(usize),
     AttrBlock(usize),
     TombstoneBlock(usize),
+    /// An index object's prefix and head bytes (`index::open`), any kind.
+    IndexHead,
     /// An SQ8 head, parsed.
     Sq8Head,
     /// One SQ8 partition, parsed.
     Partition(u32),
-    /// A whole segment for the query's flat path, as a `SegmentView`
-    ///.
+    /// A whole segment for the query's flat path, as a `SegmentView`.
     View,
 }
 
@@ -101,8 +102,7 @@ struct Inner {
 
 /// Parsed index heads, partitions, segment directories, blocks and decoded
 /// segments, shared by every handle given it with
-/// [`Namespace::with_decoded_cache`](crate::Namespace::with_decoded_cache)
-///.
+/// [`Namespace::with_decoded_cache`](crate::Namespace::with_decoded_cache).
 ///
 /// A hit costs no store call and is not charged to the read budget; a miss is
 /// read and charged as it would be without the cache. Only the query path uses
@@ -406,12 +406,12 @@ mod tests {
         let gate = gate.shared();
         let a = path("a");
 
-        let first = handle.get_or_load(&a, What::Bloom, || async {
+        let first = handle.get_or_load(&a, What::IndexHead, || async {
             calls.fetch_add(1, Ordering::SeqCst);
             let _ = gate.clone().await;
             Ok::<_, ItzmaError>((7u64, 8))
         });
-        let second = handle.get_or_load(&a, What::Bloom, || async {
+        let second = handle.get_or_load(&a, What::IndexHead, || async {
             calls.fetch_add(1, Ordering::SeqCst);
             Ok::<_, ItzmaError>((9u64, 8))
         });
@@ -434,7 +434,7 @@ mod tests {
             let calls = &calls;
             async move {
                 handle
-                    .get_or_load(&path(name), What::Bloom, || counted(calls, 1, weight))
+                    .get_or_load(&path(name), What::IndexHead, || counted(calls, 1, weight))
                     .await
                     .unwrap()
             }
@@ -495,7 +495,7 @@ mod tests {
             let gate = gate.shared();
             let a = path("a");
             let mut first = handle
-                .get_or_load(&a, What::Bloom, || async {
+                .get_or_load(&a, What::IndexHead, || async {
                     let _ = gate.clone().await;
                     Err::<(u64, u64), _>(ItzmaError::EmptyBatch)
                 })
@@ -503,7 +503,7 @@ mod tests {
             // The first caller claims the key and stops at the gate.
             assert!(futures::poll!(&mut first).is_pending());
             let calls = AtomicUsize::new(0);
-            let second = handle.get_or_load(&a, What::Bloom, || counted(&calls, 4, 1));
+            let second = handle.get_or_load(&a, What::IndexHead, || counted(&calls, 4, 1));
 
             // `second` is polled first and waits; then the loader fails or
             // goes away.
@@ -556,11 +556,11 @@ mod tests {
         let (h1, h2) = (shared.handle(&s1), shared.handle(&s2));
         let calls = AtomicUsize::new(0);
         let a = h1
-            .get_or_load(&path("x"), What::Bloom, || counted(&calls, 1, 1))
+            .get_or_load(&path("x"), What::IndexHead, || counted(&calls, 1, 1))
             .await
             .unwrap();
         let b = h2
-            .get_or_load(&path("x"), What::Bloom, || counted(&calls, 2, 1))
+            .get_or_load(&path("x"), What::IndexHead, || counted(&calls, 2, 1))
             .await
             .unwrap();
         assert_eq!((*a, *b), (1, 2));
@@ -575,7 +575,7 @@ mod tests {
         let id = DecodedCache::store_id(&s1);
         shared
             .handle(&s1)
-            .get_or_load(&path("x"), What::Bloom, || async {
+            .get_or_load(&path("x"), What::IndexHead, || async {
                 Ok::<_, ItzmaError>((1u64, 1))
             })
             .await

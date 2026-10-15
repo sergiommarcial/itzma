@@ -12,8 +12,8 @@
 //! An index has one or more partitions. With one (`nlist = 1`) every row is in
 //! it and a query scans every code. With more, a seeded k-means (see
 //! [`kmeans`]) puts each row in the partition of its nearest centroid, and a
-//! query reads only the `nprobe` partitions whose centroids are nearest to it
-//!. The format is the same either way: `nlist`, the centroids and a
+//! query reads only the `nprobe` partitions whose centroids are nearest to it.
+//! The format is the same either way: `nlist`, the centroids and a
 //! partition table.
 //!
 //! # Layout after the prefix
@@ -41,7 +41,7 @@ use crate::cpu::{self, Cost, Lane};
 
 use super::{
     Algorithm, Batch, Candidate, Cursor, Kind, PREFIX_LEN, Prefix, Probe, Reader, corrupt, missing,
-    open,
+    open_uncached,
 };
 use crate::decoded::What;
 use crate::document::Metric;
@@ -408,7 +408,7 @@ pub(crate) struct OpenedHead {
 async fn open_head(probe: &Probe<'_>) -> Result<Arc<OpenedHead>> {
     let load = || async {
         let name = probe.path.as_ref();
-        let opened = open(probe, Kind::Sq8).await?;
+        let opened = open_uncached(probe, Kind::Sq8).await?;
         let head = Head::parse(name, &opened.prefix, &opened.body)?;
         if head.end() != opened.size {
             return Err(corrupt(
@@ -432,8 +432,8 @@ async fn open_head(probe: &Probe<'_>) -> Result<Arc<OpenedHead>> {
 }
 
 /// Partitions `wanted` of the probe's index, in that order. The ones the
-/// decoded cache does not have are fetched together through the planner
-///, so nearby partitions can share a request, and each is charged
+/// decoded cache does not have are fetched together through the planner,
+/// so nearby partitions can share a request, and each is charged
 /// before it is sent.
 async fn read_partitions(
     probe: &Probe<'_>,
@@ -754,8 +754,8 @@ impl Algorithm for Sq8 {
 /// within each returned batch. Waves are visited nearest-centroid-first, but
 /// that only orders *partitions*, not individual rows, so a later wave can
 /// still hold a row closer than one an earlier batch already returned —
-/// true cross-wave best-first order needs per-partition distance bounds
-///, not built here. Replaces, for SQ8 specifically, the default
+/// true cross-wave best-first order needs per-partition distance bounds,
+/// not built here. Replaces, for SQ8 specifically, the default
 /// cursor's "re-run `search` with a bigger total" behavior: a wave is
 /// fetched and scanned exactly once, ever.
 struct Sq8Cursor<'a> {

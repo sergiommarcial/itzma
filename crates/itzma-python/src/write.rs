@@ -65,8 +65,8 @@ pub(crate) fn write_key(
     }
 }
 
-/// Write `op`. A keyed write is one batch, since a key names one batch
-///. An unkeyed one is split, and a failure part way raises with
+/// Write `op`. A keyed write is one batch, since a key names one batch.
+/// An unkeyed one is split, and a failure part way raises with
 /// `last_seq` set to the last batch that landed.
 pub(crate) async fn write(ns: Arc<Namespace>, op: Op, key: Option<WriteKey>) -> PyResult<u64> {
     if let Some(key) = key {

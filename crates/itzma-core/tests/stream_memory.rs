@@ -1,5 +1,5 @@
-//! `upsert_stream` holds a bounded amount of memory, however long its input
-//!. A file of its own: the counting allocator sees every
+//! `upsert_stream` holds a bounded amount of memory, however long its input.
+//! A file of its own: the counting allocator sees every
 //! allocation in the binary, so no other test may run beside this one.
 
 mod common;

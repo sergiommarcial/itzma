@@ -18,8 +18,8 @@ use futures::TryStreamExt;
 use itzma_core::inspect::{self, SegmentState};
 use itzma_core::manifest::{self, IndexEntry};
 use itzma_core::{
-    Compaction, CompactionOptions, GcOptions, GcReport, IndexOptions, IndexReport, ItzmaError,
-    Manifest, Metric, Namespace, QueryOptions, segment,
+    Compaction, CompactionOptions, GcOptions, GcReport, IndexKind, IndexOptions, IndexReport,
+    ItzmaError, Manifest, Metric, Namespace, QueryOptions, segment,
 };
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
@@ -43,8 +43,14 @@ const NOW: GcOptions = GcOptions {
 };
 
 /// Index every segment, however small.
+/// Every segment, as SQ8: the tests here check SQ8's objects and sizes.
 fn every() -> IndexOptions {
-    IndexOptions::default().min_rows(0)
+    IndexOptions::default().min_rows(0).kind(IndexKind::Sq8)
+}
+
+/// Index every segment, however small, as HNSW.
+fn hnsw_every() -> IndexOptions {
+    IndexOptions::default().min_rows(0).kind(IndexKind::Hnsw)
 }
 
 fn dynamic(store: &Arc<FaultyStore>) -> Arc<dyn ObjectStore> {
@@ -127,6 +133,40 @@ fn report(indexed: usize, skipped_small: usize, already: usize) -> IndexReport {
 }
 
 #[tokio::test]
+async fn an_hnsw_index_is_built_and_published() {
+    for b in cas_backends() {
+        eprintln!("backend: {}", b.name);
+        let ns = create(b.store.clone()).await;
+        write(&ns, "a", 1, 200).await;
+        ns.compact(&ROOMY).await.unwrap();
+
+        let report = ns.index(&hnsw_every()).await.unwrap();
+        assert_eq!(report.indexed, 1, "{report:?}");
+        let m = manifest_of(&*b.store).await;
+        assert_eq!(m.indexes[&seg(1, 1)].kind, "hnsw");
+
+        let got = hits(&ns).await;
+        let exact = ns
+            .query_with(
+                &Lcg(7).vector(DIM),
+                1_000,
+                &QueryOptions::default().exact(true),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            got.len(),
+            exact.len(),
+            "an approximate index should not lose or invent documents"
+        );
+        assert_consistent(b.store.clone(), DIM, L2).await;
+    }
+}
+
+#[tokio::test]
 async fn an_index_is_built_and_published() {
     for b in cas_backends() {
         eprintln!("backend: {}", b.name);
@@ -148,6 +188,28 @@ async fn an_index_is_built_and_published() {
             ]
         );
 
+        assert_eq!(hits(&ns).await, expected, "an index changes no answer");
+        assert_consistent(b.store.clone(), DIM, L2).await;
+    }
+}
+
+/// With no kind named, `index` builds HNSW.
+#[tokio::test]
+async fn the_default_kind_is_hnsw() {
+    for b in cas_backends() {
+        eprintln!("backend: {}", b.name);
+        let ns = two_segments(b.store.clone(), 30).await;
+        let expected = hits(&ns).await;
+
+        let outcome = ns
+            .index(&IndexOptions::default().min_rows(0))
+            .await
+            .unwrap();
+        assert_eq!(outcome, report(2, 0, 0));
+
+        let m = manifest_of(&*b.store).await;
+        assert_eq!(m.indexes[&seg(1, 1)].kind, "hnsw");
+        assert_eq!(m.indexes[&seg(2, 2)].kind, "hnsw");
         assert_eq!(hits(&ns).await, expected, "an index changes no answer");
         assert_consistent(b.store.clone(), DIM, L2).await;
     }
@@ -750,6 +812,30 @@ async fn a_rebuild_publishes_the_next_generation() {
     }
 }
 
+#[tokio::test]
+async fn a_rebuild_can_switch_kind() {
+    for b in cas_backends() {
+        eprintln!("backend: {}", b.name);
+        let ns = two_segments(b.store.clone(), 30).await;
+        ns.index(&every()).await.unwrap(); // both segments, sq8
+        let before = manifest_of(&*b.store).await;
+        assert_eq!(before.indexes[&seg(1, 1)].kind, "sq8");
+
+        let report = ns
+            .index(&every().rebuild(true).kind(itzma_core::IndexKind::Hnsw))
+            .await
+            .unwrap();
+        assert_eq!(report.indexed, 2, "{report:?}");
+        let after = manifest_of(&*b.store).await;
+        assert_eq!(after.indexes[&seg(1, 1)].kind, "hnsw");
+        assert_eq!(
+            after.indexes[&seg(1, 1)].generation,
+            before.indexes[&seg(1, 1)].generation + 1
+        );
+        assert_consistent(b.store.clone(), DIM, L2).await;
+    }
+}
+
 /// Two rebuilds at once end at generation 2, not 3.
 #[tokio::test]
 async fn two_rebuilds_at_once_publish_one_generation() {
@@ -1084,6 +1170,26 @@ async fn inspect_shows_which_index_the_manifest_names() {
             rebuilt.to_string().contains("unnamed indexes [1]"),
             "{rebuilt}"
         );
+    }
+}
+
+#[tokio::test]
+async fn inspect_shows_an_hnsw_index_the_same_shape_as_sq8() {
+    for b in cas_backends() {
+        eprintln!("backend: {}", b.name);
+        let ns = two_segments(b.store.clone(), 30).await;
+        ns.index(&every().kind(itzma_core::IndexKind::Hnsw))
+            .await
+            .unwrap();
+        let report = inspect::report(&*b.store, "docs").await.unwrap();
+        let seg1 = report
+            .segments
+            .iter()
+            .find(|s| s.id == seg(1, 1))
+            .expect("segment 1");
+        let index = seg1.index.as_ref().expect("named index");
+        assert_eq!(index.kind, "hnsw");
+        assert!(index.bytes.is_some());
     }
 }
 

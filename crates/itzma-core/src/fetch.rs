@@ -43,8 +43,7 @@ pub struct FetchPolicy {
     /// The width of a split grid cell (see [`split_above`](Self::split_above)).
     pub part_size: u64,
     /// Round a merged, unsplit range out to a multiple of this, so nearby
-    /// reads from different queries land on the same cache keys
-    ///.
+    /// reads from different queries land on the same cache keys.
     pub align: u64,
 }
 

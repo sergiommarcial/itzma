@@ -252,8 +252,8 @@ async fn a_fold_over_budget_publishes_nothing_and_writes_nothing() {
     }
 }
 
-/// The tail and each merge group are charged against a budget of their own
-///, so a merge's edge is the bigger of the two, not their sum.
+/// The tail and each merge group are charged against a budget of their own,
+/// so a merge's edge is the bigger of the two, not their sum.
 #[tokio::test]
 async fn a_merge_over_budget_publishes_nothing_and_writes_nothing() {
     for b in cas_backends() {

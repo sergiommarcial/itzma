@@ -1,5 +1,4 @@
-//! Compaction: fold the WAL tail into a segment, or merge the segments
-//!.
+//! Compaction: fold the WAL tail into a segment, or merge the segments.
 //!
 //! One run is: load the manifest, read the WAL tail, decide what to do, build
 //! the new segment, write it with put-if-absent, then publish it with one
@@ -51,8 +50,8 @@ pub struct CompactionOptions {
     /// produces as many size-balanced, contiguous segments as this cap
     /// requires, instead of collapsing everything into one. Only the data object's size counts, never an
     /// index object beside it. A merge needs it at or under the handle's
-    /// read budget, since it reads each group under a budget of its own
-    ///; see [`validate`](Self::validate).
+    /// read budget, since it reads each group under a budget of its own;
+    /// see [`validate`](Self::validate).
     pub max_segment_bytes: u64,
 }
 

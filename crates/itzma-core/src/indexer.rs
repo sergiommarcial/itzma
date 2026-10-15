@@ -20,7 +20,7 @@ use crate::cpu::{self, Cost, Lane};
 use crate::document::Metric;
 use crate::error::{ItzmaError, Result};
 use crate::fetch::FetchPolicy;
-use crate::index::{self, Kind, sq8};
+use crate::index::{self, Kind, hnsw, sq8};
 use crate::manifest::{self, IndexEntry};
 use crate::segment;
 
@@ -47,7 +47,7 @@ pub struct IndexOptions {
     pub rebuild: bool,
     /// Which algorithm to build. Different segments may use
     /// different kinds; rebuilding a segment to a different kind replaces its
-    /// entry like any other rebuild. Defaults to [`IndexKind::Sq8`].
+    /// entry like any other rebuild. Defaults to [`IndexKind::Hnsw`].
     pub kind: IndexKind,
     /// How many partitions an SQ8 index has. `None` chooses from the
     /// segment's row count: one partition for a small segment and more for a big
@@ -133,14 +133,18 @@ pub enum IndexKind {
     /// Scalar quantization to 8 bits per dimension. Near-zero build
     /// cost, the same cost every query pays whether the segment is warm or
     /// cold.
-    #[default]
     Sq8,
+    /// Segmented HNSW, the default. Costlier to build and to query cold,
+    /// cheaper to query once the segment's index object is warm in cache.
+    #[default]
+    Hnsw,
 }
 
 impl IndexKind {
     fn as_kind(self) -> Kind {
         match self {
             IndexKind::Sq8 => Kind::Sq8,
+            IndexKind::Hnsw => Kind::Hnsw,
         }
     }
 }
@@ -241,6 +245,7 @@ pub(crate) async fn index_segment(
     let cost = build_cost(kind, rows, nlist, dim);
     let built = cpu::run(Lane::Maintenance, cost, move || match kind {
         Kind::Sq8 => sq8::build(&matrix, dim, rows, data_size, nlist, metric),
+        Kind::Hnsw => hnsw::build(&matrix, dim, rows, data_size, metric),
     })
     .await?;
     put_or_reuse(store, &path, built, kind, dim, rows as u64, data_size).await?;
@@ -249,10 +254,12 @@ pub(crate) async fn index_segment(
 }
 
 /// How much work a build is, for the compute pool's hand-off: SQ8
-/// compares every row with every centroid.
+/// compares every row with every centroid, HNSW with about
+/// `EF_CONSTRUCTION` candidates while it inserts it.
 fn build_cost(kind: Kind, rows: usize, nlist: usize, dim: usize) -> Cost {
     let per_row = match kind {
         Kind::Sq8 => nlist.max(1),
+        Kind::Hnsw => hnsw::EF_CONSTRUCTION,
     };
     Cost::Distances {
         rows: rows.saturating_mul(per_row),
@@ -282,6 +289,9 @@ async fn put_or_reuse(
             let checked = match kind {
                 Kind::Sq8 => {
                     sq8::Index::decode(path.as_ref(), &existing, dim, rows, data_size).map(|_| ())
+                }
+                Kind::Hnsw => {
+                    hnsw::Index::decode(path.as_ref(), &existing, dim, rows, data_size).map(|_| ())
                 }
             };
             checked.map_err(|err| match err {
@@ -338,6 +348,12 @@ mod tests {
     #[test]
     fn every_build_worth_indexing_leaves_the_tokio_worker() {
         use crate::cpu::INLINE_BELOW;
+        // HNSW: the smallest segment `index` builds by default, at small
+        // dimensions, is still hundreds of distances per row.
+        for dim in [4, 25, 128] {
+            let cost = build_cost(Kind::Hnsw, DEFAULT_MIN_ROWS, 1, dim);
+            assert!(cost.units() >= INLINE_BELOW, "hnsw at dim {dim}");
+        }
         // SQ8 with clustering: every row against every centroid, five times.
         let cost = build_cost(Kind::Sq8, 100_000, 316, 25);
         assert!(cost.units() >= INLINE_BELOW);
@@ -346,8 +362,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn options_default_to_sq8() {
-        assert_eq!(IndexOptions::default().kind, IndexKind::Sq8);
+    fn options_default_to_hnsw_and_the_setter_changes_it() {
+        assert_eq!(IndexOptions::default().kind, IndexKind::Hnsw);
         let opts = IndexOptions::default().kind(IndexKind::Sq8);
         assert_eq!(opts.kind, IndexKind::Sq8);
     }

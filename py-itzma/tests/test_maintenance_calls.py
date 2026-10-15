@@ -41,7 +41,7 @@ def test_stages_match_the_model(cas_store: itzma.Store, ns_id: str) -> None:
     assert report.indexed >= 1
     check()
 
-    rebuilt = ns.index(min_rows=0, nlist=2, rebuild=True)
+    rebuilt = ns.index(kind="hnsw", min_rows=0, rebuild=True)
     assert rebuilt.indexed >= 1
     check()
 

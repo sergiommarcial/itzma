@@ -49,7 +49,7 @@ fn empties(ends: &[u32]) -> u16 {
 }
 
 /// The value a predicate compares, with `-0.0` as `0.0` so both zeros are one
-/// point (`attr_index::Value::number` does the same).
+/// point.
 fn comparable(x: f64) -> f64 {
     if x == 0.0 { 0.0 } else { x }
 }

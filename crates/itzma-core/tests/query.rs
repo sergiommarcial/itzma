@@ -17,8 +17,8 @@ use common::faulty::{Fault, FaultyStore};
 use common::{Lcg, assert_untouched, cas_backends, doc, naive_top_k, schema, snapshot};
 use itzma_core::indexer::DEFAULT_MIN_ROWS;
 use itzma_core::{
-    CompactionOptions, Document, FetchPolicy, IndexOptions, ItzmaError, Manifest, Metric,
-    Namespace, QueryOptions, manifest,
+    CompactionOptions, Document, FetchPolicy, IndexKind, IndexOptions, ItzmaError, Manifest,
+    Metric, Namespace, QueryOptions, manifest, segment,
 };
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
@@ -73,6 +73,10 @@ async fn manifest_of(store: &dyn ObjectStore) -> Manifest {
     manifest::load(store, "docs").await.unwrap().0
 }
 
+fn seg(lo: u64, hi: u64) -> String {
+    segment::segment_id(lo, hi)
+}
+
 /// Every hit's id, in order.
 fn ids(hits: &[itzma_core::Hit]) -> Vec<String> {
     hits.iter().map(|h| h.id.clone()).collect()
@@ -107,7 +111,36 @@ async fn assert_matches_flat(ns: &Namespace, docs: &[Document], options: &QueryO
     }
 }
 
-/// the fetch policy changes how many requests a read makes and how
+#[tokio::test]
+async fn a_namespace_with_both_index_kinds_matches_the_flat_scan() {
+    for b in cas_backends() {
+        eprintln!("backend: {}", b.name);
+        let ns = create(b.store.clone()).await;
+        write(&ns, "a", 1, 200).await;
+        ns.compact(&ROOMY).await.unwrap();
+        ns.index(&IndexOptions::default().min_rows(0).kind(IndexKind::Sq8))
+            .await
+            .unwrap(); // segment 1: sq8
+
+        write(&ns, "b", 2, 200).await;
+        ns.compact(&ROOMY).await.unwrap();
+        ns.index(&IndexOptions::default().min_rows(0))
+            .await
+            .unwrap(); // only segment 2 is new, so only it gets the default, hnsw
+
+        let docs: Vec<Document> = docs_of("a", 1, 200)
+            .into_iter()
+            .chain(docs_of("b", 2, 200))
+            .collect();
+        assert_matches_flat(&ns, &docs, &QueryOptions::default()).await;
+
+        let m = manifest_of(&*b.store).await;
+        assert_eq!(m.indexes[&seg(1, 1)].kind, "sq8");
+        assert_eq!(m.indexes[&seg(2, 2)].kind, "hnsw");
+    }
+}
+
+/// The fetch policy changes how many requests a read makes and how
 /// big each one is, never what a query returns: the same namespace, built
 /// and queried under each policy in turn, must answer identically.
 #[tokio::test]
@@ -131,7 +164,10 @@ async fn results_are_identical_under_both_fetch_policies() {
 
 /// Index every segment with `nlist` partitions.
 fn clustered(nlist: usize) -> IndexOptions {
-    IndexOptions::default().min_rows(0).nlist(Some(nlist))
+    IndexOptions::default()
+        .min_rows(0)
+        .kind(IndexKind::Sq8)
+        .nlist(Some(nlist))
 }
 
 #[tokio::test]
@@ -373,6 +409,44 @@ async fn the_default_nprobe_on_a_clustered_index_keeps_recall() {
     assert!(found * 10 >= 20 * 10 * 9, "recall@10 was {found}/200");
 }
 
+#[tokio::test]
+async fn nprobe_widens_the_hnsw_search_and_never_hurts_recall() {
+    for b in cas_backends() {
+        eprintln!("backend: {}", b.name);
+        let ns = create(b.store.clone()).await;
+        write(&ns, "a", 1, 2_000).await;
+        ns.compact(&ROOMY).await.unwrap();
+        ns.index(&IndexOptions::default().min_rows(0).kind(IndexKind::Hnsw))
+            .await
+            .unwrap();
+
+        let query = Lcg(99).vector(DIM);
+        let exact: Vec<String> = ids(&ns
+            .query_with(&query, 10, &QueryOptions::default().exact(true))
+            .await
+            .unwrap());
+
+        let narrow = ns
+            .query_with(&query, 10, &QueryOptions::default().nprobe(Some(1)))
+            .await
+            .unwrap();
+        let wide = ns
+            .query_with(&query, 10, &QueryOptions::default().nprobe(Some(20)))
+            .await
+            .unwrap();
+        let overlap = |hits: &[itzma_core::Hit]| -> usize {
+            hits.iter().filter(|h| exact.contains(&h.id)).count()
+        };
+        assert!(
+            overlap(&wide) >= overlap(&narrow),
+            "a wider ef_search multiplier should never find strictly fewer true neighbors: \
+             narrow {} wide {}",
+            overlap(&narrow),
+            overlap(&wide)
+        );
+    }
+}
+
 /// Every index object's key, from a snapshot.
 fn index_keys(snapshot: &BTreeMap<String, bytes::Bytes>) -> Vec<String> {
     snapshot
@@ -535,7 +609,7 @@ async fn budget_refuses_the_flat_scan_but_the_index_still_answers() {
         let ns = create(b.store.clone()).await;
         write(&ns, "a", 1, 20_000).await;
         ns.compact(&ROOMY).await.unwrap();
-        ns.index(&IndexOptions::default().nlist(Some(1)))
+        ns.index(&IndexOptions::default().kind(IndexKind::Sq8).nlist(Some(1)))
             .await
             .unwrap();
 
@@ -584,7 +658,7 @@ async fn the_indexed_path_reads_far_fewer_bytes_than_a_flat_scan() {
     ns.compact(&ROOMY).await.unwrap();
     // One partition: this compares a scan of every code with a flat read. A
     // clustered index would also take minutes to build in a debug build.
-    ns.index(&IndexOptions::default().nlist(Some(1)))
+    ns.index(&IndexOptions::default().kind(IndexKind::Sq8).nlist(Some(1)))
         .await
         .unwrap();
 
@@ -1117,7 +1191,9 @@ async fn tied_rows_across_partitions_on_the_pool_match_the_exact_scan() {
         .collect();
     ns.upsert(docs).await.unwrap();
     ns.compact(&CompactionOptions::default()).await.unwrap();
-    ns.index(&every().nlist(Some(8))).await.unwrap();
+    ns.index(&every().kind(IndexKind::Sq8).nlist(Some(8)))
+        .await
+        .unwrap();
 
     let every_partition = QueryOptions::default().nprobe(Some(8)).rerank(None);
     let exact = QueryOptions::default().exact(true);

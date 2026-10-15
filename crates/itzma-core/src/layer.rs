@@ -193,8 +193,8 @@ pub(crate) async fn fold_log(
 /// The heads of several sources sorted by id, sources numbered oldest first,
 /// ordered so the smallest id comes out first and, for one id, the newest
 /// source holding it. The one form of [`Layer::overlay`]'s rule for sorted
-/// data: compaction's streaming merge and the flat source's survivors drive it
-///. The caller pushes each source's next id after taking
+/// data: compaction's streaming merge and the flat source's survivors drive it.
+/// The caller pushes each source's next id after taking
 /// one, and checks that a source's ids rise.
 pub(crate) struct NewestWins<K> {
     heap: BinaryHeap<Reverse<(K, Reverse<usize>)>>,

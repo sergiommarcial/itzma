@@ -1,5 +1,4 @@
-//! Maintenance: decide whether a compaction is due, run it, then collect
-//!.
+//! Maintenance: decide whether a compaction is due, run it, then collect.
 //!
 //! [`Namespace::maintain`](crate::Namespace::maintain) is one call that a
 //! caller schedules. It looks at the WAL tail, compacts if a threshold is

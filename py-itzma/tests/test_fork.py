@@ -88,7 +88,7 @@ def test_a_forked_child_queries_and_builds_after_the_parent_used_the_pools(ns_id
             ns = _big_namespace(ns_id)
             if ns.query([0.5] * 64, 5, exact=True).ids == expected:
                 ns.compact()
-                ns.index(min_rows=0)  # the maintenance lane
+                ns.index(min_rows=0, kind="sq8")  # the maintenance lane, quick to build
                 if len(ns.query([0.5] * 64, 5).ids) == 5:
                     code = 0
         finally:

@@ -89,8 +89,8 @@ pub struct Manifest {
     /// reads the new version, with
     /// [`Namespace::upgrade_segment_format`](crate::Namespace::upgrade_segment_format).
     pub segment_format: u32,
-    /// The index built for each live segment that has one, by segment id
-    ///. A segment that is not listed is read whole, as before. A
+    /// The index built for each live segment that has one, by segment id.
+    /// A segment that is not listed is read whole, as before. A
     /// manifest without the field has none. Derived data: compaction drops an
     /// entry when it retires the segment, and nothing else depends on it.
     #[serde(default)]

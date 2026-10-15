@@ -411,6 +411,7 @@ async fn check_indexes(store: &Arc<dyn ObjectStore>, dim: usize, manifest: &itzm
         assert_eq!(u32_at(&index, 4), 1, "{path} container version");
         let kind = match entry.kind.as_str() {
             "sq8" => 1,
+            "hnsw" => 2,
             other => panic!("{path} is listed with the unknown kind {other}"),
         };
         assert_eq!(u32_at(&index, 8), kind, "{path} kind");

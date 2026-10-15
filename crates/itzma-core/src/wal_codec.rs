@@ -1,5 +1,5 @@
-//! Encoding and decoding of one WAL object, format versions 2 and 3
-//!, and the fence that garbage collection leaves
+//! Encoding and decoding of one WAL object, format versions 2 and 3,
+//! and the fence that garbage collection leaves
 //! in place of an old one.
 //!
 //! Bytes in, bytes out: nothing here touches the object store. The layout is

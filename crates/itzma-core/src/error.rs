@@ -60,9 +60,8 @@ pub enum ItzmaError {
 
     /// `Namespace::recover` cannot rebuild the manifest from what the store
     /// holds. Nothing was written. `reason` says what is missing, and `keys` are
-    /// the objects to put back from a replica, a versioned bucket or a backup
-    ///. Once they are back, running `recover` again can succeed
-    ///.
+    /// the objects to put back from a replica, a versioned bucket or a backup.
+    /// Once they are back, running `recover` again can succeed.
     #[error("cannot rebuild the manifest: {reason}; restore {keys:?} and run recover again")]
     Unrecoverable {
         /// What has no readable copy.
@@ -150,8 +149,8 @@ pub enum ItzmaError {
 
     /// A manifest compare-and-swap lost the race 32 times in a row and gave up.
     /// Compaction's publish step is bound by the same cap, and so is raising a
-    /// segment's generation mark before an index build writes its object
-    ///; nothing was written then either.
+    /// segment's generation mark before an index build writes its object;
+    /// nothing was written then either.
     #[error("manifest contention: gave up after {attempts} attempts")]
     ManifestContention {
         /// How many read-modify-write rounds were tried.
@@ -208,8 +207,7 @@ pub enum ItzmaError {
     /// write needs level 3, fencing WAL objects in `Namespace::gc` needs level
     /// 4, and a namespace created by an older build is at 2. Nothing was
     /// written or changed. Once every build that touches the namespace reads
-    /// the newer format, raise it with `Namespace::upgrade_wal_format`
-    ///.
+    /// the newer format, raise it with `Namespace::upgrade_wal_format`.
     #[error(
         "namespace is at WAL format {have}, this operation needs {need}: upgrade the namespace with upgrade_wal_format({need})"
     )]
@@ -266,8 +264,8 @@ pub enum ItzmaError {
     /// truncated, names an unknown codec, disagrees with its own lengths or
     /// counts, holds a ZSTD frame that does not match its header, has invalid
     /// UTF-8 or JSON inside, or has trailing bytes. Also raised on the write
-    /// side when a length cannot be encoded. An object that is not binary is
-    /// decoded as JSON and fails with [`Serde`](Self::Serde) instead.
+    /// side when a length cannot be encoded. An object without the WAL magic
+    /// is refused the same way.
     #[error("corrupt wal object {path}: {reason}")]
     CorruptWal {
         /// Object key of the WAL object, or `"(encoding)"` on the write side.

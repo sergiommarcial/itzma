@@ -126,7 +126,7 @@ async fn dense(ns: &Namespace) -> Vec<Hit> {
 
 #[tokio::test]
 async fn a_warm_indexed_query_reads_only_the_manifest_and_rerank_vectors() {
-    for kind in [IndexKind::Sq8] {
+    for kind in [IndexKind::Sq8, IndexKind::Hnsw] {
         let (counting, plain, cached) = setup(kind).await;
         let paths = warm_paths(&counting, &plain, &cached, |ns| dense(ns).boxed()).await;
         assert_only_rerank_vectors(&paths);

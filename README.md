@@ -24,7 +24,7 @@ It is a library. You embed it in your process, open a namespace, and S3 (or a lo
 ## What it does
 
 - Namespaces with a fixed dimension and metric (L2, cosine, dot product).
-- Dense vector search, exact or through an SQ8 index with clustered partitions.
+- Dense vector search, exact or through an index: HNSW (the default) or SQ8 with clustered partitions.
 - Typed attributes, declared at create, and filtering on them, alone or narrowing a vector query.
 - Batched upserts and deletes, safe with many concurrent writers, with optional idempotency keys.
 - S3 (and anything else `object_store` supports), local disk and in-memory stores.
@@ -142,7 +142,7 @@ Columnar input: `upsert_columns` takes a `DocColumns` (ids, a row-major `f32` ma
 `query(vector, top_k)` returns up to `top_k` hits, closest first, each with its id, distance and attributes. `query_with` takes `QueryOptions`:
 
 - `rerank` (default `Some(4)`): an index proposes `rerank * top_k` candidates, which are then rescored against their exact vectors. `None` proposes every row.
-- `nprobe` (default `None`, chosen from the index): how many SQ8 partitions to read.
+- `nprobe` (default `None`, chosen from the index): how many SQ8 partitions to read, or under HNSW a multiplier on how wide the graph search is.
 - `exact` (default `false`): skip indexes and scan every live document.
 - `filter`: a `Predicate` the hits must match.
 
@@ -162,9 +162,11 @@ A filter on `query_with` is applied after shadowing, and a source short of match
 
 ## Indexing
 
-`Namespace::index(&IndexOptions)` builds an SQ8 index for each live segment with at least `min_rows` rows (default 4,096) that has none yet, and publishes it in the manifest. Neither `compact` nor `maintain` builds indexes, so schedule `index` after them (the Python maintainer can run it for you).
+`Namespace::index(&IndexOptions)` builds an index for each live segment with at least `min_rows` rows (default 4,096) that has none yet, and publishes it in the manifest. Neither `compact` nor `maintain` builds indexes, so schedule `index` after them (the Python maintainer can run it for you). `IndexOptions::kind` picks the kind; a namespace can hold both, and a rebuild can switch one segment's kind.
 
-SQ8 stores each vector as one byte per dimension. Segments of 100,000 rows or more are clustered into about `sqrt(rows)` partitions (`IndexOptions::nlist` overrides), and a query reads about `2 * sqrt(nlist)` of them by default. On SIFT1M and GloVe-25 the defaults gave recall@10 of 0.99 or more. `rebuild: true` builds again over existing indexes. An index needs `segment_format` 2 or above.
+**HNSW** (`IndexKind::Hnsw`, the default) is a graph over one-byte-per-dimension codes. A query fetches a segment's whole index object in one request, then walks the graph out of those bytes, so it is cheap once the object is warm in a cache and costs one larger read cold. It takes longer to build than SQ8. At 32 segments it gave recall@10 of 0.987 on SIFT1M and 0.984 on GloVe-25.
+
+**SQ8** (`IndexKind::Sq8`) stores each vector as one byte per dimension and reads only the partitions a query probes, which suits uncached reads. Segments of 100,000 rows or more are clustered into about `sqrt(rows)` partitions (`IndexOptions::nlist` overrides), and a query reads about `2 * sqrt(nlist)` of them by default. On SIFT1M and GloVe-25 the defaults gave recall@10 of 0.99 or more. `rebuild: true` builds again over existing indexes. An index needs `segment_format` 2 or above.
 
 ## Compaction, garbage collection and maintenance
 
@@ -219,7 +221,7 @@ Not guaranteed: exactly-once for plain writes (see [Writing](#writing)), and key
   manifest/current.json               live segments, fold point, indexes, format levels
   wal/00000000000000000001.json       one object per batch (binary despite the name)
   segments/<lo>-<hi>/data.bin         a segment, named by the WAL range it covers
-  segments/<lo>-<hi>/index-<n>.bin    its SQ8 index, generation n
+  segments/<lo>-<hi>/index-<n>.bin    its dense index (HNSW or SQ8), generation n
   segments/<lo>-<hi>/generation       the highest index generation ever used
   gc/fenced-through                   a hint for gc, only with fence_wal
 ```
@@ -231,7 +233,7 @@ Not guaranteed: exactly-once for plain writes (see [Writing](#writing)), and key
 | WAL batch | `ITZW` | 2, or 3 with an idempotency key; ZSTD-compressed when smaller |
 | WAL fence | `ITZF` | 4 |
 | Segment | `ITZS`, ending in `ITZE` | 2 (block-addressable, Bloom filter); 3 adds typed attribute columns and zone maps |
-| Index | `ITZI` | 1, kind 1 (SQ8) |
+| Index | `ITZI` | 1, kind 1 (SQ8) or 2 (HNSW) |
 
 A reader that meets a version or kind it does not know refuses it instead of guessing; a segment whose index kind is unknown is scanned flat.
 

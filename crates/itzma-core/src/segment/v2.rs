@@ -542,8 +542,8 @@ pub(super) fn decode(r: Reader<'_>, version: u32, dim: usize) -> Result<Layer> {
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
     let parsed = match &parts.attrs {
         AttrSection::Rows(rows) => {
-            // Parsed a block per chunk, in parallel on a pool thread
-            //. The first error in row order is the one returned.
+            // Parsed a block per chunk, in parallel on a pool thread.
+            // The first error in row order is the one returned.
             let mut parsed: Vec<Option<serde_json::Value>> = Vec::with_capacity(docs_n);
             for chunk in crate::cpu::chunked(rows, BLOCK_ROWS, |chunk| {
                 chunk

@@ -8,7 +8,9 @@
 //! object store would show (see `tests/query.rs`'s counting-store test for
 //! that). Vectors are random, which ZSTD cannot shrink, so nothing here says
 //! how well real embeddings compress. The `kernels` group times the distance
-//! functions alone, per row.
+//! functions alone, per row. Every index here is SQ8, named explicitly since
+//! the default kind is HNSW: the groups time SQ8's partitions and cursor, and
+//! an HNSW build of 100k rows is too slow for the once-each debug run.
 //!
 //! `make bench` runs it. `cargo test --benches` (part of `make test`) runs each
 //! benchmark once as a smoke test, so a change that breaks the API breaks the
@@ -29,8 +31,8 @@ use itzma_core::quant::Sq8Codec;
 use itzma_core::search::distance;
 use itzma_core::{
     AttrColumn, AttrSchema, AttrType, CompactionOptions, Compare, DEFAULT_STREAM_TARGET_BYTES,
-    DecodedCache, DecodedCacheOptions, DocColumns, Document, FilterOptions, IndexOptions, Metric,
-    Namespace, Predicate, QueryOptions, Schema, StreamOptions,
+    DecodedCache, DecodedCacheOptions, DocColumns, Document, FilterOptions, IndexKind,
+    IndexOptions, Metric, Namespace, Predicate, QueryOptions, Schema, StreamOptions,
 };
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
@@ -314,11 +316,11 @@ fn query(c: &mut Criterion, rt: &Runtime) {
     for (name, options) in [
         (
             "segment/100k_dim128_indexed",
-            IndexOptions::default().nlist(Some(1)),
+            IndexOptions::default().kind(IndexKind::Sq8).nlist(Some(1)),
         ),
         (
             "segment/100k_dim128_indexed_clustered_64",
-            IndexOptions::default().nlist(Some(64)),
+            IndexOptions::default().kind(IndexKind::Sq8).nlist(Some(64)),
         ),
     ] {
         let indexed = OnceCell::new();
@@ -371,7 +373,9 @@ fn query(c: &mut Criterion, rt: &Runtime) {
                     }
                     ns.compact(&unbounded_segments).await.expect("compact");
                 }
-                ns.index(&IndexOptions::default()).await.expect("index");
+                ns.index(&IndexOptions::default().kind(IndexKind::Sq8))
+                    .await
+                    .expect("index");
                 ns
             })
         });
@@ -545,7 +549,7 @@ async fn filtered_query_segment_at(batches: usize, level: u32) -> Namespace {
     ns.compact(&CompactionOptions::default())
         .await
         .expect("compact");
-    ns.index(&IndexOptions::default().min_rows(0))
+    ns.index(&IndexOptions::default().kind(IndexKind::Sq8).min_rows(0))
         .await
         .expect("index");
     ns
@@ -657,11 +661,11 @@ fn decoded(c: &mut Criterion, rt: &Runtime) {
     for (name, options) in [
         (
             "query/segment/100k_dim128_indexed",
-            IndexOptions::default().nlist(Some(1)),
+            IndexOptions::default().kind(IndexKind::Sq8).nlist(Some(1)),
         ),
         (
             "query/segment/100k_dim128_indexed_clustered_64",
-            IndexOptions::default().nlist(Some(64)),
+            IndexOptions::default().kind(IndexKind::Sq8).nlist(Some(64)),
         ),
     ] {
         let indexed = OnceCell::new();
@@ -727,7 +731,7 @@ fn cpu(c: &mut Criterion) {
         .enable_all()
         .build()
         .expect("runtime");
-    let clustered = IndexOptions::default().nlist(Some(64));
+    let clustered = IndexOptions::default().kind(IndexKind::Sq8).nlist(Some(64));
     let ns: OnceCell<Arc<Namespace>> = OnceCell::new();
     let ns = || ns.get_or_init(|| Arc::new(rt.block_on(segment_100k(Some(&clustered)))));
     let mut rng = Rng(11);

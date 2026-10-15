@@ -102,8 +102,8 @@ pub struct Namespace {
     wal_level: AtomicU32,
     /// The most bytes one query or one compaction run may read.
     read_budget: u64,
-    /// How ranged reads turn "these pieces of this object" into requests
-    ///. Defaults to [`FetchPolicy::object_store`]; set it with
+    /// How ranged reads turn "these pieces of this object" into requests.
+    /// Defaults to [`FetchPolicy::object_store`]; set it with
     /// [`with_fetch_policy`](Self::with_fetch_policy).
     fetch_policy: FetchPolicy,
     /// Parsed structures kept between queries, set with
@@ -128,8 +128,7 @@ pub(crate) fn validate_id(id: &str) -> Result<()> {
 }
 
 /// How many times `query` reads against a manifest before it gives up, when
-/// the segments it needs keep vanishing because the manifest keeps moving
-///.
+/// the segments it needs keep vanishing because the manifest keeps moving.
 const MAX_READ_ATTEMPTS: u32 = 3;
 
 impl Namespace {
@@ -939,8 +938,8 @@ impl Namespace {
         }
     }
 
-    /// Build and publish an index for each live segment that has none
-    ///. An index lets a query search a segment without reading it whole
+    /// Build and publish an index for each live segment that has none.
+    /// An index lets a query search a segment without reading it whole
     /// (see [`query`](Self::query)); a segment with no index is read whole, as it
     /// always was, so a namespace never has to be indexed.
     ///

@@ -359,8 +359,8 @@ pub(crate) struct SegmentWriter {
 
 impl SegmentWriter {
     /// A writer for `version` 2 or 3 with vectors of length `dim`. At
-    /// version 3 a typed `attrs` schema stores attributes as columns
-    ///; version 2, and a free-form schema, store JSON.
+    /// version 3 a typed `attrs` schema stores attributes as columns;
+    /// version 2, and a free-form schema, store JSON.
     ///
     /// # Errors
     ///

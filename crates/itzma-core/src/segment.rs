@@ -304,8 +304,8 @@ pub(crate) fn encode_parts(
         });
         writer.attr_blocks(blocks.into_iter().collect::<Result<_>>()?)?;
     }
-    // JSON per document, a block per chunk in parallel on a pool thread
-    //, unless the writer takes the values themselves; the chunks
+    // JSON per document, a block per chunk in parallel on a pool thread,
+    // unless the writer takes the values themselves; the chunks
     // come back in order, so the bytes are the same either way.
     let mut json: Vec<Vec<u8>> = Vec::new();
     if !columnar {
@@ -379,8 +379,8 @@ pub(crate) fn missing(path: &Path) -> ItzmaError {
 }
 
 /// Whether `err` is what [`missing`] builds. Garbage collection deletes
-/// segments, so a missing one may only mean the caller read a stale manifest
-///. Callers reload the manifest before treating it as damage.
+/// segments, so a missing one may only mean the caller read a stale manifest.
+/// Callers reload the manifest before treating it as damage.
 pub(crate) fn is_missing(err: &ItzmaError) -> bool {
     matches!(err, ItzmaError::CorruptSegment { reason, .. } if reason == MISSING)
 }
@@ -490,8 +490,7 @@ impl<'a> Reader<'a> {
 /// whole thing. `RangedSegment::vectors_of`
 /// returns this instead of `Vec<Vec<f32>>` (one heap allocation per row) so
 /// a rerank walks contiguous memory and the distance kernels see
-/// one slice per row of the same buffer. A scan hands one out per batch
-///.
+/// one slice per row of the same buffer. A scan hands one out per batch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Matrix {
     pub(crate) rows: usize,

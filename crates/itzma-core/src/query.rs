@@ -250,8 +250,7 @@ struct Indexed<'a> {
 enum Attrs {
     Have(Option<serde_json::Value>),
     Row(u32),
-    /// A row of one view of a columnar run, parsed only if it is a final hit
-    ///.
+    /// A row of one view of a columnar run, parsed only if it is a final hit.
     InView {
         view: usize,
         row: usize,

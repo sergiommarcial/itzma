@@ -2,8 +2,8 @@
 //!
 //! It answers "might this id be in the segment?" so a query can skip the
 //! block reads that check whether a newer segment shadows a candidate. The
-//! bytes go into the segment object, and segments are compared byte for byte
-//!, so the filter must be a pure function of its keys: a fixed
+//! bytes go into the segment object, and segments are compared byte for byte,
+//! so the filter must be a pure function of its keys: a fixed
 //! hash written here, no library and no per-process seed.
 
 /// Bits stored per key.

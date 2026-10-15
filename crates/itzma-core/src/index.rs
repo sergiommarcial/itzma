@@ -26,8 +26,11 @@
 //! | `data_size` | u64, the size of the segment's data object |
 //! | `head_len` | u64, everything before the first partition, the prefix included |
 
+pub(crate) mod hnsw;
 pub(crate) mod kmeans;
 pub(crate) mod sq8;
+
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -35,7 +38,7 @@ use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectStore};
 
 use crate::budget::ReadBudget;
-use crate::decoded::DecodedRef;
+use crate::decoded::{DecodedRef, What};
 use crate::document::Metric;
 use crate::error::{ItzmaError, Result};
 use crate::fetch::FetchPolicy;
@@ -54,18 +57,23 @@ pub(crate) enum Kind {
     /// Scalar quantization to 8 bits per dimension, scanned exhaustively
     /// inside the partitions it probes (`sq8`).
     Sq8,
+    /// Segmented HNSW: a graph over SQ8-quantized codes, traversed directly
+    /// out of the cached object bytes (`hnsw`).
+    Hnsw,
 }
 
 impl Kind {
     pub(crate) fn id(self) -> u32 {
         match self {
             Kind::Sq8 => 1,
+            Kind::Hnsw => 2,
         }
     }
 
     pub(crate) fn from_id(id: u32) -> Option<Kind> {
         match id {
             1 => Some(Kind::Sq8),
+            2 => Some(Kind::Hnsw),
             _ => None,
         }
     }
@@ -73,12 +81,14 @@ impl Kind {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Kind::Sq8 => "sq8",
+            Kind::Hnsw => "hnsw",
         }
     }
 
     pub(crate) fn from_name(name: &str) -> Option<Kind> {
         match name {
             "sq8" => Some(Kind::Sq8),
+            "hnsw" => Some(Kind::Hnsw),
             _ => None,
         }
     }
@@ -87,6 +97,7 @@ impl Kind {
     pub(crate) fn algorithm(self) -> &'static dyn Algorithm {
         match self {
             Kind::Sq8 => &sq8::Sq8,
+            Kind::Hnsw => &hnsw::Hnsw,
         }
     }
 }
@@ -404,7 +415,7 @@ pub(crate) struct Opened {
 /// Read the prefix and the head of an index of `kind`, and check that they
 /// belong to the segment the probe is about. One request when the head fits the
 /// guess, two otherwise. Nothing is sized from the object before the object's
-/// real size has been compared with it. Always fetched and charged.
+/// real size has been compared with it.
 ///
 /// # Errors
 ///
@@ -412,7 +423,29 @@ pub(crate) struct Opened {
 /// [`is_missing`]), too short, of another kind, built for another segment, or
 /// whose head runs past its end. [`ItzmaError::UnsupportedFormat`] for a
 /// container version this build does not read.
-pub(crate) async fn open(probe: &Probe<'_>, kind: Kind) -> Result<Opened> {
+///
+/// With a decoded cache in the probe, a head opened before is served from it
+/// with no request and no charge.
+pub(crate) async fn open(probe: &Probe<'_>, kind: Kind) -> Result<Arc<Opened>> {
+    match probe.decoded {
+        Some(decoded) => {
+            decoded
+                .get_or_load(probe.path, What::IndexHead, || async {
+                    let mut opened = open_uncached(probe, kind).await?;
+                    // Its own buffer, so the kept head does not pin the whole
+                    // first read it was sliced from.
+                    opened.body = Bytes::copy_from_slice(&opened.body);
+                    let weight = opened.body.len() as u64;
+                    Ok((opened, weight))
+                })
+                .await
+        }
+        None => Ok(Arc::new(open_uncached(probe, kind).await?)),
+    }
+}
+
+/// [`open`] with no cache: always fetched and charged.
+pub(crate) async fn open_uncached(probe: &Probe<'_>, kind: Kind) -> Result<Opened> {
     let name = probe.path.as_ref();
     probe.budget.charge(name, HEAD_GUESS)?;
     let options = GetOptions {
@@ -588,6 +621,11 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    pub(crate) fn u16(&mut self) -> Result<u16> {
+        let bytes = self.take(2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
     pub(crate) fn u32(&mut self) -> Result<u32> {
         let bytes = self.take(4)?;
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
@@ -602,6 +640,14 @@ impl<'a> Reader<'a> {
 
     pub(crate) fn f32(&mut self) -> Result<f32> {
         Ok(f32::from_bits(self.u32()?))
+    }
+
+    /// How many bytes have been consumed so far. Used where a decoder needs
+    /// to know exactly where one variable-length record ended and the next
+    /// begins (the HNSW node-directory chain check), the same role
+    /// `head_len` plays for SQ8's fixed-size partition table.
+    pub(crate) fn pos(&self) -> usize {
+        self.pos
     }
 }
 
@@ -648,7 +694,10 @@ mod tests {
         assert_eq!(Kind::Sq8.name(), "sq8");
         assert_eq!(Kind::from_id(1), Some(Kind::Sq8));
         assert_eq!(Kind::from_name("sq8"), Some(Kind::Sq8));
-        assert_eq!(Kind::from_id(2), None, "kind 2 is not read here");
+        assert_eq!(Kind::Hnsw.id(), 2);
+        assert_eq!(Kind::Hnsw.name(), "hnsw");
+        assert_eq!(Kind::from_id(2), Some(Kind::Hnsw));
+        assert_eq!(Kind::from_name("hnsw"), Some(Kind::Hnsw));
         assert_eq!(Kind::from_name("graph"), None);
         assert_eq!(Kind::from_id(0), None);
         assert_eq!(Kind::from_id(3), None);
