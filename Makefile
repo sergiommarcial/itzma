@@ -4,12 +4,14 @@
 # Cargo.toml stays the single source of truth.
 RUST_MIN := $(shell sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
 
+# Where compose.yaml publishes its MinIO container.
+S3_ENDPOINT := http://127.0.0.1:9000
 
 
-.PHONY: help check-tools check-cargo check-cargo-deny check-cargo-machete \
+.PHONY: help check-tools check-cargo check-cargo-deny check-cargo-machete check-docker \
 	install install-tools \
 	build build-release \
-	test test-fast test-msrv \
+	test test-fast test-msrv test-s3 s3-up s3-down \
 	lint fmt-check clippy doc deny machete \
 	format doc-open \
 	ci clean
@@ -41,6 +43,12 @@ check-cargo-machete: ## Verify cargo-machete is installed
 	@cargo machete --version >/dev/null 2>&1 || { echo "cargo-machete not found — run: make install-tools"; exit 1; }
 	@echo "cargo-machete: OK ($$(cargo machete --version))"
 
+check-docker: ## Verify docker and docker compose are installed and the daemon is running
+	@command -v docker >/dev/null 2>&1 || { echo "docker not found — install: https://docs.docker.com/get-docker/"; exit 1; }
+	@docker compose version >/dev/null 2>&1 || { echo "docker compose not found"; exit 1; }
+	@docker info >/dev/null 2>&1 || { echo "docker daemon is not running"; exit 1; }
+	@echo "docker: OK ($$(docker --version))"
+
 ##@ Setup
 
 install: check-cargo ## Fetch the locked dependencies (after verifying the toolchain)
@@ -70,6 +78,17 @@ test-msrv: ## Run the tests on the rust-version floor (needs rustup; the second 
 test-fast: check-cargo ## Per-task check: the library's unit tests plus the named integration test files only, no doctests or benches. Example: make test-fast TESTS="query filter"
 	cargo test --locked -p itzma-core --lib $(foreach t,$(TESTS),--test $(t))
 
+test-s3: check-cargo s3-up ## Run the tests against a real S3-compatible store (MinIO via docker compose)
+	ITZMA_TEST_S3_ENDPOINT=$(S3_ENDPOINT) cargo test --locked
+
+##@ S3 test server
+
+s3-up: check-docker ## Start MinIO and create the test bucket (compose.yaml)
+	docker compose up -d --wait
+
+s3-down: check-docker ## Stop MinIO and delete its data
+	docker compose down -v
+
 ##@ Linting & formatting
 
 lint: fmt-check clippy doc deny machete ## Run all static analysis (no files written)
@@ -97,7 +116,7 @@ doc-open: check-cargo ## Build rustdoc and open it in the browser
 
 ##@ CI
 
-ci: lint test ## Run what .github/workflows/ci.yml runs on stable
+ci: lint test ## Run what .github/workflows/ci.yml runs on stable, without docker (test-s3 and test-msrv cover the other two test jobs)
 
 ##@ Cleanup
 

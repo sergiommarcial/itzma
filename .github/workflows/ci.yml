@@ -53,6 +53,23 @@ jobs:
       - name: unit, integration, and doctests
         run: cargo test --locked
 
+  test-s3:
+    name: test (S3, MinIO)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: start MinIO and create the bucket
+        run: docker compose up -d --wait
+      - name: storage tests against S3
+        run: cargo test --locked
+        env:
+          ITZMA_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      - name: MinIO logs
+        if: failure()
+        run: docker compose logs minio
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest

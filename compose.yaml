@@ -1,0 +1,26 @@
+# A local S3-compatible store for the integration tests. Start it with
+# `make s3-up`; `make test-s3` runs the whole suite against it. The credentials
+# are throwaway and the port is bound to localhost only.
+services:
+  minio:
+    # MinIO no longer publishes public images (Docker Hub is gone and quay.io
+    # now needs a login). Chainguard's build is free to pull anonymously, but
+    # only as :latest, and it ships sh and mc, which the lines below use.
+    image: cgr.dev/chainguard/minio:latest
+    # The image runs as uid 65532, which cannot create /data.
+    user: "0"
+    # A directory at the top of the data dir is a bucket, so this creates
+    # `itzma-test` without a second init container (which `up --wait` would
+    # report as a failure once it exits).
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["mkdir -p /data/itzma-test && exec minio server /data"]
+    ports:
+      - "127.0.0.1:9000:9000"
+    environment:
+      MINIO_ROOT_USER: itzma
+      MINIO_ROOT_PASSWORD: itzma-test-secret
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 30

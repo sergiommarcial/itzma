@@ -236,6 +236,8 @@ Every fallible call returns `itzma_core::Result<T>` with `ItzmaError`, which is 
 
 Anything that implements `object_store::ObjectStore` works: S3, GCS, Azure, local disk, memory. Itzma needs put-if-absent (writes, create) and conditional update (every manifest change: compaction, indexing, format upgrades). `InMemory` and S3 have both. `LocalFileSystem` has no conditional update, so on local disk you can create, write and query, but `compact`, `index` and the upgrades fail with a storage error.
 
+The tests run against MinIO as well (`make test-s3`), which checks that conditional writes really are atomic under concurrent writers.
+
 ## Limits
 
 - A query without an index, or with `exact: true`, reads every live vector of the unindexed segments, bounded by the read budget.
@@ -255,6 +257,7 @@ Anything that implements `object_store::ObjectStore` works: S3, GCS, Azure, loca
 make install-tools    # once: cargo-deny and cargo-machete
 make test             # unit, integration and doctests
 make test-fast TESTS="query filter"   # library unit tests plus the named files
+make test-s3          # the tests against MinIO (needs docker)
 make lint             # fmt, clippy, rustdoc, cargo-deny, cargo-machete
 make ci               # what CI runs on stable
 ```
