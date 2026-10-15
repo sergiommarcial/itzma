@@ -36,5 +36,11 @@ object_store = { version = "0.14", features = ["aws"] }
 # For cache.rs's tests, which build an ObjectMeta by hand.
 chrono = "0.4"
 tempfile = "3"
+# Timings in benches/core.rs. Default features add plotting and rayon, neither
+# of which is used.
+criterion = { version = "0.8", default-features = false, features = ["async_tokio"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
+[[bench]]
+name = "core"
+harness = false

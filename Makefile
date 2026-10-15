@@ -11,7 +11,7 @@ S3_ENDPOINT := http://127.0.0.1:9000
 .PHONY: help check-tools check-cargo check-cargo-deny check-cargo-machete check-docker \
 	install install-tools \
 	build build-release \
-	test test-fast test-msrv test-s3 s3-up s3-down \
+	test test-fast test-msrv test-s3 s3-up s3-down bench \
 	lint fmt-check clippy doc deny machete \
 	format doc-open \
 	ci clean
@@ -67,8 +67,9 @@ build-release: check-cargo ## Build the workspace (release)
 
 ##@ Testing
 
-test: check-cargo ## Run unit, integration, and doctests
+test: check-cargo ## Run unit, integration, and doctests, and each benchmark once
 	cargo test --locked
+	cargo test --locked --bench core
 
 test-msrv: ## Run the tests on the rust-version floor (needs rustup; the second leg of CI's test job)
 	@command -v rustup >/dev/null 2>&1 || { echo "rustup not found — install: https://rustup.rs"; exit 1; }
@@ -80,6 +81,9 @@ test-fast: check-cargo ## Per-task check: the library's unit tests plus the name
 
 test-s3: check-cargo s3-up ## Run the tests against a real S3-compatible store (MinIO via docker compose)
 	ITZMA_TEST_S3_ENDPOINT=$(S3_ENDPOINT) cargo test --locked
+
+bench: check-cargo ## Run the benchmarks (crates/itzma-core/benches, in-memory store, about 90 s)
+	cargo bench --locked --bench core
 
 ##@ S3 test server
 

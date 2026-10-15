@@ -257,11 +257,12 @@ The tests run against MinIO as well (`make test-s3`), which checks that conditio
 
 ```bash
 make install-tools    # once: cargo-deny and cargo-machete
-make test             # unit, integration and doctests
+make test             # unit, integration and doctests, each benchmark once
 make test-fast TESTS="query filter"   # library unit tests plus the named files
 make test-s3          # the tests against MinIO (needs docker)
 make lint             # fmt, clippy, rustdoc, cargo-deny, cargo-machete
 make ci               # what CI runs on stable
+make bench            # timings, in-memory store
 ```
 
 Requires Rust 1.87 or newer (edition 2024).

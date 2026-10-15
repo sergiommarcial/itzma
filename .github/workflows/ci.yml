@@ -52,6 +52,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: unit, integration, and doctests
         run: cargo test --locked
+      - name: benchmarks, run once each
+        run: cargo test --locked --bench core
 
   test-s3:
     name: test (S3, MinIO)
