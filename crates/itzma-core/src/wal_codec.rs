@@ -37,6 +37,7 @@ use std::io::Read;
 
 use bytes::Bytes;
 
+use crate::columns::{AttrColumn, DocColumns};
 use crate::document::{Document, WalOp};
 use crate::error::{ItzmaError, Result};
 use crate::wal::WalEntry;
@@ -219,6 +220,218 @@ fn frame(body: Vec<u8>, key: Option<&str>) -> Result<Keyed> {
         bytes: Bytes::from(out),
         body_len,
     })
+}
+
+/// Encode a columnar batch as the version 2 object that [`encode`]
+/// writes for the same documents, byte for byte: every row an upsert,
+/// attributes written as JSON straight from the columns. Same size rule and
+/// errors as [`encode`] (the batch's shape was checked when it was built).
+pub(crate) fn encode_columns(cols: &DocColumns, max_body: usize) -> Result<Bytes> {
+    Ok(encode_columns_with(cols, max_body, None)?.bytes)
+}
+
+/// [`encode_columns`] as a version 3 object carrying `key`, as
+/// [`encode_keyed`] writes it.
+pub(crate) fn encode_columns_keyed(cols: &DocColumns, max_body: usize, key: &str) -> Result<Keyed> {
+    validate_key(key)?;
+    encode_columns_with(cols, max_body, Some(key))
+}
+
+/// The exact body length [`encode_columns`] would write for `cols`.
+// The tests check it against `body_size`; the stream's chunker sums
+// `row_body_bytes` instead, row by row.
+#[cfg(test)]
+pub(crate) fn columns_body_size(cols: &DocColumns) -> u64 {
+    let mut scratch = Vec::new();
+    let attrs: u64 = (0..cols.rows())
+        .map(|row| {
+            scratch.clear();
+            write_row_attrs(cols, row, &mut scratch);
+            4 + scratch.len() as u64
+        })
+        .sum();
+    columns_size(cols, attrs)
+}
+
+/// What row `row` adds to a body: its kind byte, its id, its vector and its
+/// attribute entry. A body is [`COUNTS_LEN`] plus this over its rows, so the
+/// stream's chunker can cut a batch at a size without encoding it.
+pub(crate) fn row_body_bytes(cols: &DocColumns, row: usize, scratch: &mut Vec<u8>) -> u64 {
+    scratch.clear();
+    write_row_attrs(cols, row, scratch);
+    1 + 4 + cols.id(row).len() as u64 + cols.dim() as u64 * 4 + 4 + scratch.len() as u64
+}
+
+/// The body length given the attribute column's total length (length
+/// prefixes included).
+fn columns_size(cols: &DocColumns, attrs: u64) -> u64 {
+    let rows = cols.rows() as u64;
+    let ids: u64 = (0..cols.rows())
+        .map(|row| 4 + cols.id(row).len() as u64)
+        .sum();
+    let vectors = (cols.vectors().len() as u64).saturating_mul(4);
+    COUNTS_LEN as u64 + rows + ids + vectors + attrs
+}
+
+fn encode_columns_with(cols: &DocColumns, max_body: usize, key: Option<&str>) -> Result<Keyed> {
+    let rows = cols.rows();
+    // Every row's attribute entry, one after the other, and where each ends.
+    let mut attrs = Vec::new();
+    let mut attr_ends = Vec::with_capacity(rows);
+    for row in 0..rows {
+        write_row_attrs(cols, row, &mut attrs);
+        attr_ends.push(attrs.len());
+    }
+    let size = columns_size(cols, 4 * rows as u64 + attrs.len() as u64);
+    if size > max_body as u64 {
+        return Err(ItzmaError::BatchTooLarge {
+            bytes: size,
+            max: max_body as u64,
+        });
+    }
+
+    let mut body = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+    // A batch of no upserts has no vectors and `encode` writes dim 0.
+    let dim = if rows == 0 { 0 } else { cols.dim() };
+    body.extend_from_slice(&len32(rows)?.to_le_bytes());
+    body.extend_from_slice(&len32(rows)?.to_le_bytes());
+    body.extend_from_slice(&len32(dim)?.to_le_bytes());
+    body.resize(body.len() + rows, KIND_UPSERT);
+    for row in 0..rows {
+        put_bytes(&mut body, cols.id(row).as_bytes())?;
+    }
+
+    // The vectors are row-major already, which is the order `build_body`
+    // walks them in.
+    let values = cols.vectors();
+    let plane_len = values.len();
+    let start = body.len();
+    body.resize(start + plane_len * 4, 0);
+    for (i, x) in values.iter().enumerate() {
+        for (k, byte) in x.to_le_bytes().into_iter().enumerate() {
+            body[start + k * plane_len + i] = byte;
+        }
+    }
+
+    let mut from = 0;
+    for end in attr_ends {
+        put_bytes(&mut body, &attrs[from..end])?;
+        from = end;
+    }
+    frame(body, key)
+}
+
+/// Row `row`'s attributes as the JSON `serde_json::to_vec` writes for the
+/// same object: nothing when the batch has no attribute columns, otherwise
+/// every column in name order (the batch keeps them sorted, as
+/// `serde_json`'s map does), `null` for a row that is not valid.
+fn write_row_attrs(cols: &DocColumns, row: usize, out: &mut Vec<u8>) {
+    let columns = cols.attrs();
+    if columns.is_empty() {
+        return;
+    }
+    out.push(b'{');
+    for (at, (name, column)) in columns.iter().enumerate() {
+        if at > 0 {
+            out.push(b',');
+        }
+        json_str(out, name);
+        out.push(b':');
+        write_value(column, row, out);
+    }
+    out.push(b'}');
+}
+
+fn write_value(column: &AttrColumn, row: usize, out: &mut Vec<u8>) {
+    if column.is_null(row) {
+        out.extend_from_slice(b"null");
+        return;
+    }
+    match column {
+        AttrColumn::Null { .. } => out.extend_from_slice(b"null"),
+        AttrColumn::Bool { values, .. } => {
+            out.extend_from_slice(if values[row] { b"true" } else { b"false" });
+        }
+        AttrColumn::I64 { values, .. } => json_number(out, &values[row]),
+        AttrColumn::F64 { values, .. } => json_number(out, &values[row]),
+        AttrColumn::Text { bytes, offsets, .. } => {
+            json_str(out, AttrColumn::text(bytes, offsets, row));
+        }
+        AttrColumn::I64Set {
+            offsets,
+            items_valid,
+            values,
+            ..
+        } => json_array(
+            out,
+            AttrColumn::items(offsets, row),
+            items_valid,
+            |out, i| {
+                json_number(out, &values[i]);
+            },
+        ),
+        AttrColumn::F64Set {
+            offsets,
+            items_valid,
+            values,
+            ..
+        } => json_array(
+            out,
+            AttrColumn::items(offsets, row),
+            items_valid,
+            |out, i| {
+                json_number(out, &values[i]);
+            },
+        ),
+        AttrColumn::TextSet {
+            offsets,
+            items_valid,
+            bytes,
+            byte_offsets,
+            ..
+        } => json_array(
+            out,
+            AttrColumn::items(offsets, row),
+            items_valid,
+            |out, i| {
+                json_str(out, AttrColumn::text(bytes, byte_offsets, i));
+            },
+        ),
+    }
+}
+
+fn json_array(
+    out: &mut Vec<u8>,
+    items: std::ops::Range<usize>,
+    items_valid: &[bool],
+    mut item: impl FnMut(&mut Vec<u8>, usize),
+) {
+    out.push(b'[');
+    for (at, i) in items.enumerate() {
+        if at > 0 {
+            out.push(b',');
+        }
+        if items_valid[i] {
+            item(out, i);
+        } else {
+            out.extend_from_slice(b"null");
+        }
+    }
+    out.push(b']');
+}
+
+/// A string through `serde_json`'s own escaping, so the bytes match a
+/// `Value::String` written by `serde_json::to_vec`. Writing to a `Vec`
+/// cannot fail.
+fn json_str(out: &mut Vec<u8>, s: &str) {
+    let _ = serde_json::to_writer(&mut *out, s);
+}
+
+/// A number through `serde_json`: `5` for an integer, `5.0` for a float, as
+/// a `Value::Number` built from either writes it. A non-finite float would
+/// come out as `null`; the batch's checks refuse one first.
+fn json_number<T: serde::Serialize>(out: &mut Vec<u8>, n: &T) {
+    let _ = serde_json::to_writer(&mut *out, n);
 }
 
 /// The number of upserts and the shared vector length (0 with no upserts).
@@ -1325,5 +1538,330 @@ mod tests {
         assert!(matches!(&err, ItzmaError::CorruptWal { path, .. } if path == "wal/test"));
         assert!(!is_fenced(&corrupt("wal/test", "bad magic")));
         assert!(!is_fenced(&ItzmaError::EmptyBatch));
+    }
+}
+
+/// `encode_columns` against `encode`: the same batch, given as
+/// columns and as documents built here from the same raw cells, must give
+/// the same bytes.
+#[cfg(test)]
+mod column_tests {
+    use serde_json::{Map, Number, Value};
+
+    use super::*;
+    use crate::columns::{AttrColumn, DocColumns};
+
+    const BIG: usize = 1 << 30;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+
+        fn text(&mut self, min: u64, max: u64) -> String {
+            const CHARS: [&str; 10] = ["a", "Z", "\"", "\\", "é", "\n", "😀", " ", "0", "\u{1}"];
+            let len = min + self.below(max - min + 1);
+            (0..len)
+                .map(|_| CHARS[self.below(CHARS.len() as u64) as usize])
+                .collect()
+        }
+
+        fn int(&mut self) -> i64 {
+            match self.below(4) {
+                0 => i64::MIN,
+                1 => i64::MAX,
+                _ => self.below(2_000) as i64 - 1_000,
+            }
+        }
+
+        fn float(&mut self) -> f64 {
+            if self.below(2) == 0 {
+                self.below(100) as f64
+            } else {
+                (self.below(1_000_000) as f64 - 500_000.0) / 7.0
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Null,
+        Bool,
+        I64,
+        F64,
+        Text,
+        I64Set,
+        F64Set,
+        TextSet,
+    }
+
+    const KINDS: [Kind; 8] = [
+        Kind::Null,
+        Kind::Bool,
+        Kind::I64,
+        Kind::F64,
+        Kind::Text,
+        Kind::I64Set,
+        Kind::F64Set,
+        Kind::TextSet,
+    ];
+
+    #[derive(Clone)]
+    enum Cell {
+        Null,
+        Bool(bool),
+        I64(i64),
+        F64(f64),
+        Text(String),
+        I64Set(Vec<Option<i64>>),
+        F64Set(Vec<Option<f64>>),
+        TextSet(Vec<Option<String>>),
+    }
+
+    fn cell(rng: &mut Rng, kind: Kind) -> Cell {
+        let items = rng.below(5) as usize;
+        let null_item = |rng: &mut Rng| rng.below(4) == 0;
+        match kind {
+            Kind::Null => Cell::Null,
+            Kind::Bool => Cell::Bool(rng.below(2) == 0),
+            Kind::I64 => Cell::I64(rng.int()),
+            Kind::F64 => Cell::F64(rng.float()),
+            Kind::Text => Cell::Text(rng.text(0, 8)),
+            Kind::I64Set => Cell::I64Set(
+                (0..items)
+                    .map(|_| (!null_item(rng)).then(|| rng.int()))
+                    .collect(),
+            ),
+            Kind::F64Set => Cell::F64Set(
+                (0..items)
+                    .map(|_| (!null_item(rng)).then(|| rng.float()))
+                    .collect(),
+            ),
+            Kind::TextSet => Cell::TextSet(
+                (0..items)
+                    .map(|_| (!null_item(rng)).then(|| rng.text(0, 5)))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn json(cell: &Cell) -> Value {
+        let float = |f: f64| Value::Number(Number::from_f64(f).unwrap());
+        match cell {
+            Cell::Null => Value::Null,
+            Cell::Bool(b) => Value::Bool(*b),
+            Cell::I64(i) => Value::from(*i),
+            Cell::F64(f) => float(*f),
+            Cell::Text(s) => Value::String(s.clone()),
+            Cell::I64Set(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|i| i.map_or(Value::Null, Value::from))
+                    .collect(),
+            ),
+            Cell::F64Set(items) => {
+                Value::Array(items.iter().map(|f| f.map_or(Value::Null, float)).collect())
+            }
+            Cell::TextSet(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|s| s.clone().map_or(Value::Null, Value::String))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The column for `cells`, a `Null` cell being a row that is not valid.
+    fn column(kind: Kind, cells: &[Cell]) -> AttrColumn {
+        let valid: Vec<bool> = cells.iter().map(|c| !matches!(c, Cell::Null)).collect();
+        let mut offsets = vec![0u32];
+        let mut items_valid = Vec::new();
+        let mut bytes = Vec::new();
+        let mut byte_offsets = vec![0u32];
+        let mut ints = Vec::new();
+        let mut floats = Vec::new();
+        let mut bools = Vec::new();
+        for c in cells {
+            match c {
+                // A null row still takes a slot in a scalar column's values;
+                // a set or text column gives it no items or bytes.
+                Cell::Null => match kind {
+                    Kind::Bool => bools.push(false),
+                    Kind::I64 => ints.push(0),
+                    Kind::F64 => floats.push(0.0),
+                    _ => {}
+                },
+                Cell::Bool(b) => bools.push(*b),
+                Cell::I64(i) => ints.push(*i),
+                Cell::F64(f) => floats.push(*f),
+                Cell::Text(s) => bytes.extend_from_slice(s.as_bytes()),
+                Cell::I64Set(items) => {
+                    for i in items {
+                        items_valid.push(i.is_some());
+                        ints.push(i.unwrap_or(0));
+                    }
+                }
+                Cell::F64Set(items) => {
+                    for f in items {
+                        items_valid.push(f.is_some());
+                        floats.push(f.unwrap_or(0.0));
+                    }
+                }
+                Cell::TextSet(items) => {
+                    for s in items {
+                        items_valid.push(s.is_some());
+                        bytes.extend_from_slice(s.as_deref().unwrap_or("").as_bytes());
+                        byte_offsets.push(bytes.len() as u32);
+                    }
+                }
+            }
+            offsets.push(match kind {
+                Kind::Text => bytes.len() as u32,
+                _ => items_valid.len() as u32,
+            });
+        }
+        match kind {
+            Kind::Null => AttrColumn::Null { rows: cells.len() },
+            Kind::Bool => AttrColumn::Bool {
+                valid,
+                values: bools,
+            },
+            Kind::I64 => AttrColumn::I64 {
+                valid,
+                values: ints,
+            },
+            Kind::F64 => AttrColumn::F64 {
+                valid,
+                values: floats,
+            },
+            Kind::Text => AttrColumn::Text {
+                valid,
+                bytes,
+                offsets,
+            },
+            Kind::I64Set => AttrColumn::I64Set {
+                valid,
+                offsets,
+                items_valid,
+                values: ints,
+            },
+            Kind::F64Set => AttrColumn::F64Set {
+                valid,
+                offsets,
+                items_valid,
+                values: floats,
+            },
+            Kind::TextSet => AttrColumn::TextSet {
+                valid,
+                offsets,
+                items_valid,
+                bytes,
+                byte_offsets,
+            },
+        }
+    }
+
+    /// One random batch, as columns and as the equivalent upserts.
+    fn case(seed: u64) -> (DocColumns, Vec<WalOp>) {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let rows = [1, 2, 17, 300][rng.below(4) as usize];
+        let dim = [1, 3, 8][rng.below(3) as usize];
+        let ids: Vec<String> = (0..rows).map(|_| rng.text(1, 40)).collect();
+        let vectors: Vec<f32> = (0..rows * dim)
+            .map(|_| (rng.below(20_000) as f32 - 10_000.0) / 3.0)
+            .collect();
+
+        let mut names = Vec::new();
+        let mut columns: Vec<(Kind, Vec<Cell>)> = Vec::new();
+        for _ in 0..rng.below(7) {
+            let name = rng.text(1, 6);
+            if names.contains(&name) {
+                continue;
+            }
+            let kind = KINDS[rng.below(KINDS.len() as u64) as usize];
+            // All valid, all null, or mixed.
+            let mode = rng.below(3);
+            let cells = (0..rows)
+                .map(|_| {
+                    let null = mode == 1 || (mode == 2 && rng.below(3) == 0);
+                    if null {
+                        Cell::Null
+                    } else {
+                        cell(&mut rng, kind)
+                    }
+                })
+                .collect();
+            names.push(name);
+            columns.push((kind, cells));
+        }
+        let mut id_bytes = Vec::new();
+        let mut id_offsets = vec![0u32];
+        for id in &ids {
+            id_bytes.extend_from_slice(id.as_bytes());
+            id_offsets.push(id_bytes.len() as u32);
+        }
+        let mut cols = DocColumns::new(id_bytes, id_offsets, vectors.clone(), dim).unwrap();
+        for (name, (kind, cells)) in names.iter().zip(&columns) {
+            cols = cols.with_attr(name.clone(), column(*kind, cells)).unwrap();
+        }
+        let ops = (0..rows)
+            .map(|row| {
+                WalOp::Upsert(Document {
+                    id: ids[row].clone(),
+                    vector: vectors[row * dim..(row + 1) * dim].to_vec(),
+                    attrs: (!columns.is_empty()).then(|| {
+                        let mut map = Map::new();
+                        for (name, (_, cells)) in names.iter().zip(&columns) {
+                            map.insert(name.clone(), json(&cells[row]));
+                        }
+                        Value::Object(map)
+                    }),
+                })
+            })
+            .collect();
+        (cols, ops)
+    }
+
+    #[test]
+    fn encode_columns_equals_encode() {
+        for seed in 0..500 {
+            let (cols, ops) = case(seed);
+            assert_eq!(
+                encode_columns(&cols, BIG).unwrap(),
+                encode(&ops, BIG).unwrap(),
+                "seed {seed}"
+            );
+            assert_eq!(
+                encode_columns_keyed(&cols, BIG, "k").unwrap().bytes,
+                encode_keyed(&ops, BIG, "k").unwrap().bytes,
+                "seed {seed}, keyed"
+            );
+        }
+    }
+
+    #[test]
+    fn the_size_limit_is_at_the_same_byte() {
+        for seed in 0..50 {
+            let (cols, ops) = case(seed);
+            let size = columns_body_size(&cols);
+            let (upserts, dim) = shape(&ops).unwrap();
+            let attrs = attribute_json(&ops).unwrap();
+            assert_eq!(size, body_size(&ops, upserts, dim, &attrs), "seed {seed}");
+            let at = usize::try_from(size).unwrap();
+            assert!(matches!(
+                encode_columns(&cols, at - 1),
+                Err(ItzmaError::BatchTooLarge { bytes, max }) if bytes == size && max == size - 1
+            ));
+            assert!(encode_columns(&cols, at).is_ok());
+        }
     }
 }

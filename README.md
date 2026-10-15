@@ -114,6 +114,8 @@ A batch is one object and is refused above 64 MiB uncompressed (`BatchTooLarge`)
 
 A write that fails after the request was sent may or may not have landed. A plain retry can append it twice, which is harmless for the end state of upserts and deletes but can overwrite a newer write to the same id. For loads that must land once, use the keyed forms, `upsert_keyed` and `delete_keyed`, with a `WriteKey`: `WriteKey::new(key)` on the first attempt, `WriteKey::retry(key, from)` on a retry, which looks for the key from sequence `from` on and returns the original's sequence number if it finds it.
 
+Columnar input: `upsert_columns` takes a `DocColumns` (ids, a row-major `f32` matrix, typed attribute columns) as one batch, and `upsert_stream` takes a stream of them, cut into objects of about `StreamOptions::target_bytes` and written in order. A failed stream reports how much landed. The Python bridge uses these for Arrow input.
+
 ## Querying
 
 `query(vector, top_k)` returns up to `top_k` hits, closest first, each with its id, distance and attributes. `query_with` takes `QueryOptions`:

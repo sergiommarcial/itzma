@@ -118,6 +118,13 @@ pub enum ItzmaError {
     #[error("invalid attributes: {0}")]
     InvalidAttrs(&'static str),
 
+    /// A [`DocColumns`](crate::DocColumns) batch is malformed: offsets that do
+    /// not start at zero, go down or overrun their buffer, a column that does
+    /// not mark every row, text that is not UTF-8, a repeated or empty column
+    /// name, or batches of one stream that do not share their columns.
+    #[error("invalid columns: {0}")]
+    InvalidColumns(&'static str),
+
     /// [`QueryOptions`](crate::QueryOptions) that cannot be run: a shortlist
     /// factor or a probe count of zero.
     #[error("invalid query options: {0}")]

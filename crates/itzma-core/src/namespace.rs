@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use object_store::ObjectStore;
 
 use crate::budget::{DEFAULT_READ_BUDGET, ReadBudget};
+use crate::columns::DocColumns;
 use crate::compaction::{self, Compaction, CompactionOptions};
 use crate::decoded::{DecodedCache, DecodedRef};
 use crate::document;
@@ -34,6 +35,7 @@ use crate::recover::{self, RecoverReport};
 use crate::schema_object;
 use crate::search::Hit;
 use crate::segment;
+use crate::stream::{self, StreamError, StreamOptions, StreamReport};
 use crate::view;
 use crate::wal::{self, WriteKey};
 use crate::wal_codec;
@@ -563,6 +565,156 @@ impl Namespace {
             .await
     }
 
+    /// Insert a columnar batch, one row a document: the same WAL
+    /// object, byte for byte, that [`upsert`](Self::upsert) writes for the
+    /// same documents, without building them. The batch is checked with
+    /// [`DocColumns::validate`] first, and one bad row rejects the whole call
+    /// with nothing written.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`upsert`](Self::upsert). An input with one defect gets
+    /// exactly `upsert`'s error; with several, the first one reported can
+    /// differ (see [`DocColumns::validate`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[tokio::main]
+    /// # async fn main() -> itzma_core::Result<()> {
+    /// use std::sync::Arc;
+    ///
+    /// use itzma_core::{DocColumns, Metric, Namespace, Schema};
+    /// use object_store::memory::InMemory;
+    ///
+    /// let ns = Namespace::create(Arc::new(InMemory::new()), "docs", Schema::new(2, Metric::L2)).await?;
+    /// // Ids "a" and "b", vectors [1, 0] and [0, 1].
+    /// let batch = DocColumns::new(b"ab".to_vec(), vec![0, 1, 2], vec![1.0, 0.0, 0.0, 1.0], 2)?;
+    /// assert_eq!(ns.upsert_columns(&batch).await?, 1);
+    /// assert_eq!(ns.query(&[1.0, 0.0], 1).await?[0].id, "a");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn upsert_columns(&self, cols: &DocColumns) -> Result<u64> {
+        cols.validate(&self.schema)?;
+        let bytes = wal_codec::encode_columns(cols, wal::MAX_BODY_BYTES)?;
+        self.append_bytes(bytes).await
+    }
+
+    /// Load a stream of columnar batches in bounded memory.
+    ///
+    /// The input is cut into chunks of about
+    /// [`StreamOptions::target_bytes`] of encoded body, wherever its own
+    /// batches happen to end, so the same rows always make the same chunks.
+    /// Each chunk is checked as [`upsert_columns`](Self::upsert_columns)
+    /// checks a batch and encoded on the compute pool while the previous one
+    /// is being written; exactly one PUT is in flight, so the chunks land in
+    /// order and a crash can never leave a hole between them. At most
+    /// [`StreamOptions::depth`] encoded chunks wait for the writer, so memory
+    /// is about `(depth + 2) * target_bytes` however long the input is.
+    ///
+    /// Each chunk is its own WAL object, made visible on its own: a reader
+    /// can see the first chunks of a load before the rest.
+    ///
+    /// The batches of one stream must have the same columns: the same `dim`,
+    /// the same attribute names, each attribute column of the same kind (an
+    /// all-null [`AttrColumn::Null`](crate::AttrColumn::Null) fits any kind; a number column cannot
+    /// switch between integers and floats from one batch to the next, which
+    /// `upsert` of documents would allow). Otherwise the stream stops with [`ItzmaError::InvalidColumns`].
+    ///
+    /// # Errors
+    ///
+    /// A [`StreamError`]: the error, and in
+    /// [`landed`](StreamError::landed) what was written before it, whole and
+    /// in order. Chunks the encoder had already queued when a later chunk
+    /// failed its check are written first. The errors are those of
+    /// `upsert_columns`, plus an error from the input itself,
+    /// [`ItzmaError::EmptyBatch`] for an input with no rows, and
+    /// [`ItzmaError::InvalidConfig`] for bad options (before the input is
+    /// polled). To resume an unkeyed load, feed the input again from row
+    /// [`landed.rows`](StreamReport::rows).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[tokio::main]
+    /// # async fn main() -> itzma_core::Result<()> {
+    /// use std::sync::Arc;
+    ///
+    /// use itzma_core::{DocColumns, Metric, Namespace, Schema, StreamOptions};
+    /// use object_store::memory::InMemory;
+    ///
+    /// let ns = Namespace::create(Arc::new(InMemory::new()), "docs", Schema::new(1, Metric::L2)).await?;
+    /// let batches = vec![
+    ///     DocColumns::new(b"a".to_vec(), vec![0, 1], vec![1.0], 1),
+    ///     DocColumns::new(b"b".to_vec(), vec![0, 1], vec![2.0], 1),
+    /// ];
+    /// let report = ns
+    ///     .upsert_stream(futures::stream::iter(batches), &StreamOptions::default())
+    ///     .await
+    ///     .map_err(|e| e.error)?;
+    /// assert_eq!((report.rows, report.objects), (2, 1));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn upsert_stream<S>(
+        &self,
+        input: S,
+        options: &StreamOptions,
+    ) -> std::result::Result<StreamReport, StreamError>
+    where
+        S: futures::Stream<Item = Result<DocColumns>> + Send,
+    {
+        stream::run(self, input, options, None).await
+    }
+
+    /// [`upsert_stream`](Self::upsert_stream) under an idempotency key: chunk
+    /// `n` is written under `<key>#<n>`, so the key can be at most 107 bytes
+    /// (room for `#` and any chunk number). Those chunk keys share the key
+    /// space of [`upsert_keyed`](Self::upsert_keyed): do not give a plain
+    /// keyed write a key of the form `<stream key>#<number>`, or the two can
+    /// be taken for each other.
+    /// A retry with [`WriteKey::retry`] and the same input and
+    /// `target_bytes` cuts the same chunks, finds the ones that landed by
+    /// their keys and writes only the rest, however the input is
+    /// batched the second time. Its `search_from` must be at or before the
+    /// first chunk the first attempt may have written: the failed attempt's
+    /// [`landed.first_seq`](StreamReport::first_seq), or, when that is `None`
+    /// (nothing was acknowledged, though the first put may have landed), the
+    /// namespace's next seq before the first attempt. The search reads the
+    /// headers from there once; each later chunk is looked for only past the
+    /// one before it.
+    ///
+    /// # Errors
+    ///
+    /// Those of `upsert_stream` and [`upsert_keyed`](Self::upsert_keyed);
+    /// [`ItzmaError::InvalidKey`] for a key over 107 bytes, before the input
+    /// is polled.
+    pub async fn upsert_stream_keyed<S>(
+        &self,
+        write: &WriteKey,
+        input: S,
+        options: &StreamOptions,
+    ) -> std::result::Result<StreamReport, StreamError>
+    where
+        S: futures::Stream<Item = Result<DocColumns>> + Send,
+    {
+        stream::run(self, input, options, Some(write)).await
+    }
+
+    /// [`upsert_columns`](Self::upsert_columns) under an idempotency key, with
+    /// the rules of [`upsert_keyed`](Self::upsert_keyed).
+    ///
+    /// # Errors
+    ///
+    /// Those of `upsert_columns` and `upsert_keyed`.
+    pub async fn upsert_columns_keyed(&self, write: &WriteKey, cols: &DocColumns) -> Result<u64> {
+        write.validate()?;
+        cols.validate(&self.schema)?;
+        let object = wal_codec::encode_columns_keyed(cols, wal::MAX_BODY_BYTES, &write.key)?;
+        self.append_bytes_keyed(write, object).await
+    }
+
     /// Remove documents by id under an idempotency key. The keyed form of
     /// [`delete`](Self::delete), with the rules and errors of
     /// [`upsert_keyed`](Self::upsert_keyed).
@@ -1088,6 +1240,30 @@ impl Namespace {
     async fn append(&self, ops: Vec<WalOp>) -> Result<u64> {
         let hint = self.next_seq.load(Ordering::Relaxed);
         let seq = wal::append(&*self.store, &self.id, hint, ops).await?;
+        self.next_seq.fetch_max(seq + 1, Ordering::Relaxed);
+        Ok(seq)
+    }
+
+    /// Commit an object `wal_codec` already encoded, with [`append`]'s hint
+    /// bookkeeping.
+    pub(crate) async fn append_bytes(&self, bytes: bytes::Bytes) -> Result<u64> {
+        let hint = self.next_seq.load(Ordering::Relaxed);
+        let seq = wal::put_encoded(&*self.store, &self.id, hint, bytes).await?;
+        self.next_seq.fetch_max(seq + 1, Ordering::Relaxed);
+        Ok(seq)
+    }
+
+    /// [`append_bytes`](Self::append_bytes) for a keyed object, with
+    /// [`append_keyed`](Self::append_keyed)'s checks.
+    pub(crate) async fn append_bytes_keyed(
+        &self,
+        write: &WriteKey,
+        object: wal_codec::Keyed,
+    ) -> Result<u64> {
+        write.validate()?;
+        self.ensure_wal_level(wal::KEYED_FORMAT_VERSION).await?;
+        let hint = self.next_seq.load(Ordering::Relaxed);
+        let seq = wal::put_encoded_keyed(&*self.store, &self.id, hint, write, object).await?;
         self.next_seq.fetch_max(seq + 1, Ordering::Relaxed);
         Ok(seq)
     }
