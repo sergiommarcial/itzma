@@ -348,6 +348,7 @@ async fn queries_are_unchanged_by_compaction() {
                         id: pool_id(rng.below(POOL)),
                         vector: rng.vector(DIM),
                         attrs: None,
+                        sparse: None,
                     })
                     .collect();
                 for d in &docs {
@@ -925,6 +926,101 @@ async fn a_fault_at_every_operation_of_a_multi_output_merge_converges() {
     }
 }
 
+#[tokio::test]
+async fn a_fold_writes_sparse_bin_only_when_a_document_has_one() {
+    let store = common::memory();
+    let ns = Namespace::create(store.clone(), "docs", schema(1, Metric::L2))
+        .await
+        .expect("create");
+    ns.upsert(vec![Document {
+        id: "a".into(),
+        vector: vec![1.0],
+        attrs: None,
+        sparse: Some(vec![(3, 0.5)]),
+    }])
+    .await
+    .expect("upsert");
+    ns.compact(&DEFAULT).await.expect("compact");
+
+    let id = segment::segment_id(1, 1);
+    let sparse_path = itzma_core::sparse::sparse_path("docs", &id);
+    assert!(
+        store.get(&sparse_path).await.is_ok(),
+        "sparse.bin must exist"
+    );
+}
+
+#[tokio::test]
+async fn a_fold_with_no_sparse_documents_writes_no_sparse_bin() {
+    let store = common::memory();
+    let ns = Namespace::create(store.clone(), "docs", schema(1, Metric::L2))
+        .await
+        .expect("create");
+    ns.upsert(vec![doc("a", &[1.0])]).await.expect("upsert");
+    ns.compact(&DEFAULT).await.expect("compact");
+
+    let id = segment::segment_id(1, 1);
+    let sparse_path = itzma_core::sparse::sparse_path("docs", &id);
+    assert!(matches!(
+        store.get(&sparse_path).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+}
+
+/// A merge rebuilds its layer from the segments it retires, whose `data.bin`
+/// does not carry sparse vectors. The new segment's `sparse.bin` must still
+/// hold them.
+#[tokio::test]
+async fn a_merge_keeps_the_sparse_vectors_of_the_segments_it_retires() {
+    let opts = CompactionOptions {
+        max_segments: 2,
+        max_segment_bytes: itzma_core::compaction::DEFAULT_MAX_SEGMENT_BYTES,
+    };
+    let sparse_doc = |id: &str, term: u32| Document {
+        id: id.into(),
+        vector: vec![1.0],
+        attrs: None,
+        sparse: Some(vec![(term, 1.0)]),
+    };
+    for b in cas_backends() {
+        eprintln!("backend: {}", b.name);
+        let ns = Namespace::create(b.store.clone(), "docs", schema(1, Metric::L2))
+            .await
+            .unwrap();
+        for (id, term) in [("a", 1), ("b", 2)] {
+            ns.upsert(vec![sparse_doc(id, term)]).await.unwrap();
+            ns.compact(&opts).await.unwrap();
+        }
+        ns.upsert(vec![sparse_doc("c", 3)]).await.unwrap();
+        let merged = segment::segment_id(1, 3);
+        assert!(matches!(
+            ns.compact(&opts).await.unwrap(),
+            Compaction::Published {
+                merged_segments: 2,
+                ..
+            }
+        ));
+        assert_eq!(live(&*b.store, "docs").await.0, vec![merged]);
+
+        for (term, want) in [(1, "a"), (2, "b"), (3, "c")] {
+            let hits = ns
+                .query_sparse(
+                    &vec![(term, 1.0)],
+                    5,
+                    &itzma_core::SparseQueryOptions::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+                [want],
+                "term {term} on {}",
+                b.name
+            );
+        }
+    }
+}
+
 /// Sizes of every `data.bin` under the namespace "docs", largest first.
 async fn data_sizes(store: &dyn ObjectStore) -> Vec<u64> {
     let prefix = object_store::path::Path::from("docs/segments");
@@ -1093,8 +1189,8 @@ async fn a_refused_group_publishes_nothing_and_a_rerun_with_room_converges() {
     }
 }
 
-/// Two folded segments and a tail, and a merge into one whose publish fails,
-/// leaving its output as an orphan.
+/// Two folded segments of documents with sparse vectors and a tail, and a
+/// merge into one whose publish fails, leaving its outputs as orphans.
 async fn orphaned_merge(inner: Arc<InMemory>) -> (Arc<FaultyStore>, Namespace, String) {
     let store = FaultyStore::new(inner);
     let ns = Namespace::create(store.clone(), "docs", schema(2, Metric::L2))
@@ -1106,7 +1202,11 @@ async fn orphaned_merge(inner: Arc<InMemory>) -> (Arc<FaultyStore>, Namespace, S
     };
     for s in 0..2u32 {
         let docs = (0..300u32)
-            .map(|i| doc(&format!("s{s}-{i:04}"), &[i as f32, s as f32]))
+            .map(|i| {
+                let mut d = doc(&format!("s{s}-{i:04}"), &[i as f32, s as f32]);
+                d.sparse = Some(vec![(i, 1.0), (i + 1, 0.5)]);
+                d
+            })
             .collect();
         ns.upsert(docs).await.unwrap();
         ns.compact(&fold).await.unwrap();
@@ -1130,6 +1230,10 @@ async fn orphaned_merge(inner: Arc<InMemory>) -> (Arc<FaultyStore>, Namespace, S
 async fn a_rerun_reuses_its_orphan_after_a_streamed_compare() {
     let inner = Arc::new(InMemory::new());
     let (store, ns, id) = orphaned_merge(inner.clone()).await;
+    inner
+        .head(&itzma_core::sparse::sparse_path("docs", &id))
+        .await
+        .expect("the orphan's sparse.bin stays");
     let one = CompactionOptions {
         max_segments: 1,
         ..DEFAULT
@@ -1147,7 +1251,7 @@ async fn a_differing_orphan_is_refused_piece_by_piece() {
         max_segments: 1,
         ..DEFAULT
     };
-    for file in ["data.bin"] {
+    for file in ["data.bin", "sparse.bin"] {
         for truncate in [false, true] {
             let inner = Arc::new(InMemory::new());
             let (store, ns, id) = orphaned_merge(inner.clone()).await;
@@ -1217,6 +1321,67 @@ async fn a_merge_with_a_cap_above_the_budget_is_refused_before_any_segment_is_re
     let err = small.compact(&one).await.unwrap_err();
     assert!(matches!(err, ItzmaError::InvalidConfig(_)), "{err:?}");
     assert_untouched(&*inner, &before).await;
+}
+
+#[tokio::test]
+async fn a_streamed_merge_keeps_sparse_vectors() {
+    for b in cas_backends() {
+        eprintln!("backend: {}", b.name);
+        // Segments over 1 MiB, so the merge reads them in windows rather
+        // than whole.
+        let dim = 256;
+        let ns = Namespace::create(b.store.clone(), "docs", schema(dim, Metric::L2))
+            .await
+            .unwrap();
+        let roomy = CompactionOptions {
+            max_segments: 8,
+            ..DEFAULT
+        };
+        let mut rng = Lcg(7);
+        for s in 0..3u32 {
+            let docs = (0..1200u32)
+                .map(|i| {
+                    let mut d = doc(&format!("d{i:05}"), &rng.vector(dim));
+                    d.sparse = (i % 3 != s).then(|| vec![(i + 100, 1.0 + s as f32), (i % 7, 0.5)]);
+                    d
+                })
+                .collect();
+            ns.upsert(docs).await.unwrap();
+            ns.compact(&roomy).await.unwrap();
+        }
+        ns.delete((0..1200).step_by(5).map(|i| format!("d{i:05}")).collect())
+            .await
+            .unwrap();
+
+        let queries: Vec<Vec<(u32, f32)>> =
+            vec![vec![(103, 1.0)], vec![(110, 1.0), (2, 0.5)], vec![(0, 1.0)]];
+        let mut before = Vec::new();
+        for q in &queries {
+            before.push(
+                ns.query_sparse(q, 20, &itzma_core::SparseQueryOptions::default())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let largest = data_sizes(&*b.store).await[0];
+        assert!(largest > 1024 * 1024, "{largest}");
+        let merge = CompactionOptions {
+            max_segments: 1,
+            max_segment_bytes: largest + largest / 2,
+        };
+        match ns.compact(&merge).await.unwrap() {
+            Compaction::Published { segments, .. } => assert!(segments.len() >= 2),
+            other => panic!("expected a merge, got {other:?}"),
+        }
+        for (q, want) in queries.iter().zip(&before) {
+            let got = ns
+                .query_sparse(q, 20, &itzma_core::SparseQueryOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(&got, want, "query {q:?}");
+        }
+        assert_consistent(b.store.clone(), dim, Metric::L2).await;
+    }
 }
 
 /// A merge of version 3 segments over 1 MiB reads them in windows

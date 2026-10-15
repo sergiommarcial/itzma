@@ -28,7 +28,7 @@ use crate::wal::WalEntry;
 /// use itzma_core::layer::Layer;
 /// use itzma_core::{Document, WalOp};
 ///
-/// let doc = |id: &str| Document { id: id.into(), vector: vec![1.0], attrs: None };
+/// let doc = |id: &str| Document { id: id.into(), vector: vec![1.0], attrs: None, sparse: None };
 ///
 /// let mut older = Layer::new();
 /// older.apply(WalOp::Upsert(doc("a")));
@@ -102,6 +102,23 @@ impl Layer {
     /// beneath it, which is a segment that starts at WAL seq 1.
     pub fn drop_tombstones(&mut self) {
         self.tombstones.clear();
+    }
+
+    /// Set the sparse vector of each of `ids`' documents that this layer
+    /// still holds live, in order. Used to graft `sparse.bin`'s row-ordered
+    /// vectors onto a decoded segment's documents (`crate::sparse`) — a
+    /// document a tombstone or a later overlay already removed is silently
+    /// skipped, since a shadowed row's sparse vector is never seen.
+    pub(crate) fn set_sparse(
+        &mut self,
+        ids: &[String],
+        vectors: Vec<Option<crate::document::SparseVector>>,
+    ) {
+        for (id, sparse) in ids.iter().zip(vectors) {
+            if let Some(doc) = self.docs.get_mut(id) {
+                doc.sparse = sparse;
+            }
+        }
     }
 
     /// Whether the layer holds neither a document nor a tombstone.
@@ -310,6 +327,7 @@ mod tests {
                 id: format!("d{i}"),
                 vector: vec![i as f32],
                 attrs: None,
+                sparse: None,
             }));
         }
         let first: Vec<&str> = layer.docs().map(|d| d.id.as_str()).collect();
@@ -330,6 +348,7 @@ mod tests {
             id: id.into(),
             vector: vec![v],
             attrs: None,
+            sparse: None,
         })
     }
 

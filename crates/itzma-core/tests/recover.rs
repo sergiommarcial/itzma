@@ -15,8 +15,8 @@ use common::{
     Snapshot, assert_consistent, assert_untouched, cas_backends, doc, schema, snapshot, wal_listing,
 };
 use itzma_core::{
-    CompactionOptions, GcOptions, Hit, ItzmaError, Manifest, Metric, Namespace, manifest, segment,
-    wal,
+    CompactionOptions, Document, GcOptions, Hit, ItzmaError, Manifest, Metric, Namespace,
+    SparseQueryOptions, manifest, segment, wal,
 };
 use object_store::{ObjectStore, ObjectStoreExt};
 
@@ -441,6 +441,38 @@ async fn an_unpublished_segment_is_adopted() {
         assert_eq!(report.tail_objects, 0);
         assert_eq!(hits(&recovered).await, expected);
         assert_consistent(b.store.clone(), DIM, L2).await;
+    }
+}
+
+/// The sparse vectors sit in `sparse.bin` beside the data object, so a
+/// recovered manifest keeps them queryable. Like `indexes`, `sparse_indexes` comes
+/// back empty and a query scans the segment's sparse data until `index_sparse`
+/// runs again.
+#[tokio::test]
+async fn a_recovered_namespace_keeps_its_sparse_vectors() {
+    for b in cas_backends() {
+        eprintln!("backend: {}", b.name);
+        let ns = Namespace::create(b.store.clone(), "docs", schema(DIM, L2))
+            .await
+            .unwrap();
+        ns.upsert(vec![Document {
+            id: "a".into(),
+            vector: vec![0.0, 0.0],
+            attrs: None,
+            sparse: Some(vec![(3, 2.0)]),
+        }])
+        .await
+        .unwrap();
+        ns.compact(&ROOMY).await.unwrap();
+        lose_manifest(&*b.store).await;
+
+        let (recovered, _) = Namespace::recover(b.store.clone(), "docs").await.unwrap();
+        let found = recovered
+            .query_sparse(&vec![(3, 1.0)], 5, &SparseQueryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "a");
     }
 }
 

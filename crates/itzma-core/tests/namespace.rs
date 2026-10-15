@@ -345,5 +345,5 @@ async fn a_new_manifest_has_exactly_the_known_fields() {
             "wal_format"
         ]
     );
-    assert_eq!(json["wal_format"], 4);
+    assert_eq!(json["wal_format"], 5);
 }

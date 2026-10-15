@@ -20,7 +20,7 @@ use crate::columns::DocColumns;
 use crate::compaction::{self, Compaction, CompactionOptions};
 use crate::decoded::{DecodedCache, DecodedRef};
 use crate::document;
-use crate::document::{Document, Schema, WalOp};
+use crate::document::{Document, Schema, SparseVector, WalOp};
 use crate::error::{ItzmaError, Result};
 use crate::fetch::FetchPolicy;
 use crate::filter::{self, FilterOptions, FilterPage};
@@ -35,6 +35,7 @@ use crate::recover::{self, RecoverReport};
 use crate::schema_object;
 use crate::search::Hit;
 use crate::segment;
+use crate::sparse_query::{self, SparseQueryOptions};
 use crate::stream::{self, StreamError, StreamOptions, StreamReport};
 use crate::view;
 use crate::wal::{self, WriteKey};
@@ -73,8 +74,8 @@ use crate::wal_codec;
 /// let ns = Namespace::create(store, "docs", Schema::new(2, Metric::L2)).await?;
 ///
 /// ns.upsert(vec![
-///     Document { id: "near".into(), vector: vec![1.0, 0.0], attrs: None },
-///     Document { id: "far".into(), vector: vec![9.0, 9.0], attrs: None },
+///     Document { id: "near".into(), vector: vec![1.0, 0.0], attrs: None, sparse: None },
+///     Document { id: "far".into(), vector: vec![9.0, 9.0], attrs: None, sparse: None },
 /// ])
 /// .await?;
 ///
@@ -259,10 +260,12 @@ impl Namespace {
     }
 
     /// Everything `upsert` and `upsert_keyed` check about one document before
-    /// any storage call: the id, the vector and the attributes.
+    /// any storage call: the id, the vector, the sparse vector and the
+    /// attributes.
     fn validate_doc(&self, doc: &Document) -> Result<()> {
         doc.validate_id()?;
         self.schema.validate(&doc.vector)?;
+        doc.validate_sparse()?;
         self.schema.attrs.validate(doc.attrs.as_ref())
     }
 
@@ -340,8 +343,8 @@ impl Namespace {
     }
 
     /// Keep what the query path parses (index heads and partitions, segment
-    /// directories, Bloom filters, id, attribute and tombstone blocks, and
-    /// whole segments the flat path decodes) in `cache`
+    /// directories, Bloom filters, id, attribute and tombstone blocks, sparse
+    /// term directories, and whole segments the flat path decodes) in `cache`
     /// between queries, and return the handle.
     ///
     /// A structure found in the cache is neither fetched nor charged to the
@@ -441,7 +444,7 @@ impl Namespace {
     /// let store = Arc::new(InMemory::new());
     /// let ns = Namespace::create(store, "docs", Schema::new(1, Metric::L2)).await?;
     ///
-    /// let doc = |v: f32| Document { id: "a".into(), vector: vec![v], attrs: None };
+    /// let doc = |v: f32| Document { id: "a".into(), vector: vec![v], attrs: None, sparse: None };
     /// assert_eq!(ns.upsert(vec![doc(1.0)]).await?, 1);
     /// assert_eq!(ns.upsert(vec![doc(5.0)]).await?, 2); // replaces "a"
     ///
@@ -490,7 +493,7 @@ impl Namespace {
     ///
     /// let store = Arc::new(InMemory::new());
     /// let ns = Namespace::create(store, "docs", Schema::new(1, Metric::L2)).await?;
-    /// ns.upsert(vec![Document { id: "a".into(), vector: vec![1.0], attrs: None }]).await?;
+    /// ns.upsert(vec![Document { id: "a".into(), vector: vec![1.0], attrs: None, sparse: None }]).await?;
     ///
     /// ns.delete(vec!["a".into()]).await?;
     /// assert!(ns.query(&[1.0], 10).await?.is_empty());
@@ -545,7 +548,7 @@ impl Namespace {
     ///
     /// let store = Arc::new(InMemory::new());
     /// let ns = Namespace::create(store, "docs", Schema::new(1, Metric::L2)).await?;
-    /// let batch = || vec![Document { id: "a".into(), vector: vec![1.0], attrs: None }];
+    /// let batch = || vec![Document { id: "a".into(), vector: vec![1.0], attrs: None, sparse: None }];
     ///
     /// let seq = ns.upsert_keyed(&WriteKey::new("load-7/batch-1"), batch()).await?;
     ///
@@ -574,7 +577,8 @@ impl Namespace {
     ///
     /// The errors of [`upsert`](Self::upsert). An input with one defect gets
     /// exactly `upsert`'s error; with several, the first one reported can
-    /// differ (see [`DocColumns::validate`]).
+    /// differ (see [`DocColumns::validate`]). A batch with a sparse column
+    /// needs WAL level 5 ([`ItzmaError::WalFormatTooOld`]).
     ///
     /// # Examples
     ///
@@ -597,7 +601,7 @@ impl Namespace {
     pub async fn upsert_columns(&self, cols: &DocColumns) -> Result<u64> {
         cols.validate(&self.schema)?;
         let bytes = wal_codec::encode_columns(cols, wal::MAX_BODY_BYTES)?;
-        self.append_bytes(bytes).await
+        self.append_bytes(bytes, cols.has_sparse()).await
     }
 
     /// Load a stream of columnar batches in bounded memory.
@@ -619,7 +623,8 @@ impl Namespace {
     /// the same attribute names, each attribute column of the same kind (an
     /// all-null [`AttrColumn::Null`](crate::AttrColumn::Null) fits any kind; a number column cannot
     /// switch between integers and floats from one batch to the next, which
-    /// `upsert` of documents would allow). Otherwise the stream stops with [`ItzmaError::InvalidColumns`].
+    /// `upsert` of documents would allow), and all a sparse column or none.
+    /// Otherwise the stream stops with [`ItzmaError::InvalidColumns`].
     ///
     /// # Errors
     ///
@@ -711,7 +716,8 @@ impl Namespace {
         write.validate()?;
         cols.validate(&self.schema)?;
         let object = wal_codec::encode_columns_keyed(cols, wal::MAX_BODY_BYTES, &write.key)?;
-        self.append_bytes_keyed(write, object).await
+        self.append_bytes_keyed(write, object, cols.has_sparse())
+            .await
     }
 
     /// Remove documents by id under an idempotency key. The keyed form of
@@ -735,12 +741,14 @@ impl Namespace {
     /// One compare-and-swap on the manifest. It only goes up: a level at or
     /// below the current one changes nothing and writes nothing, and two
     /// callers racing both succeed. Level 3 is what [`upsert_keyed`](Self::upsert_keyed)
-    /// needs and level 4 is what [`gc`](Self::gc) needs to fence WAL objects.
-    /// A namespace created by this build starts at 4.
+    /// needs, level 4 is what [`gc`](Self::gc) needs to fence WAL objects, and
+    /// level 5 is what a sparse-carrying [`upsert`](Self::upsert) or
+    /// [`upsert_keyed`](Self::upsert_keyed) needs (WAL object
+    /// versions 4 and 5). A namespace created by this build starts at 5.
     ///
     /// **Raise it only once every build that reads or compacts this namespace
-    /// reads the new format** (version 3 for level 3, fences for level 4).
-    /// From the next manifest read, a build that does not is
+    /// reads the new format** (version 3 for level 3, fences for level 4, and
+    /// versions 4/5's sparse column for level 5). From the next manifest read, a build that does not is
     /// refused with [`ItzmaError::WalFormatTooNew`] (the gate), which is what
     /// keeps it away, but it cannot be undone: there is no way to lower the
     /// level. Writers that already hold a handle keep writing what they wrote,
@@ -901,7 +909,7 @@ impl Namespace {
     ///
     /// let store = Arc::new(InMemory::new());
     /// let ns = Namespace::create(store, "docs", Schema::new(1, Metric::L2)).await?;
-    /// ns.upsert(vec![Document { id: "a".into(), vector: vec![1.0], attrs: None }]).await?;
+    /// ns.upsert(vec![Document { id: "a".into(), vector: vec![1.0], attrs: None, sparse: None }]).await?;
     ///
     /// let options = CompactionOptions::default();
     /// let outcome = ns.compact(&options).await?;
@@ -993,7 +1001,7 @@ impl Namespace {
     ///
     /// let store = Arc::new(InMemory::new());
     /// let ns = Namespace::create(store, "docs", Schema::new(2, Metric::L2)).await?;
-    /// ns.upsert(vec![Document { id: "a".into(), vector: vec![1.0, 0.0], attrs: None }]).await?;
+    /// ns.upsert(vec![Document { id: "a".into(), vector: vec![1.0, 0.0], attrs: None, sparse: None }]).await?;
     /// ns.compact(&CompactionOptions::default()).await?;
     ///
     /// // One document is under the default minimum, so nothing is indexed.
@@ -1120,7 +1128,7 @@ impl Namespace {
     ///
     /// let store = Arc::new(InMemory::new());
     /// let ns = Namespace::create(store, "docs", Schema::new(1, Metric::L2)).await?;
-    /// let doc = |id: &str| Document { id: id.into(), vector: vec![1.0], attrs: None };
+    /// let doc = |id: &str| Document { id: id.into(), vector: vec![1.0], attrs: None, sparse: None };
     ///
     /// // Two folds, then a merge that replaces both segments.
     /// let tight = CompactionOptions { max_segments: 1, max_segment_bytes: itzma_core::compaction::DEFAULT_MAX_SEGMENT_BYTES };
@@ -1187,7 +1195,7 @@ impl Namespace {
     ///
     /// let store = Arc::new(InMemory::new());
     /// let ns = Namespace::create(store, "docs", Schema::new(1, Metric::L2)).await?;
-    /// let doc = |id: &str| Document { id: id.into(), vector: vec![1.0], attrs: None };
+    /// let doc = |id: &str| Document { id: id.into(), vector: vec![1.0], attrs: None, sparse: None };
     ///
     /// // Fold once the tail has two objects.
     /// let options = MaintenanceOptions {
@@ -1235,17 +1243,26 @@ impl Namespace {
 
     /// Commit ops through [`wal::append`], then advance the hint past the seq
     /// that was won. `fetch_max` keeps the hint from moving backwards when
-    /// several tasks share a handle. A plain batch never reads the level.
+    /// several tasks share a handle. A batch that carries a sparse vector
+    /// needs the namespace at [`wal::SPARSE_FORMAT_VERSION`] first,
+    /// checked before anything is written; a plain batch never reads the
+    /// level.
     async fn append(&self, ops: Vec<WalOp>) -> Result<u64> {
+        if has_sparse(&ops) {
+            self.ensure_wal_level(wal::SPARSE_FORMAT_VERSION).await?;
+        }
         let hint = self.next_seq.load(Ordering::Relaxed);
         let seq = wal::append(&*self.store, &self.id, hint, ops).await?;
         self.next_seq.fetch_max(seq + 1, Ordering::Relaxed);
         Ok(seq)
     }
 
-    /// Commit an object `wal_codec` already encoded, with [`append`]'s hint
-    /// bookkeeping.
-    pub(crate) async fn append_bytes(&self, bytes: bytes::Bytes) -> Result<u64> {
+    /// Commit an object `wal_codec` already encoded, with [`append`]'s level
+    /// check (`sparse`: the object has a sparse column) and hint bookkeeping.
+    pub(crate) async fn append_bytes(&self, bytes: bytes::Bytes, sparse: bool) -> Result<u64> {
+        if sparse {
+            self.ensure_wal_level(wal::SPARSE_FORMAT_VERSION).await?;
+        }
         let hint = self.next_seq.load(Ordering::Relaxed);
         let seq = wal::put_encoded(&*self.store, &self.id, hint, bytes).await?;
         self.next_seq.fetch_max(seq + 1, Ordering::Relaxed);
@@ -1258,9 +1275,13 @@ impl Namespace {
         &self,
         write: &WriteKey,
         object: wal_codec::Keyed,
+        sparse: bool,
     ) -> Result<u64> {
         write.validate()?;
         self.ensure_wal_level(wal::KEYED_FORMAT_VERSION).await?;
+        if sparse {
+            self.ensure_wal_level(wal::SPARSE_FORMAT_VERSION).await?;
+        }
         let hint = self.next_seq.load(Ordering::Relaxed);
         let seq = wal::put_encoded_keyed(&*self.store, &self.id, hint, write, object).await?;
         self.next_seq.fetch_max(seq + 1, Ordering::Relaxed);
@@ -1268,13 +1289,17 @@ impl Namespace {
     }
 
     /// Commit ops under a key through [`wal::append_keyed`], after checking the
-    /// key and the namespace's level.
+    /// key and the namespace's level (and, for a sparse-carrying batch, the
+    /// sparse level too).
     async fn append_keyed(&self, write: &WriteKey, ops: Vec<WalOp>) -> Result<u64> {
         write.validate()?;
         if ops.is_empty() {
             return Err(ItzmaError::EmptyBatch);
         }
         self.ensure_wal_level(wal::KEYED_FORMAT_VERSION).await?;
+        if has_sparse(&ops) {
+            self.ensure_wal_level(wal::SPARSE_FORMAT_VERSION).await?;
+        }
         let hint = self.next_seq.load(Ordering::Relaxed);
         let seq = wal::append_keyed(&*self.store, &self.id, hint, write, ops).await?;
         self.next_seq.fetch_max(seq + 1, Ordering::Relaxed);
@@ -1374,6 +1399,7 @@ impl Namespace {
     ///     id: id.into(),
     ///     vector: v.to_vec(),
     ///     attrs: Some(serde_json::json!({ "label": id })),
+    ///     sparse: None,
     /// };
     /// ns.upsert(vec![doc("east", [1.0, 0.0]), doc("north", [0.0, 1.0])]).await?;
     ///
@@ -1442,7 +1468,7 @@ impl Namespace {
     ///
     /// let store = Arc::new(InMemory::new());
     /// let ns = Namespace::create(store, "docs", Schema::new(1, Metric::L2)).await?;
-    /// ns.upsert(vec![Document { id: "a".into(), vector: vec![1.0], attrs: None }]).await?;
+    /// ns.upsert(vec![Document { id: "a".into(), vector: vec![1.0], attrs: None, sparse: None }]).await?;
     ///
     /// let exact = QueryOptions::default().exact(true);
     /// assert_eq!(ns.query(&[0.0], 1).await?, ns.query_with(&[0.0], 1, &exact).await?);
@@ -1507,6 +1533,102 @@ impl Namespace {
         query::run(&q, manifest, tail).await
     }
 
+    /// Find the `top_k` documents whose sparse vectors score highest against
+    /// `query`, best first.
+    ///
+    /// `query` is a set of `(term id, weight)` pairs in the same vocabulary the
+    /// documents' [`sparse`](Document::sparse) vectors use. A document's score
+    /// is the dot product over the terms it shares with the query, an exact
+    /// sum with no approximation, so there is no rerank step and nothing to
+    /// tune. A document that shares no term with the query, or has no sparse
+    /// vector, is never a hit. A term repeated in `query` counts as the sum of
+    /// its weights.
+    ///
+    /// Hits are [`Hit`]s like [`query`](Self::query)'s, and follow the same
+    /// convention: `distance` is lower for a closer match, so it is the score
+    /// negated. Ties break by id.
+    ///
+    /// [`SparseQueryOptions::filter`] keeps only documents whose attributes
+    /// match a [`Predicate`], with the same checks and meaning as
+    /// [`QueryOptions::filter`].
+    ///
+    /// Shadowing works as it does for [`query_with`](Self::query_with): the
+    /// newest version of an id decides, so an overwrite or a delete hides the
+    /// older document's sparse vector. The segments and the WAL tail are read
+    /// whole and scored directly. Reads go through the
+    /// handle's cache if [`with_cache`](Self::with_cache) set one, and are
+    /// bounded by the read budget.
+    ///
+    /// # Errors
+    ///
+    /// - [`ItzmaError::InvalidQuery`] for a `top_k` of zero, an empty `query`
+    ///   or a non-finite weight in it, before any storage call.
+    /// - [`ItzmaError::CorruptSegment`] for a damaged `sparse.bin`.
+    /// - [`ItzmaError::ReadBudgetExceeded`] and the other errors of
+    ///   [`query`](Self::query).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[tokio::main]
+    /// # async fn main() -> itzma_core::Result<()> {
+    /// use std::sync::Arc;
+    ///
+    /// use itzma_core::{Document, Metric, Namespace, Schema, SparseQueryOptions};
+    /// use object_store::memory::InMemory;
+    ///
+    /// let store = Arc::new(InMemory::new());
+    /// let ns = Namespace::create(store, "docs", Schema::new(1, Metric::L2)).await?;
+    /// let doc = |id: &str, terms: Vec<(u32, f32)>| Document {
+    ///     id: id.into(),
+    ///     vector: vec![0.0],
+    ///     attrs: None,
+    ///     sparse: Some(terms),
+    /// };
+    /// ns.upsert(vec![doc("cats", vec![(1, 2.0), (2, 1.0)]), doc("dogs", vec![(3, 2.0)])]).await?;
+    ///
+    /// let hits = ns.query_sparse(&vec![(1, 1.0), (2, 1.0)], 5, &SparseQueryOptions::default()).await?;
+    /// assert_eq!(hits.len(), 1);
+    /// assert_eq!(hits[0].id, "cats");
+    /// assert_eq!(hits[0].distance, -3.0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn query_sparse(
+        &self,
+        query: &SparseVector,
+        top_k: usize,
+        options: &SparseQueryOptions,
+    ) -> Result<Vec<Hit>> {
+        sparse_query::validate(query, top_k)?;
+        self.check_filter(&options.filter)?;
+        let mut budget = ReadBudget::new(self.read_budget);
+        let mut plan = self.views.plan(&self.reader(&budget)).await?;
+        let mut attempt = 1;
+        loop {
+            let q = sparse_query::Query {
+                store: &*self.query_store,
+                namespace: &self.id,
+                dim: self.schema.dim,
+                query,
+                top_k,
+                filter: options.filter.as_ref(),
+                budget: &budget,
+                policy: &self.fetch_policy,
+            };
+            let reader = self.reader(&budget);
+            let tail = self.views.tail(&reader, &plan);
+            match sparse_query::run(&q, &plan.manifest, tail).await {
+                Err(err) if is_stale_read(&err) && attempt < MAX_READ_ATTEMPTS => {
+                    budget = ReadBudget::new(self.read_budget);
+                    plan = self.views.replan(&self.reader(&budget), &plan, err).await?;
+                    attempt += 1;
+                }
+                done => return done,
+            }
+        }
+    }
+
     /// Return the documents whose attributes match `predicate`, in ascending id
     /// order, one page at a time.
     ///
@@ -1564,6 +1686,7 @@ impl Namespace {
     ///     id: id.into(),
     ///     vector: vec![0.0],
     ///     attrs: Some(serde_json::json!({ "price": price })),
+    ///     sparse: None,
     /// };
     /// ns.upsert(vec![item("a", 5.0), item("b", 50.0), item("c", 12.0)]).await?;
     ///
@@ -1665,6 +1788,13 @@ impl Namespace {
 /// they mean damage.
 pub(crate) fn is_stale_read(err: &ItzmaError) -> bool {
     segment::is_missing(err) || index::is_missing(err) || wal_codec::is_fenced(err)
+}
+
+/// Whether any upsert in `ops` carries a sparse vector — such a
+/// batch needs [`wal::SPARSE_FORMAT_VERSION`] before it is written.
+fn has_sparse(ops: &[WalOp]) -> bool {
+    ops.iter()
+        .any(|op| matches!(op, WalOp::Upsert(doc) if doc.sparse.is_some()))
 }
 
 #[cfg(test)]

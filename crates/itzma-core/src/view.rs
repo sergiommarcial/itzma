@@ -217,6 +217,7 @@ mod tests {
             id: id.into(),
             vector: vec![v],
             attrs: None,
+            sparse: None,
         })
     }
 

@@ -169,6 +169,7 @@ impl<D: Borrow<Document>> Ord for Candidate<D> {
 ///     id: id.into(),
 ///     vector: vec![x],
 ///     attrs: None,
+///     sparse: None,
 /// };
 /// let docs = vec![doc("far", 9.0), doc("near", 1.0), doc("mid", 4.0)];
 ///
@@ -227,6 +228,7 @@ mod tests {
             id: id.into(),
             vector: v.to_vec(),
             attrs: None,
+            sparse: None,
         }
     }
 

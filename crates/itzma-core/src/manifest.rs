@@ -48,7 +48,7 @@ pub const MAX_UPDATE_ATTEMPTS: u32 = 32;
 ///   "schema": {"dim": 2, "metric": "l2"},
 ///   "live_segments": [],
 ///   "wal_folded_through": 0,
-///   "wal_format": 4,
+///   "wal_format": 5,
 ///   "segment_format": 2,
 ///   "indexes": {}
 /// }

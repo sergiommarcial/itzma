@@ -85,6 +85,7 @@ fn model(n: usize) -> Vec<Document> {
                 "price": if i % 7 == 0 { serde_json::Value::Null } else { json!(i as f64 / 4.0) },
                 "tag": tag(i),
             })),
+            sparse: None,
         })
         .collect()
 }
@@ -516,4 +517,31 @@ async fn the_longest_stream_key_is_107_bytes() {
         .await
         .unwrap();
     assert_eq!(report.rows, 10);
+}
+
+/// A stream whose batches disagree on having a sparse column is refused:
+/// chunk sizes would then depend on how the input was batched, and a keyed
+/// retry with other batching could cut other chunks.
+#[tokio::test]
+async fn batches_with_and_without_a_sparse_column_are_refused() {
+    let ns = create(common::memory()).await;
+    let with_sparse = || {
+        let sparse =
+            itzma_core::SparseColumn::new(vec![true], vec![0, 1], vec![3], vec![1.0]).unwrap();
+        batch(0, 1).with_sparse(sparse).unwrap()
+    };
+    for batches in [
+        vec![with_sparse(), batch(1, 2)],
+        vec![batch(1, 2), with_sparse()],
+    ] {
+        let rows = stream::iter(batches.into_iter().map(Ok)).boxed();
+        let err = ns
+            .upsert_stream(rows, &StreamOptions::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.error, ItzmaError::InvalidColumns(_)),
+            "{err:?}"
+        );
+    }
 }

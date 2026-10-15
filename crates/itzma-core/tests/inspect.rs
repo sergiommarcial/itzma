@@ -10,8 +10,8 @@ use common::faulty::{Fault, FaultyStore};
 use common::{backends, cas_backends, doc, publish, put_segment, schema, snapshot};
 use itzma_core::inspect::{self, Report, SegmentState};
 use itzma_core::{
-    CompactionOptions, GcOptions, ItzmaError, Metric, Namespace, WalOp, manifest, schema_object,
-    segment, wal,
+    CompactionOptions, Document, GcOptions, ItzmaError, Metric, Namespace, WalOp, manifest,
+    schema_object, segment, wal,
 };
 use object_store::{ObjectStore, ObjectStoreExt};
 
@@ -509,5 +509,28 @@ async fn the_display_names_each_part_and_each_problem() {
         let broken = report(&*b.store).await.to_string();
         assert!(broken.contains("problems     1"), "{broken}");
         assert!(broken.contains("WAL seq 1 is missing"));
+    }
+}
+
+#[tokio::test]
+async fn a_segments_sparse_data_and_index_show_in_the_report() {
+    for b in cas_backends() {
+        let ns = Namespace::create(b.store.clone(), "docs", schema(DIM, Metric::L2))
+            .await
+            .unwrap();
+        ns.upsert(vec![Document {
+            id: "a".into(),
+            vector: vec![1.0],
+            attrs: None,
+            sparse: Some(vec![(3, 0.5)]),
+        }])
+        .await
+        .unwrap();
+        ns.compact(&ROOMY).await.unwrap();
+
+        let report = inspect::report(&*b.store, "docs").await.unwrap();
+        let seg = &report.segments[0];
+        assert!(seg.has_sparse_data, "{}", b.name);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
     }
 }

@@ -924,6 +924,7 @@ mod tests {
             id: id.into(),
             vector: vec![x, y],
             attrs: None,
+            sparse: None,
         }
     }
 
@@ -936,6 +937,7 @@ mod tests {
                 id: format!("d{i:06}"),
                 vector: vec![1.0; dim],
                 attrs: Some(serde_json::json!({ "active": i % 2 == 0 })),
+                sparse: None,
             }));
         }
         layer
@@ -985,6 +987,7 @@ mod tests {
                                 id,
                                 vector: vec![x, -x, 0.5, 1.0],
                                 attrs: Some(serde_json::json!({ "active": next(2) == 0 })),
+                                sparse: None,
                             }));
                         }
                     }

@@ -13,6 +13,7 @@ from itzma.exceptions import InvalidInput, InvalidVector
 
 VectorLike = Sequence[float] | npt.NDArray[Any]
 Row = Mapping[str, Any]
+SparseLike = Sequence[tuple[int, float]]
 
 
 def as_vector(vector: Any) -> Any:
@@ -38,6 +39,7 @@ def to_batch(
     ids: Iterable[str] | None,
     vectors: Any | None,
     attrs: Iterable[Mapping[str, Any] | None] | None,
+    sparse: Iterable[SparseLike | None] | None,
 ) -> _itzma.Batch | _itzma.ArrowStream:
     """Dispatch rows, an Arrow stream, or columns to the matching converter.
 
@@ -54,9 +56,10 @@ def to_batch(
             list(ids),
             _matrix(vectors),
             None if attrs is None else list(attrs),
+            None if sparse is None else list(sparse),
         )
-    if attrs is not None:
-        raise InvalidInput("attrs= goes with ids= and vectors=")
+    if attrs is not None or sparse is not None:
+        raise InvalidInput("attrs= and sparse= go with ids= and vectors=")
     if data is None:
         raise InvalidInput("nothing to write: pass rows, an Arrow table, or ids= and vectors=")
     if hasattr(data, "__arrow_c_stream__"):

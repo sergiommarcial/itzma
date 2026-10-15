@@ -592,7 +592,12 @@ pub(super) fn decode(r: Reader<'_>, version: u32, dim: usize) -> Result<Layer> {
     let mut docs = Vec::with_capacity(docs_n);
     for (id, attrs) in ids.into_iter().zip(parsed) {
         let vector: Vec<f32> = floats.by_ref().take(dim).collect();
-        docs.push(Document { id, vector, attrs });
+        docs.push(Document {
+            id,
+            vector,
+            attrs,
+            sparse: None,
+        });
     }
 
     let tombstones = strings(path, &parts.tombstones, "tombstone")?;
@@ -737,6 +742,7 @@ mod tests {
             id: id.into(),
             vector: v.to_vec(),
             attrs,
+            sparse: None,
         })
     }
 

@@ -13,7 +13,7 @@ use common::faulty::{Fault, FaultyStore};
 use common::{Lcg, cas_backends, doc, naive_top_k};
 use itzma_core::{
     AttrSchema, AttrType, CompactionOptions, Compare, Document, IndexOptions, ItzmaError, Metric,
-    Namespace, Predicate, QueryOptions, Schema,
+    Namespace, Predicate, QueryOptions, Schema, SparseQueryOptions, SparseVector,
 };
 use object_store::{ObjectStore, ObjectStoreExt};
 use serde_json::json;
@@ -307,16 +307,161 @@ async fn hits_of_a_filtered_indexed_query_carry_their_attributes() {
     }
 }
 
-/// A namespace of indexed segments behind a faulty store.
+fn sdoc(id: &str, price: f64, terms: &[(u32, f32)]) -> Document {
+    Document {
+        id: id.into(),
+        vector: vec![1.0; DIM],
+        attrs: Some(json!({"price": price, "active": price < 5.0})),
+        sparse: Some(terms.to_vec()),
+    }
+}
+
+/// The naive answer: every matching document sharing a term, best score
+/// first, ties by id.
+fn naive_sparse(state: &BTreeMap<String, Document>, query: &SparseVector, k: usize) -> Vec<String> {
+    let mut scored: Vec<(f32, &str)> = state
+        .values()
+        .filter(|d| is_cheap(d))
+        .filter_map(|d| {
+            let terms = d.sparse.as_ref()?;
+            let mut shared = false;
+            let mut score = 0.0;
+            for (qt, qw) in query {
+                for (t, w) in terms {
+                    if t == qt {
+                        shared = true;
+                        score += qw * w;
+                    }
+                }
+            }
+            shared.then_some((-score, d.id.as_str()))
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    scored
+        .into_iter()
+        .take(k)
+        .map(|(_, id)| id.to_string())
+        .collect()
+}
+
+async fn assert_sparse_matches_naive(ns: &Namespace, state: &BTreeMap<String, Document>) {
+    let options = SparseQueryOptions::default().filter(Some(cheap()));
+    for query in [vec![(1, 1.0)], vec![(1, 1.0), (2, 0.5), (10, 2.0)]] {
+        for k in [1, 4, state.len() + 5] {
+            let got: Vec<String> = ns
+                .query_sparse(&query, k, &options)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|h| h.id)
+                .collect();
+            assert_eq!(got, naive_sparse(state, &query, k), "k {k} {query:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_filtered_sparse_query_equals_filter_then_rank_at_every_stage() {
+    for backend in cas_backends() {
+        let ns = create(backend.store.clone()).await;
+        let first: Vec<Document> = (0..40u32)
+            .map(|i| {
+                sdoc(
+                    &format!("d{i:03}"),
+                    f64::from(i % 10),
+                    &[(1 + i % 3, 1.0 + (i % 5) as f32), (10, 0.5)],
+                )
+            })
+            .collect();
+        let mut batches = vec![first.clone()];
+        ns.upsert(first).await.unwrap();
+        assert_sparse_matches_naive(&ns, &state_of(&batches)).await;
+
+        ns.compact(&ROOMY).await.unwrap();
+        assert_sparse_matches_naive(&ns, &state_of(&batches)).await;
+
+        assert_sparse_matches_naive(&ns, &state_of(&batches)).await;
+
+        let second = vec![
+            sdoc("d005", 1.0, &[(1, 9.0)]),
+            sdoc("d001", 9.0, &[(1, 9.0)]),
+        ];
+        ns.upsert(second.clone()).await.unwrap();
+        ns.delete(vec!["d002".into()]).await.unwrap();
+        batches.push(second);
+        let mut state = state_of(&batches);
+        state.remove("d002");
+        assert_sparse_matches_naive(&ns, &state).await;
+
+        // An unindexed segment above an indexed one, then two indexed segments
+        // with a delete from the tail above them.
+        ns.compact(&ROOMY).await.unwrap();
+        assert_sparse_matches_naive(&ns, &state).await;
+        assert_sparse_matches_naive(&ns, &state).await;
+        ns.delete(vec!["d003".into()]).await.unwrap();
+        state.remove("d003");
+        assert_sparse_matches_naive(&ns, &state).await;
+
+        ns.compact(&TIGHT).await.unwrap();
+        assert_sparse_matches_naive(&ns, &state).await;
+    }
+}
+
+#[tokio::test]
+async fn a_sparse_filter_matching_few_documents_returns_exactly_those() {
+    for backend in cas_backends() {
+        let ns = create(backend.store.clone()).await;
+        let batch: Vec<Document> = (0..300u32)
+            .map(|i| {
+                let price = if i % 100 == 7 { 0.0 } else { 100.0 };
+                sdoc(&format!("d{i:04}"), price, &[(1, 1.0 + (i % 7) as f32)])
+            })
+            .collect();
+        ns.upsert(batch).await.unwrap();
+        ns.compact(&ROOMY).await.unwrap();
+
+        let options = SparseQueryOptions::default().filter(Some(cheap()));
+        let hits = ns
+            .query_sparse(&vec![(1, 1.0)], 10, &options)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3, "{}", backend.name);
+        for hit in hits {
+            let price = hit.attrs.as_ref().and_then(|a| a["price"].as_f64());
+            assert_eq!(price, Some(0.0), "{hit:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_bad_sparse_filter_is_refused_before_storage() {
+    for backend in cas_backends() {
+        let ns = create(backend.store.clone()).await;
+        let options = SparseQueryOptions::default().filter(Some(Predicate::is_true("price")));
+        let err = ns
+            .query_sparse(&vec![(1, 1.0)], 3, &options)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ItzmaError::AttrTypeMismatch { .. }),
+            "{err:?}"
+        );
+    }
+}
+
+/// A namespace of indexed segments, dense and sparse, behind a faulty store.
 async fn indexed_namespace(store: Arc<dyn ObjectStore>) -> Namespace {
     let ns = create(store).await;
     let batch: Vec<Document> = (0..200u32)
         .map(|i| {
-            item(
+            let mut d = sdoc(
                 &format!("d{i:04}"),
                 f64::from(i % 10),
-                &mut Lcg(u64::from(i) + 1),
-            )
+                &[(1 + i % 3, 1.0 + (i % 5) as f32), (10, 0.5)],
+            );
+            d.vector = Lcg(u64::from(i) + 1).vector(DIM);
+            d
         })
         .collect();
     ns.upsert(batch).await.unwrap();
@@ -330,12 +475,17 @@ async fn a_fault_at_every_operation_of_a_filtered_query_is_an_error_never_a_wron
     let store = FaultyStore::new(common::memory());
     let ns = indexed_namespace(store.clone() as Arc<dyn ObjectStore>).await;
     let dense = QueryOptions::default().rerank(None).filter(Some(cheap()));
+    let sparse = SparseQueryOptions::default().filter(Some(cheap()));
     let query = Lcg(1).vector(DIM);
+    let terms: SparseVector = vec![(1, 1.0), (2, 0.5)];
 
     store.reset_ops();
     let want_dense = ids(&ns.query_with(&query, 5, &dense).await.unwrap());
     let dense_ops = store.ops();
-    assert!(dense_ops > 0);
+    store.reset_ops();
+    let want_sparse = ids(&ns.query_sparse(&terms, 5, &sparse).await.unwrap());
+    let sparse_ops = store.ops();
+    assert!(dense_ops > 0 && sparse_ops > 0);
 
     // A query never writes, so one store and namespace serve every fault.
     for fault in [Fault::Generic, Fault::LostAck] {
@@ -344,12 +494,22 @@ async fn a_fault_at_every_operation_of_a_filtered_query_is_an_error_never_a_wron
             let outcome = ns.query_with(&query, 5, &dense).await;
             assert!(outcome.is_err(), "dense {fault:?} at op {n} of {dense_ops}");
         }
+        for n in 0..sparse_ops {
+            store.fail_nth_op(n, fault);
+            let outcome = ns.query_sparse(&terms, 5, &sparse).await;
+            assert!(
+                outcome.is_err(),
+                "sparse {fault:?} at op {n} of {sparse_ops}"
+            );
+        }
     }
     store.clear();
     assert_eq!(
         ids(&ns.query_with(&query, 5, &dense).await.unwrap()),
         want_dense
     );
+    let again = ns.query_sparse(&terms, 5, &sparse).await.unwrap();
+    assert_eq!(ids(&again), want_sparse);
 }
 
 #[tokio::test]
@@ -396,8 +556,10 @@ async fn a_refused_filter_costs_no_storage_call() {
     let wrong_type = Predicate::is_true("price");
     faulty.reset_ops();
     for bad in [unknown, wrong_type] {
-        let dense = QueryOptions::default().filter(Some(bad));
+        let dense = QueryOptions::default().filter(Some(bad.clone()));
         assert!(ns.query_with(&[0.0; DIM], 3, &dense).await.is_err());
+        let sparse = SparseQueryOptions::default().filter(Some(bad));
+        assert!(ns.query_sparse(&vec![(1, 1.0)], 3, &sparse).await.is_err());
     }
     assert_eq!(faulty.ops(), 0, "no storage call for a refused filter");
 }
@@ -406,6 +568,7 @@ async fn a_refused_filter_costs_no_storage_call() {
 async fn filtered_query_futures_can_be_spawned() {
     let ns = Arc::new(indexed_namespace(common::memory()).await);
     let dense = QueryOptions::default().filter(Some(cheap()));
+    let sparse = SparseQueryOptions::default().filter(Some(cheap()));
 
     let handle = ns.clone();
     let dense_hits = tokio::spawn(async move {
@@ -416,7 +579,17 @@ async fn filtered_query_futures_can_be_spawned() {
     })
     .await
     .unwrap();
+    let handle = ns.clone();
+    let sparse_hits = tokio::spawn(async move {
+        handle
+            .query_sparse(&vec![(1, 1.0)], 5, &sparse)
+            .await
+            .unwrap()
+    })
+    .await
+    .unwrap();
     assert_eq!(dense_hits.len(), 5);
+    assert_eq!(sparse_hits.len(), 5);
 }
 
 #[tokio::test]

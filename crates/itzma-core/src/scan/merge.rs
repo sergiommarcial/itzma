@@ -524,6 +524,7 @@ mod tests {
                 id: format!("d{i:05}"),
                 vector: vec![i as f32, 1.0],
                 attrs: (i % 3 != 0).then(|| serde_json::json!({ "n": i })),
+                sparse: None,
             }));
         }
         for i in 0..tombstones {

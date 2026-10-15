@@ -15,7 +15,9 @@ use super::zone::{encode_empty_zone, encode_zone};
 use super::{MAGIC, too_long};
 use crate::attrs::AttrSchema;
 use crate::bloom::Bloom;
+use crate::document::SparseVector;
 use crate::error::{ItzmaError, Result};
+use crate::sparse::SparseWriter;
 
 /// Most bytes one chunk of a section holds before the next one starts. A
 /// chunk can pass it by the one row or block that crossed it.
@@ -342,8 +344,8 @@ enum Layout {
     },
 }
 
-/// Encodes one segment object (version 2 or 3) from documents and
-/// tombstones given in strictly ascending id order.
+/// Encodes one segment object (version 2 or 3) and its `sparse.bin` from
+/// documents and tombstones given in strictly ascending id order.
 pub(crate) struct SegmentWriter {
     dim: usize,
     dim32: u32,
@@ -355,6 +357,7 @@ pub(crate) struct SegmentWriter {
     /// The last id written, kept in one reused buffer, once there is one.
     last: String,
     any: bool,
+    sparse: SparseWriter,
 }
 
 impl SegmentWriter {
@@ -399,6 +402,7 @@ impl SegmentWriter {
             tombstones: 0,
             last: String::new(),
             any: false,
+            sparse: SparseWriter::new(),
         })
     }
 
@@ -424,7 +428,13 @@ impl SegmentWriter {
     /// [`ItzmaError::CorruptSegment`] for an id at or below the last one, a
     /// field longer than 4 GiB, or at version 3 attributes the schema does
     /// not allow.
-    pub(crate) fn doc(&mut self, id: &str, vector: &[f32], attrs: AttrIn<'_>) -> Result<()> {
+    pub(crate) fn doc(
+        &mut self,
+        id: &str,
+        vector: &[f32],
+        attrs: AttrIn<'_>,
+        sparse: Option<&SparseVector>,
+    ) -> Result<()> {
         if vector.len() != self.dim {
             return Err(ItzmaError::DimensionMismatch {
                 expected: self.dim,
@@ -447,6 +457,7 @@ impl SegmentWriter {
             }
         }
         self.vectors.push_f32s(vector);
+        self.sparse.row(sparse)?;
         self.docs += 1;
         Ok(())
     }
@@ -509,12 +520,15 @@ impl SegmentWriter {
         self.tombstones as usize
     }
 
-    /// The data object in file order.
+    /// The data object in file order, and its `sparse.bin` if any document
+    /// was given a sparse vector.
     ///
     /// # Errors
     ///
-    /// [`ItzmaError::CorruptSegment`] for a first id longer than 4 GiB.
-    pub(crate) fn finish(self) -> Result<PutPayload> {
+    /// [`ItzmaError::CorruptSegment`] for a first id longer than 4 GiB or more
+    /// rows than `sparse.bin` can count.
+    pub(crate) fn finish(self) -> Result<(PutPayload, Option<PutPayload>)> {
+        let (sparse, any) = self.sparse.finish()?;
         let mut header = Vec::with_capacity(HEADER_LEN);
         header.extend_from_slice(&MAGIC);
         header.extend_from_slice(&self.version.to_le_bytes());
@@ -616,7 +630,7 @@ impl SegmentWriter {
                 parts.push(Bytes::from(tail));
             }
         }
-        Ok(parts.into_iter().collect())
+        Ok((parts.into_iter().collect(), any.then_some(sparse)))
     }
 }
 
@@ -697,8 +711,8 @@ mod tests {
         }
     }
 
-    /// A random layer: documents, tombstones interleaved with them, every
-    /// block count from none to several.
+    /// A random layer: documents, tombstones interleaved with them, sparse
+    /// vectors on some, every block count from none to several.
     fn layer(rng: &mut Rng, dim: usize) -> Layer {
         let mut l = Layer::new();
         let docs = match rng.below(5) {
@@ -708,10 +722,16 @@ mod tests {
             _ => rng.below(1_100),
         };
         for n in 0..docs {
+            let sparse = (rng.below(3) == 0).then(|| {
+                (0..rng.below(5) + 1)
+                    .map(|t| (t as u32 * 7 + 1, rng.f32()))
+                    .collect()
+            });
             l.apply(WalOp::Upsert(Document {
                 id: id(rng, n),
                 vector: (0..dim).map(|_| rng.f32()).collect(),
                 attrs: attrs(rng),
+                sparse,
             }));
         }
         for _ in 0..rng.below(300) {
@@ -745,31 +765,41 @@ mod tests {
         for case in 0..300 {
             let dim = rng.below(9) as usize + 1;
             let layer = layer(&mut rng, dim);
-            let data = encode_parts(&layer, dim, 2, &AttrSchema::free_form()).unwrap();
+            let (data, sparse) = encode_parts(&layer, dim, 2, &AttrSchema::free_form()).unwrap();
             same(
                 &join(&data),
                 &reference(&layer, dim),
                 &format!("data, case {case}"),
             );
+            let want_sparse = layer.sorted_docs().iter().any(|d| d.sparse.is_some());
+            assert_eq!(sparse.is_some(), want_sparse, "case {case}");
+            if let Some(s) = sparse {
+                same(
+                    &join(&s),
+                    &crate::sparse::reference_encode(&layer).unwrap(),
+                    &format!("sparse, case {case}"),
+                );
+            }
         }
     }
 
     #[test]
     fn an_empty_writer_is_an_empty_layer() {
-        let data = SegmentWriter::new(3, 2, &AttrSchema::free_form())
+        let (data, sparse) = SegmentWriter::new(3, 2, &AttrSchema::free_form())
             .unwrap()
             .finish()
             .unwrap();
         assert_eq!(join(&data), reference(&Layer::new(), 3));
+        assert!(sparse.is_none());
     }
 
     #[test]
     fn ids_out_of_order_are_refused() {
         {
             let mut w = SegmentWriter::new(1, 2, &AttrSchema::free_form()).unwrap();
-            w.doc("b", &[0.0], AttrIn::Json(b"")).unwrap();
+            w.doc("b", &[0.0], AttrIn::Json(b""), None).unwrap();
             assert!(matches!(
-                w.doc("a", &[0.0], AttrIn::Json(b"")),
+                w.doc("a", &[0.0], AttrIn::Json(b""), None),
                 Err(ItzmaError::CorruptSegment { .. })
             ));
             assert!(matches!(
@@ -778,7 +808,7 @@ mod tests {
             ));
             w.tombstone("c").unwrap();
             assert!(matches!(
-                w.doc("c", &[0.0], AttrIn::Json(b"")),
+                w.doc("c", &[0.0], AttrIn::Json(b""), None),
                 Err(ItzmaError::CorruptSegment { .. })
             ));
         }
@@ -788,7 +818,7 @@ mod tests {
     fn a_vector_of_another_length_is_refused() {
         let mut w = SegmentWriter::new(2, 2, &AttrSchema::free_form()).unwrap();
         assert!(matches!(
-            w.doc("a", &[0.0], AttrIn::Json(b"")),
+            w.doc("a", &[0.0], AttrIn::Json(b""), None),
             Err(ItzmaError::DimensionMismatch {
                 expected: 2,
                 got: 1
@@ -812,10 +842,10 @@ mod tests {
         let mut w = SegmentWriter::new(dim, 2, &AttrSchema::free_form()).unwrap();
         let rows = 2 * SECTION_CHUNK / (dim * 4) + 10;
         for n in 0..rows {
-            w.doc(&format!("{n:08}"), &vec![0.5; dim], AttrIn::Json(b""))
+            w.doc(&format!("{n:08}"), &vec![0.5; dim], AttrIn::Json(b""), None)
                 .unwrap();
         }
-        let data = w.finish().unwrap();
+        let (data, _) = w.finish().unwrap();
         assert!(data.iter().count() >= 3, "the vectors are several chunks");
         assert!(data.iter().all(|c| c.len() <= SECTION_CHUNK + dim * 4));
     }
@@ -858,6 +888,7 @@ mod tests {
                 id: format!("d{i:05}"),
                 vector: vec![i as f32, 0.5, -1.0],
                 attrs,
+                sparse: None,
             }));
         }
         for i in 0..tombstones {
@@ -896,12 +927,12 @@ mod tests {
                         0 => AttrIn::Json(&json),
                         _ => AttrIn::Owned(doc.attrs.clone()),
                     };
-                    w.doc(&doc.id, &doc.vector, attrs).unwrap();
+                    w.doc(&doc.id, &doc.vector, attrs, None).unwrap();
                 }
                 for t in dead {
                     w.tombstone(t).unwrap();
                 }
-                Bytes::from(w.finish().unwrap())
+                Bytes::from(w.finish().unwrap().0)
             };
             assert_eq!(write(0), write(1), "version {version}");
         }
@@ -924,12 +955,12 @@ mod tests {
                 } else {
                     AttrIn::Owned(doc.attrs.clone())
                 };
-                w.doc(&doc.id, &doc.vector, attrs).unwrap();
+                w.doc(&doc.id, &doc.vector, attrs, None).unwrap();
             }
             for t in dead {
                 w.tombstone(t).unwrap();
             }
-            let data = w.finish().unwrap();
+            let (data, _) = w.finish().unwrap();
             Bytes::from(data)
         };
         assert_eq!(write(true), write(false));
@@ -953,6 +984,7 @@ mod tests {
                 id: format!("d{i}"),
                 vector: vec![0.0; 3],
                 attrs,
+                sparse: None,
             }));
         }
         let bytes = encode_with_schema(&layer, &schema, 3).unwrap();
@@ -976,6 +1008,7 @@ mod tests {
             id: "a".into(),
             vector: vec![0.0; 3],
             attrs: Some(serde_json::json!({"anything": [1, "x", null]})),
+            sparse: None,
         }));
         let bytes = crate::segment::encode_as(&odd, 3, 3).unwrap();
         assert_eq!(
@@ -991,6 +1024,7 @@ mod tests {
             id: "a".into(),
             vector: vec![0.0; 3],
             attrs: Some(serde_json::json!({"zz": 1})),
+            sparse: None,
         }));
         let err = encode_with_schema(&layer, &typed(), 3).unwrap_err();
         assert!(matches!(err, ItzmaError::CorruptSegment { ref path, .. } if path == "(encoding)"));
@@ -1005,13 +1039,13 @@ mod tests {
             while let Some(t) = dead.next_if(|t| *t < doc.id.as_str()) {
                 w.tombstone(t).unwrap();
             }
-            w.doc(&doc.id, &doc.vector, AttrIn::Owned(doc.attrs.clone()))
+            w.doc(&doc.id, &doc.vector, AttrIn::Owned(doc.attrs.clone()), None)
                 .unwrap();
         }
         for t in dead {
             w.tombstone(t).unwrap();
         }
-        Bytes::from(w.finish().unwrap())
+        Bytes::from(w.finish().unwrap().0)
     }
 
     #[test]
@@ -1038,7 +1072,7 @@ mod tests {
             let mut w = SegmentWriter::new(3, 3, &schema.attrs)?;
             w.attr_blocks(blocks)?;
             for i in 0..docs {
-                w.doc(&format!("d{i:04}"), &[0.0; 3], AttrIn::Encoded)?;
+                w.doc(&format!("d{i:04}"), &[0.0; 3], AttrIn::Encoded, None)?;
             }
             w.finish().map(|_| ())
         };

@@ -32,7 +32,8 @@ use itzma_core::search::distance;
 use itzma_core::{
     AttrColumn, AttrSchema, AttrType, CompactionOptions, Compare, DEFAULT_STREAM_TARGET_BYTES,
     DecodedCache, DecodedCacheOptions, DocColumns, Document, FilterOptions, IndexKind,
-    IndexOptions, Metric, Namespace, Predicate, QueryOptions, Schema, StreamOptions,
+    IndexOptions, Metric, Namespace, Predicate, QueryOptions, Schema, SparseQueryOptions,
+    SparseVector, StreamOptions,
 };
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
@@ -66,6 +67,7 @@ fn documents(rng: &mut Rng, first: usize, count: usize) -> Vec<Document> {
             id: format!("doc-{n}"),
             vector: rng.vector(),
             attrs: None,
+            sparse: None,
         })
         .collect()
 }
@@ -220,6 +222,7 @@ fn load_documents() -> Vec<Document> {
             attrs: Some(
                 serde_json::json!({ "price": n as f64 / 4.0, "tag": format!("tag-{}", n % 50) }),
             ),
+            sparse: None,
         })
         .collect()
 }
@@ -459,6 +462,117 @@ async fn merge_input() -> Namespace {
     ns
 }
 
+const SPARSE_DIM: usize = 4;
+const SPARSE_SCHEMA: Schema = Schema::new(SPARSE_DIM, Metric::L2);
+const VOCAB: f32 = 30_000.0;
+const DOC_TERMS: usize = 100;
+const QUERY_TERMS: usize = 30;
+
+impl Rng {
+    /// A term id skewed toward the low ids, so a few terms are in most
+    /// documents and most terms in few, the shape of a real vocabulary.
+    fn term(&mut self) -> u32 {
+        let u = (self.next_f32() + 1.0) / 2.0;
+        (u * u * u * VOCAB) as u32
+    }
+
+    /// Up to `count` distinct terms with a weight each.
+    fn sparse(&mut self, count: usize) -> SparseVector {
+        let mut terms: SparseVector = Vec::with_capacity(count);
+        for _ in 0..count {
+            let term = self.term();
+            if !terms.iter().any(|(t, _)| *t == term) {
+                terms.push((term, (self.next_f32() + 1.0) / 2.0 + 0.01));
+            }
+        }
+        terms
+    }
+}
+
+fn sparse_documents(rng: &mut Rng, first: usize, count: usize) -> Vec<Document> {
+    (first..first + count)
+        .map(|n| Document {
+            id: format!("doc-{n}"),
+            vector: vec![0.0; SPARSE_DIM],
+            attrs: None,
+            sparse: Some(rng.sparse(DOC_TERMS)),
+        })
+        .collect()
+}
+
+/// A compacted namespace of `batches` times [`BATCH`] documents with sparse
+/// vectors.
+async fn sparse_segment(batches: usize) -> Namespace {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let ns = Namespace::create(store, "bench", SPARSE_SCHEMA)
+        .await
+        .expect("create");
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    for b in 0..batches {
+        ns.upsert(sparse_documents(&mut rng, b * BATCH, BATCH))
+            .await
+            .expect("upsert");
+    }
+    ns.compact(&CompactionOptions::default())
+        .await
+        .expect("compact");
+    ns
+}
+
+/// Sparse writes and `query_sparse`. `InMemory` has no request latency, so
+/// the query numbers are CPU only.
+fn sparse(c: &mut Criterion, rt: &Runtime) {
+    let mut group = c.benchmark_group("sparse");
+    group.sample_size(10);
+
+    // The same batch of 1k documents with and without a 100-term sparse
+    // vector, so the WAL version 4 column has its cost on record.
+    group.throughput(Throughput::Elements(BATCH as u64));
+    for (name, with_sparse) in [
+        ("upsert/1k_no_sparse", false),
+        ("upsert/1k_100_terms", true),
+    ] {
+        group.bench_function(name, |b| {
+            b.iter_custom(|iters| {
+                rt.block_on(async {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+                        let ns = Namespace::create(store, "bench", SPARSE_SCHEMA)
+                            .await
+                            .expect("create");
+                        let mut docs = sparse_documents(&mut Rng(1), 0, BATCH);
+                        if !with_sparse {
+                            for doc in &mut docs {
+                                doc.sparse = None;
+                            }
+                        }
+                        let start = Instant::now();
+                        black_box(ns.upsert(docs).await.expect("upsert"));
+                        total += start.elapsed();
+                    }
+                    total
+                })
+            });
+        });
+    }
+
+    let query = Rng(7).sparse(QUERY_TERMS);
+    let options = SparseQueryOptions::default();
+    for batches in [10, 100] {
+        let docs = batches * BATCH;
+        group.throughput(Throughput::Elements(docs as u64));
+        let ns = OnceCell::new();
+        group.bench_function(format!("query/{}k_100_terms_unindexed", docs / 1000), |b| {
+            let ns = ns.get_or_init(|| rt.block_on(sparse_segment(batches)));
+            b.to_async(rt).iter(|| async {
+                black_box(ns.query_sparse(&query, 10, &options).await.expect("query"))
+            });
+        });
+    }
+    group.finish();
+}
+
 const FILTER_DIM: usize = 4;
 
 /// The schema the `filter` and `filtered` groups use.
@@ -483,6 +597,7 @@ async fn filter_segment(batches: usize) -> Namespace {
                 id: format!("doc-{n:08}"),
                 vector: vec![0.0; FILTER_DIM],
                 attrs: Some(serde_json::json!({ "bucket": n % 100, "active": n % 2 == 0 })),
+                sparse: None,
             })
             .collect();
         ns.upsert(docs).await.expect("upsert");
@@ -541,6 +656,7 @@ async fn filtered_query_segment_at(batches: usize, level: u32) -> Namespace {
                     id: format!("doc-{n:08}"),
                     vector: vec![x, x * 0.5, (n % 7) as f32, 1.0],
                     attrs: Some(serde_json::json!({ "bucket": n % 100, "active": n % 2 == 0 })),
+                    sparse: Some(vec![(1 + (n % 50) as u32, 1.0 + (n % 5) as f32)]),
                 }
             })
             .collect();
@@ -562,6 +678,7 @@ fn filtered(c: &mut Criterion, rt: &Runtime) {
     let mut group = c.benchmark_group("filtered");
     group.sample_size(10);
     let probe = [3.0, 1.5, 2.0, 1.0];
+    let terms: SparseVector = vec![(1, 1.0), (2, 1.0), (3, 1.0)];
     let filters = [
         ("unfiltered", None),
         ("loose", Some(Predicate::is_true("active"))),
@@ -581,6 +698,13 @@ fn filtered(c: &mut Criterion, rt: &Runtime) {
                 let ns = ns();
                 b.to_async(rt).iter(|| async {
                     black_box(ns.query_with(&probe, 10, &dense).await.expect("query"))
+                });
+            });
+            let sparse = SparseQueryOptions::default().filter(predicate.clone());
+            group.bench_function(format!("sparse/{kind}/{}k", docs / 1000), |b| {
+                let ns = ns();
+                b.to_async(rt).iter(|| async {
+                    black_box(ns.query_sparse(&terms, 10, &sparse).await.expect("query"))
                 });
             });
         }
@@ -794,6 +918,7 @@ async fn filter_segment_at(batches: usize, level: u32, segments: usize) -> Names
                 id: format!("doc-{n:08}"),
                 vector: vec![0.0; FILTER_DIM],
                 attrs: Some(serde_json::json!({ "bucket": n % 100, "active": n % 2 == 0 })),
+                sparse: None,
             })
             .collect();
         ns.upsert(docs).await.expect("upsert");
@@ -908,6 +1033,7 @@ async fn columnar_input(level: u32, parts: usize, fold: bool) -> Namespace {
                 id: format!("doc-{n:08}"),
                 vector: rng.vector(),
                 attrs: Some(serde_json::json!({ "bucket": n % 100, "active": n % 2 == 0 })),
+                sparse: None,
             })
             .collect();
         ns.upsert(docs).await.expect("upsert");
@@ -925,6 +1051,7 @@ fn benches(c: &mut Criterion) {
     upsert(c, &rt);
     query(c, &rt);
     compact(c, &rt);
+    sparse(c, &rt);
     filter(c, &rt);
     filtered(c, &rt);
     columnar(c, &rt);

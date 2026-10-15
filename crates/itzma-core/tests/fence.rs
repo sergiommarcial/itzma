@@ -16,7 +16,7 @@ use common::{
     fence_by_hand, put_segment, schema, snapshot,
 };
 use itzma_core::gc::fenced_through_path;
-use itzma_core::wal::{self, FENCE_FORMAT_VERSION, FORMAT_VERSION};
+use itzma_core::wal::{self, FENCE_FORMAT_VERSION, FORMAT_VERSION, SPARSE_FORMAT_VERSION};
 use itzma_core::{
     Compaction, CompactionOptions, GcOptions, GcReport, Hit, ItzmaError, Manifest, Metric,
     Namespace, WalOp, WriteKey, manifest,
@@ -79,15 +79,19 @@ async fn fold_and_fence(store: Arc<dyn ObjectStore>, through: u64) {
 #[tokio::test]
 async fn the_build_is_at_the_fence_level_and_a_new_namespace_starts_there() {
     assert_eq!(FENCE_FORMAT_VERSION, 4);
-    assert_eq!(FORMAT_VERSION, FENCE_FORMAT_VERSION);
+    assert_eq!(SPARSE_FORMAT_VERSION, 5);
+    assert_eq!(FORMAT_VERSION, SPARSE_FORMAT_VERSION);
     for b in backends() {
         eprintln!("backend: {}", b.name);
         Namespace::create(b.store.clone(), "docs", schema(1, Metric::L2))
             .await
             .unwrap();
         let (m, _) = manifest::load(&*b.store, "docs").await.unwrap();
-        // A new namespace starts at the newest level this build reads.
-        assert_eq!(m.wal_format, FENCE_FORMAT_VERSION);
+        // A new namespace starts at the newest level this build writes,
+        // which now includes sparse-in-WAL support on top of
+        // fencing.
+        assert_eq!(m.wal_format, SPARSE_FORMAT_VERSION);
+        assert!(m.wal_format >= FENCE_FORMAT_VERSION);
     }
 }
 

@@ -29,8 +29,9 @@ mod writer;
 mod zone;
 
 pub(crate) use ranged::{DocWindow, Held, RangedSegment};
+pub(crate) use v2::BLOCK_ROWS;
 pub(crate) use view::SegmentView;
-pub(crate) use writer::{AttrIn, SegmentWriter, attr_json, encode_attr_block};
+pub(crate) use writer::{AttrIn, Chunks, SegmentWriter, attr_json, encode_attr_block};
 
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -266,7 +267,8 @@ pub fn encode(layer: &Layer, dim: usize) -> Result<Bytes> {
 /// - [`ItzmaError::Serde`] / [`ItzmaError::CorruptSegment`] if an attribute
 ///   cannot be serialized or a field is longer than 4 GiB.
 pub fn encode_as(layer: &Layer, dim: usize, version: u32) -> Result<Bytes> {
-    Ok(encode_parts(layer, dim, version, &AttrSchema::free_form())?.into())
+    let (data, _) = encode_parts(layer, dim, version, &AttrSchema::free_form())?;
+    Ok(data.into())
 }
 
 /// Encode a layer as the segment object `compact` writes at `version` for a
@@ -280,16 +282,19 @@ pub fn encode_as(layer: &Layer, dim: usize, version: u32) -> Result<Bytes> {
 /// document whose attributes the schema does not allow, which a strict write
 /// never stores.
 pub fn encode_with_schema(layer: &Layer, schema: &Schema, version: u32) -> Result<Bytes> {
-    Ok(encode_parts(layer, schema.dim, version, &schema.attrs)?.into())
+    let (data, _) = encode_parts(layer, schema.dim, version, &schema.attrs)?;
+    Ok(data.into())
 }
 
-/// [`encode_as`] without joining the chunks: what compaction writes.
+/// [`encode_as`] without joining the chunks, with the segment's `sparse.bin`
+/// beside it (`None` when no document has a sparse vector): what compaction
+/// writes.
 pub(crate) fn encode_parts(
     layer: &Layer,
     dim: usize,
     version: u32,
     attrs: &AttrSchema,
-) -> Result<PutPayload> {
+) -> Result<(PutPayload, Option<PutPayload>)> {
     let mut writer = SegmentWriter::new(dim, version, attrs)?;
     let docs = layer.sorted_docs();
     let columnar = version >= 3 && !attrs.is_free_form();
@@ -330,7 +335,7 @@ pub(crate) fn encode_parts(
         } else {
             AttrIn::Json(&json[i])
         };
-        writer.doc(&doc.id, &doc.vector, attrs)?;
+        writer.doc(&doc.id, &doc.vector, attrs, doc.sparse.as_ref())?;
     }
     for id in dead {
         writer.tombstone(id)?;
@@ -547,7 +552,7 @@ pub(crate) async fn fetch_bytes(
 }
 
 /// Fetch one segment and decode it on `lane`.
-pub(crate) async fn fetch(
+async fn fetch(
     store: &dyn ObjectStore,
     namespace: &str,
     id: &str,
@@ -579,11 +584,11 @@ pub(crate) async fn encode_parts_on(
     dim: usize,
     version: u32,
     attrs: AttrSchema,
-) -> Result<(Layer, PutPayload)> {
+) -> Result<(Layer, PutPayload, Option<PutPayload>)> {
     let cost = Cost::Bytes(layer.doc_count().saturating_mul(dim * 4 + 64));
     cpu::run(lane, cost, move || {
-        let data = encode_parts(&layer, dim, version, &attrs)?;
-        Ok((layer, data))
+        let (data, sparse) = encode_parts(&layer, dim, version, &attrs)?;
+        Ok((layer, data, sparse))
     })
     .await
 }
@@ -736,6 +741,7 @@ mod tests {
                 id: format!("d{i}"),
                 vector: vec![i as f32; 2],
                 attrs: None,
+                sparse: None,
             }));
         }
         let ids = [segment_id(1, 1)];
@@ -791,6 +797,7 @@ mod tests {
                 id: format!("d{i:06}"),
                 vector: (0..dim).map(|d| ((i * 31 + d * 7) % 101) as f32).collect(),
                 attrs: (i % 3 == 0).then(|| serde_json::json!({ "n": i, "tag": "x" })),
+                sparse: None,
             }));
         }
         for i in 0..10 {
@@ -817,7 +824,7 @@ mod tests {
         let layer = big_layer(20_000, 32);
         for version in [2, 3] {
             let direct = encode_as(&layer, 32, version).unwrap();
-            let (back, data) = encode_parts_on(
+            let (back, data, sparse) = encode_parts_on(
                 Lane::Maintenance,
                 layer.clone(),
                 32,
@@ -827,6 +834,7 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(Bytes::from(data), direct, "version {version}");
+            assert!(sparse.is_none());
             assert_eq!(back, layer);
         }
     }
@@ -848,6 +856,7 @@ mod tests {
             id: id.into(),
             vector: v.to_vec(),
             attrs,
+            sparse: None,
         })
     }
 

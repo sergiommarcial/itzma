@@ -42,7 +42,7 @@ impl PyBatch {
     }
 }
 
-const ROW_KEYS: [&str; 3] = ["id", "vector", "attrs"];
+const ROW_KEYS: [&str; 4] = ["id", "vector", "attrs", "sparse"];
 
 fn optional_attrs(value: Option<Bound<'_, PyAny>>) -> PyResult<Option<serde_json::Value>> {
     match value {
@@ -51,7 +51,15 @@ fn optional_attrs(value: Option<Bound<'_, PyAny>>) -> PyResult<Option<serde_json
     }
 }
 
-/// Documents from a list of dicts with `id`, `vector` and optional `attrs`.
+fn optional_sparse(value: Option<Bound<'_, PyAny>>) -> PyResult<Option<Vec<(u32, f32)>>> {
+    match value {
+        Some(v) if !v.is_none() => Ok(Some(vectors::sparse(&v)?)),
+        _ => Ok(None),
+    }
+}
+
+/// Documents from a list of dicts with `id`, `vector`, optional `attrs` and
+/// `sparse`.
 #[pyfunction]
 pub(crate) fn batch_from_rows(rows: &Bound<'_, PyList>) -> PyResult<PyBatch> {
     let mut docs = Vec::with_capacity(rows.len());
@@ -63,7 +71,7 @@ pub(crate) fn batch_from_rows(rows: &Bound<'_, PyList>) -> PyResult<PyBatch> {
             let key: String = key.extract()?;
             if !ROW_KEYS.contains(&key.as_str()) {
                 return Err(error::input(format!(
-                    "row {i}: unknown key {key:?}; a row has id, vector and attrs"
+                    "row {i}: unknown key {key:?}; a row has id, vector, attrs and sparse"
                 )));
             }
         }
@@ -77,19 +85,26 @@ pub(crate) fn batch_from_rows(rows: &Bound<'_, PyList>) -> PyResult<PyBatch> {
                 .ok_or_else(|| error::input(format!("row {i}: no vector")))?,
         )?;
         let attrs = optional_attrs(row.get_item("attrs")?)?;
-        docs.push(Document { id, vector, attrs });
+        let sparse = optional_sparse(row.get_item("sparse")?)?;
+        docs.push(Document {
+            id,
+            vector,
+            attrs,
+            sparse,
+        });
     }
     Ok(PyBatch::from_docs(docs))
 }
 
-/// Documents from columns: ids, a 2-D float32 matrix, and an optional list
-/// of attribute dicts of the same length.
+/// Documents from columns: ids, a 2-D float32 matrix, and optional lists of
+/// attribute dicts and sparse vectors of the same length.
 #[pyfunction]
-#[pyo3(signature = (ids, vectors, attrs=None))]
+#[pyo3(signature = (ids, vectors, attrs=None, sparse=None))]
 pub(crate) fn batch_from_columns(
     ids: Vec<String>,
     vectors: &Bound<'_, PyAny>,
     attrs: Option<&Bound<'_, PyList>>,
+    sparse: Option<&Bound<'_, PyList>>,
 ) -> PyResult<PyBatch> {
     let rows = vectors::matrix(vectors)?;
     let n = ids.len();
@@ -104,13 +119,18 @@ pub(crate) fn batch_from_columns(
     if let Some(a) = attrs {
         same("attrs", a.len())?;
     }
+    if let Some(s) = sparse {
+        same("sparse vectors", s.len())?;
+    }
     let mut docs = Vec::with_capacity(n);
     for (i, (id, vector)) in ids.into_iter().zip(rows).enumerate() {
         let doc_attrs = attrs.map(|a| a.get_item(i)).transpose()?;
+        let doc_sparse = sparse.map(|s| s.get_item(i)).transpose()?;
         docs.push(Document {
             id,
             vector,
             attrs: optional_attrs(doc_attrs)?,
+            sparse: optional_sparse(doc_sparse)?,
         });
     }
     Ok(PyBatch::from_docs(docs))

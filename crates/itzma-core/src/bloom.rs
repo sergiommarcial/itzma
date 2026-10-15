@@ -117,6 +117,7 @@ mod tests {
                 id: id.clone(),
                 vector: (0..128).map(|d| ((i + d) % 97) as f32).collect(),
                 attrs: None,
+                sparse: None,
             }));
         }
         let start = std::time::Instant::now();

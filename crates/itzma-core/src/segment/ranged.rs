@@ -1377,6 +1377,7 @@ mod tests {
                 id: format!("d{i:05}"),
                 vector: (0..dim).map(|k| (i * 7 + k) as f32 * 0.5).collect(),
                 attrs: (i % 3 == 0).then(|| json!({ "n": i, "tag": "x" })),
+                sparse: None,
             }));
         }
         for i in 0..tombstones {

@@ -1,19 +1,20 @@
 //! Arrow record batches to documents.
 //!
 //! Columns: `id` (any string type), `vector` (a list, large list or fixed
-//! size list of floats), and every other column an attribute. Types are normalized
+//! size list of floats), an optional `sparse` (a list of structs with `term`
+//! and `weight`), and every other column an attribute. Types are normalized
 //! with `arrow_cast::cast`, so Polars' `Utf8View` and `LargeList` work too.
 
 use std::sync::{Arc, Mutex};
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float32Type, Float64Type, Int64Type};
+use arrow_array::types::{Float32Type, Float64Type, Int64Type, UInt32Type};
 use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, RecordBatchReader, StringArray};
 use arrow_cast::cast;
 use arrow_schema::{DataType, Field};
 #[cfg(test)]
 use itzma_core::Document;
-use itzma_core::{AttrColumn as Column, DocColumns};
+use itzma_core::{AttrColumn as Column, DocColumns, SparseColumn as Sparse};
 use pyo3::prelude::*;
 use pyo3_arrow::PyRecordBatchReader;
 #[cfg(test)]
@@ -262,6 +263,82 @@ impl AttrColumn {
     }
 }
 
+struct SparseColumn {
+    list: ListArray,
+    terms: ArrayRef,
+    weights: ArrayRef,
+}
+
+impl SparseColumn {
+    fn new(col: &ArrayRef) -> Result<Self, String> {
+        let inner = match col.data_type() {
+            DataType::List(f) | DataType::LargeList(f) => f.data_type().clone(),
+            other => {
+                return Err(format!(
+                    "column \"sparse\": expected a list of structs, got {other}"
+                ));
+            }
+        };
+        let list = cast_to("sparse", col, &list_of(inner))?
+            .as_list::<i32>()
+            .clone();
+        let entries = list
+            .values()
+            .as_struct_opt()
+            .ok_or("column \"sparse\": expected a list of structs with term and weight")?;
+        let field = |name: &str, to: DataType| -> Result<ArrayRef, String> {
+            let column = entries
+                .column_by_name(name)
+                .ok_or_else(|| format!("column \"sparse\": the structs need a {name:?} field"))?;
+            cast_to("sparse", column, &to)
+        };
+        let terms = field("term", DataType::UInt32)?;
+        let weights = field("weight", DataType::Float32)?;
+        // A safe cast turns an out-of-range term into null, so a null here is
+        // either a null in the input or a term that does not fit a u32.
+        if entries.null_count() > 0 || terms.null_count() > 0 || weights.null_count() > 0 {
+            return Err(
+                "column \"sparse\": every entry needs a term (0 to 4294967295) and a weight".into(),
+            );
+        }
+        Ok(Self {
+            terms,
+            weights,
+            list,
+        })
+    }
+
+    /// The column as `itzma_core` takes it.
+    fn column(&self) -> Result<Sparse, String> {
+        let offsets = self.list.value_offsets();
+        let start = offsets.first().copied().unwrap_or(0) as usize;
+        let end = offsets.last().copied().unwrap_or(0) as usize;
+        Sparse::new(
+            validity(&self.list),
+            rebased(offsets),
+            self.terms.as_primitive::<UInt32Type>().values()[start..end].to_vec(),
+            self.weights.as_primitive::<Float32Type>().values()[start..end].to_vec(),
+        )
+        .map_err(|e| format!("column \"sparse\": {e}"))
+    }
+
+    #[cfg(test)]
+    fn value(&self, row: usize) -> Option<Vec<(u32, f32)>> {
+        if self.list.is_null(row) {
+            return None;
+        }
+        let offsets = self.list.value_offsets();
+        let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
+        let terms = self.terms.as_primitive::<UInt32Type>();
+        let weights = self.weights.as_primitive::<Float32Type>();
+        Some(
+            (start..end)
+                .map(|i| (terms.value(i), weights.value(i)))
+                .collect(),
+        )
+    }
+}
+
 /// A record batch as one columnar batch: the same columns, the
 /// same kinds and the same refusals as the row-by-row conversion it
 /// replaced (`documents`, kept in the tests as the reference), with each
@@ -280,10 +357,14 @@ pub(crate) fn columns_from_batch(batch: &RecordBatch) -> Result<DocColumns, Stri
         .ok_or("an Arrow table needs a \"vector\" column")?;
     let vectors = cast_to("vector", vectors, &list_of(DataType::Float32))?;
     let vectors = vectors.as_list::<i32>();
+    let sparse = batch
+        .column_by_name("sparse")
+        .map(SparseColumn::new)
+        .transpose()?;
     let schema = batch.schema();
     let mut attrs = Vec::new();
     for (field, column) in schema.fields().iter().zip(batch.columns()) {
-        if !matches!(field.name().as_str(), "id" | "vector") {
+        if !matches!(field.name().as_str(), "id" | "vector" | "sparse") {
             attrs.push((field.name().clone(), AttrColumn::new(field.name(), column)?));
         }
     }
@@ -324,6 +405,11 @@ pub(crate) fn columns_from_batch(batch: &RecordBatch) -> Result<DocColumns, Stri
             .with_attr(name.clone(), column.column(rows))
             .map_err(|e| format!("column {name:?}: {e}"))?;
     }
+    if let Some(sparse) = &sparse {
+        cols = cols
+            .with_sparse(sparse.column()?)
+            .map_err(|e| e.to_string())?;
+    }
     Ok(cols)
 }
 
@@ -339,10 +425,14 @@ pub(crate) fn documents(batch: &RecordBatch) -> Result<Vec<Document>, String> {
         .ok_or("an Arrow table needs a \"vector\" column")?;
     let vectors = cast_to("vector", vectors, &list_of(DataType::Float32))?;
     let vectors = vectors.as_list::<i32>();
+    let sparse = batch
+        .column_by_name("sparse")
+        .map(SparseColumn::new)
+        .transpose()?;
     let schema = batch.schema();
     let mut attrs = Vec::new();
     for (field, column) in schema.fields().iter().zip(batch.columns()) {
-        if !matches!(field.name().as_str(), "id" | "vector") {
+        if !matches!(field.name().as_str(), "id" | "vector" | "sparse") {
             attrs.push((field.name().clone(), AttrColumn::new(field.name(), column)?));
         }
     }
@@ -372,6 +462,7 @@ pub(crate) fn documents(batch: &RecordBatch) -> Result<Vec<Document>, String> {
             id: ids.value(row).to_owned(),
             vector: values.values().to_vec(),
             attrs: doc_attrs,
+            sparse: sparse.as_ref().and_then(|s| s.value(row)),
         });
     }
     Ok(docs)
@@ -419,12 +510,13 @@ mod tests {
 
     use arrow_array::builder::{
         FixedSizeListBuilder, Float32Builder, Float64Builder, LargeListBuilder, ListBuilder,
-        StringBuilder,
+        StringBuilder, StructBuilder, UInt32Builder,
     };
     use arrow_array::{
         ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, NullArray, RecordBatch,
         StringArray, StringViewArray,
     };
+    use arrow_schema::{DataType, Field, Fields};
     use serde_json::json;
 
     use super::*;
@@ -442,7 +534,7 @@ mod tests {
         RecordBatch::try_from_iter(columns).expect("batch")
     }
 
-    /// Every attribute kind, nulls in each: three rows.
+    /// Every attribute kind, nulls in each, a sparse column: three rows.
     fn rich() -> RecordBatch {
         use arrow_array::builder::{BooleanBuilder, Int64Builder};
         use arrow_array::types::Int32Type;
@@ -483,6 +575,31 @@ mod tests {
         let nums: ArrayRef = Arc::new(nums.finish());
         let nothing: ArrayRef = Arc::new(NullArray::new(3));
 
+        let fields = Fields::from(vec![
+            Field::new("term", DataType::UInt32, false),
+            Field::new("weight", DataType::Float32, false),
+        ]);
+        let mut sparse = ListBuilder::new(StructBuilder::new(
+            fields,
+            vec![
+                Box::new(UInt32Builder::new()),
+                Box::new(Float32Builder::new()),
+            ],
+        ));
+        for row in [vec![(7u32, 0.5f32), (9, 1.0)], vec![], vec![(3, 2.0)]] {
+            for (term, weight) in row {
+                let s = sparse.values();
+                s.field_builder::<UInt32Builder>(0)
+                    .expect("term")
+                    .append_value(term);
+                s.field_builder::<Float32Builder>(1)
+                    .expect("weight")
+                    .append_value(weight);
+                s.append(true);
+            }
+            sparse.append(true);
+        }
+        let sparse: ArrayRef = Arc::new(sparse.finish());
         batch(vec![
             ("id", ids),
             ("vector", vectors),
@@ -495,6 +612,7 @@ mod tests {
             ("years", years),
             ("nums", nums),
             ("nothing", nothing),
+            ("sparse", sparse),
         ])
     }
 
@@ -616,6 +734,7 @@ mod tests {
         assert_eq!(docs[1].id, "b");
         assert_eq!(docs[1].vector, vec![3.0, 4.0]);
         assert_eq!(docs[0].attrs, None);
+        assert_eq!(docs[0].sparse, None);
     }
 
     #[test]
@@ -669,6 +788,43 @@ mod tests {
     }
 
     #[test]
+    fn sparse_column() {
+        let fields = Fields::from(vec![
+            Field::new("term", DataType::UInt32, false),
+            Field::new("weight", DataType::Float32, false),
+        ]);
+        let mut sparse = ListBuilder::new(StructBuilder::new(
+            fields,
+            vec![
+                Box::new(UInt32Builder::new()),
+                Box::new(Float32Builder::new()),
+            ],
+        ));
+        for (term, weight) in [(7u32, 0.5f32), (9, 1.0)] {
+            let s = sparse.values();
+            s.field_builder::<UInt32Builder>(0)
+                .expect("term")
+                .append_value(term);
+            s.field_builder::<Float32Builder>(1)
+                .expect("weight")
+                .append_value(weight);
+            s.append(true);
+        }
+        sparse.append(true);
+        sparse.append(false);
+        let sparse: ArrayRef = Arc::new(sparse.finish());
+        let ids: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let docs = documents(&batch(vec![
+            ("id", ids),
+            ("vector", fixed_vectors(&[[1.0, 0.0], [0.0, 1.0]])),
+            ("sparse", sparse),
+        ]))
+        .expect("docs");
+        assert_eq!(docs[0].sparse, Some(vec![(7, 0.5), (9, 1.0)]));
+        assert_eq!(docs[1].sparse, None);
+    }
+
+    #[test]
     fn refusals() {
         let ids: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None]));
         let err = documents(&batch(vec![
@@ -715,6 +871,49 @@ mod tests {
         assert_eq!(float32_values(&values).expect("values"), vec![1.0, 2.0]);
         let nulls: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.0), None]));
         assert!(float32_values(&nulls).is_err());
+    }
+
+    #[test]
+    fn sparse_nulls_and_out_of_range_terms_are_refused() {
+        use arrow_array::builder::Int64Builder;
+        let fields = Fields::from(vec![
+            Field::new("term", DataType::Int64, true),
+            Field::new("weight", DataType::Float32, true),
+        ]);
+        let build = |term: Option<i64>, weight: Option<f32>| -> ArrayRef {
+            let mut sparse = ListBuilder::new(StructBuilder::new(
+                fields.clone(),
+                vec![
+                    Box::new(Int64Builder::new()),
+                    Box::new(Float32Builder::new()),
+                ],
+            ));
+            let s = sparse.values();
+            s.field_builder::<Int64Builder>(0)
+                .expect("term")
+                .append_option(term);
+            s.field_builder::<Float32Builder>(1)
+                .expect("weight")
+                .append_option(weight);
+            s.append(true);
+            sparse.append(true);
+            Arc::new(sparse.finish())
+        };
+        for (term, weight) in [
+            (Some(-1), Some(1.0)),
+            (Some(5_000_000_000), Some(1.0)),
+            (None, Some(1.0)),
+            (Some(3), None),
+        ] {
+            let ids: ArrayRef = Arc::new(StringArray::from(vec!["a"]));
+            let err = documents(&batch(vec![
+                ("id", ids),
+                ("vector", fixed_vectors(&[[1.0, 0.0]])),
+                ("sparse", build(term, weight)),
+            ]))
+            .expect_err("bad sparse entry");
+            assert!(err.contains("sparse"), "{term:?} {weight:?}: {err}");
+        }
     }
 
     #[test]

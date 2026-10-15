@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use itzma_core::{
     AttrColumn, AttrSchema, AttrType, DocColumns, Document, Metric, Namespace, Schema,
+    SparseColumn, SparseVector,
 };
 use object_store::ObjectStore;
 use serde_json::{Map, Number, Value};
@@ -19,6 +20,7 @@ struct Case {
     ids: Vec<String>,
     vectors: Vec<Vec<f32>>,
     attrs: Vec<(String, AttrColumn)>,
+    sparse: Option<Vec<Option<SparseVector>>>,
 }
 
 impl Case {
@@ -37,6 +39,20 @@ impl Case {
                 .with_attr(name.clone(), column.clone())
                 .expect("well formed");
         }
+        if let Some(rows) = &self.sparse {
+            let (mut valid, mut offsets, mut terms, mut weights) =
+                (vec![], vec![0u32], vec![], vec![]);
+            for row in rows {
+                valid.push(row.is_some());
+                for &(t, w) in row.iter().flatten() {
+                    terms.push(t);
+                    weights.push(w);
+                }
+                offsets.push(terms.len() as u32);
+            }
+            let sparse = SparseColumn::new(valid, offsets, terms, weights).expect("well formed");
+            cols = cols.with_sparse(sparse).expect("well formed");
+        }
         cols
     }
 
@@ -52,6 +68,7 @@ impl Case {
                     }
                     Value::Object(map)
                 }),
+                sparse: self.sparse.as_ref().and_then(|rows| rows[row].clone()),
             })
             .collect()
     }
@@ -225,6 +242,7 @@ fn good() -> Case {
             ),
             ("scores".into(), f64_set(&[Some(vec![Some(1.5)]), None])),
         ],
+        sparse: Some(vec![Some(vec![(1, 0.5)]), None]),
     }
 }
 
@@ -247,6 +265,15 @@ fn defects() -> Vec<(&'static str, Case)> {
     with("cosine zero vector", &|c| c.vectors[1] = vec![0.0, 0.0]);
     with("wrong dim", &|c| {
         c.vectors = vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]]
+    });
+    with("repeated sparse term", &|c| {
+        c.sparse = Some(vec![Some(vec![(1, 0.5), (1, 0.2)]), None])
+    });
+    with("NaN sparse weight", &|c| {
+        c.sparse = Some(vec![None, Some(vec![(2, f32::NAN)])])
+    });
+    with("too many sparse terms", &|c| {
+        c.sparse = Some(vec![Some((0..65_536u32).map(|t| (t, 1.0)).collect()), None]);
     });
     with("undeclared column", &|c| {
         set_attr(c, "colour", text(&[Some("red"), Some("blue")]));
@@ -407,20 +434,26 @@ async fn a_bad_batch_writes_nothing() {
 }
 
 #[tokio::test]
-async fn a_keyed_batch_needs_level_3() {
+async fn a_sparse_batch_needs_level_5_and_a_keyed_one_level_3() {
     let store = common::memory();
     let ns = at_level_2(store.clone()).await;
     let before = common::snapshot(&*store).await;
-    let err = ns
-        .upsert_columns_keyed(&itzma_core::WriteKey::new("k"), &good().columns())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, itzma_core::ItzmaError::WalFormatTooOld { .. }),
-        "{err:?}"
+    let too_old = |err: itzma_core::ItzmaError| {
+        assert!(
+            matches!(err, itzma_core::ItzmaError::WalFormatTooOld { .. }),
+            "{err:?}"
+        );
+    };
+    too_old(ns.upsert_columns(&good().columns()).await.unwrap_err());
+    let mut plain = good();
+    plain.sparse = None;
+    too_old(
+        ns.upsert_columns_keyed(&itzma_core::WriteKey::new("k"), &plain.columns())
+            .await
+            .unwrap_err(),
     );
     common::assert_untouched(&*store, &before).await;
-    assert_eq!(ns.upsert_columns(&good().columns()).await.unwrap(), 1);
+    assert_eq!(ns.upsert_columns(&plain.columns()).await.unwrap(), 1);
 }
 
 #[tokio::test]

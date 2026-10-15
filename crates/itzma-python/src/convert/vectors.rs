@@ -36,3 +36,10 @@ pub(crate) fn matrix(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<f32>>> {
         .map(|row| row.to_vec())
         .collect())
 }
+
+/// A sparse vector: a sequence of `(term id, weight)` pairs.
+pub(crate) fn sparse(obj: &Bound<'_, PyAny>) -> PyResult<Vec<(u32, f32)>> {
+    obj.extract::<Vec<(u32, f32)>>().map_err(|_| {
+        error::input("a sparse vector must be a list of (term id, weight) pairs".into())
+    })
+}

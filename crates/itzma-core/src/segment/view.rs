@@ -230,6 +230,7 @@ mod tests {
                 id: format!("d{i:05}"),
                 vector: vec![i as f32, -(i as f32), 0.5],
                 attrs: (i % 3 != 0).then(|| json!({"n": i, "tag": format!("t{}", i % 7)})),
+                sparse: None,
             }));
         }
         for i in 0..tombstones {
@@ -389,6 +390,7 @@ mod tests {
                 id: id.into(),
                 vector: vec![0.0; DIM],
                 attrs: Some(attrs),
+                sparse: None,
             }));
         }
         let mut bytes = bytes_of(&layer).to_vec();
@@ -441,6 +443,7 @@ mod tests {
                 id: format!("d{i:04}"),
                 vector: vec![i as f32; DIM],
                 attrs,
+                sparse: None,
             }));
         }
         layer.apply(WalOp::Delete("e".into()));

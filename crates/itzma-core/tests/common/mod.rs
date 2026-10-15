@@ -125,6 +125,7 @@ pub fn doc(id: &str, vector: &[f32]) -> Document {
         id: id.into(),
         vector: vector.to_vec(),
         attrs: None,
+        sparse: None,
     }
 }
 

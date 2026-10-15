@@ -4,8 +4,8 @@
 //! that turned every row into a [`Document`](crate::Document) and back would
 //! copy every vector three times and build a JSON tree per row for nothing.
 //! [`DocColumns`] keeps the batch as flat buffers: ids as one UTF-8 buffer and
-//! offsets, vectors as one row-major `f32` slice and one typed column per
-//! attribute. The constructors check the shape
+//! offsets, vectors as one row-major `f32` slice, one typed column per
+//! attribute and an optional sparse column. The constructors check the shape
 //! (offsets, lengths, UTF-8), and [`DocColumns::validate`] checks the batch
 //! against a namespace's schema the way `upsert` checks documents, column by
 //! column.
@@ -15,7 +15,8 @@ use crate::document::{self, Schema};
 use crate::error::{ItzmaError, Result};
 
 /// A batch of upserts as columns. Build it with [`DocColumns::new`], then
-/// [`with_attr`](Self::with_attr); the constructors are the only way in, so every batch is well formed.
+/// [`with_attr`](Self::with_attr) and [`with_sparse`](Self::with_sparse);
+/// the constructors are the only way in, so every batch is well formed.
 ///
 /// Every row has every attribute column: a column cannot leave a field out
 /// of one row, only make it `null` there (`valid` false). A batch with no
@@ -31,6 +32,7 @@ pub struct DocColumns {
     /// Sorted by name, in byte order: the order `serde_json` writes an
     /// object's keys in, which keeps the WAL bytes equal to `upsert`'s.
     attrs: Vec<(String, AttrColumn)>,
+    sparse: Option<SparseColumn>,
 }
 
 /// One attribute column of a [`DocColumns`] batch.
@@ -116,6 +118,19 @@ pub enum AttrColumn {
     },
 }
 
+/// The sparse vectors of a [`DocColumns`] batch: row `i`'s terms
+/// are `terms[offsets[i]..offsets[i + 1]]` with the weights beside them. A
+/// row that is not `valid` has no sparse vector; a valid row with no terms
+/// has an empty one.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct SparseColumn {
+    valid: Vec<bool>,
+    offsets: Vec<u32>,
+    terms: Vec<u32>,
+    weights: Vec<f32>,
+}
+
 fn malformed<T>(reason: &'static str) -> Result<T> {
     Err(ItzmaError::InvalidColumns(reason))
 }
@@ -168,8 +183,8 @@ fn run_range(offsets: &[u32], at: usize) -> std::ops::Range<usize> {
 }
 
 impl DocColumns {
-    /// A batch of `id_offsets.len() - 1` rows with no attributes: row `i`'s
-    /// id is `ids[id_offsets[i]..id_offsets[i + 1]]`
+    /// A batch of `id_offsets.len() - 1` rows with no attributes and no
+    /// sparse vectors: row `i`'s id is `ids[id_offsets[i]..id_offsets[i + 1]]`
     /// and its vector `vectors[i * dim..(i + 1) * dim]`.
     ///
     /// # Errors
@@ -194,6 +209,7 @@ impl DocColumns {
             vectors,
             dim,
             attrs: Vec::new(),
+            sparse: None,
         })
     }
 
@@ -219,6 +235,19 @@ impl DocColumns {
         }
     }
 
+    /// Add the sparse column.
+    ///
+    /// # Errors
+    ///
+    /// [`ItzmaError::InvalidColumns`] if it does not mark every row.
+    pub fn with_sparse(mut self, sparse: SparseColumn) -> Result<Self> {
+        if sparse.valid.len() != self.rows() {
+            return malformed("the sparse column must mark every row");
+        }
+        self.sparse = Some(sparse);
+        Ok(self)
+    }
+
     /// The number of rows.
     pub fn rows(&self) -> usize {
         self.id_offsets.len().saturating_sub(1)
@@ -234,7 +263,7 @@ impl DocColumns {
     /// document, run column by column. An input with one defect gets exactly
     /// the error `upsert` gives for the same documents; with several, the
     /// first one reported can differ, since every id is checked before any
-    /// vector, every vector before any attribute, and so on.
+    /// vector, every vector before any sparse vector, and so on.
     ///
     /// # Errors
     ///
@@ -242,7 +271,7 @@ impl DocColumns {
     /// - [`ItzmaError::InvalidId`] for an empty id or one longer than
     ///   [`MAX_ID_BYTES`](crate::document::MAX_ID_BYTES).
     /// - [`ItzmaError::DimensionMismatch`] and [`ItzmaError::InvalidVector`]
-    ///   for vectors, as [`Schema::validate`] decides.
+    ///   for vectors, as [`Schema::validate`] decides, and for sparse vectors.
     /// - [`ItzmaError::UnknownAttr`], [`ItzmaError::AttrTypeMismatch`] and
     ///   [`ItzmaError::InvalidAttrs`] for attributes. A free-form namespace
     ///   checks only that every number is finite, since JSON has no NaN.
@@ -262,6 +291,16 @@ impl DocColumns {
         }
         for row in 0..rows {
             schema.validate(self.vector(row))?;
+        }
+        if let Some(sparse) = &self.sparse {
+            for row in 0..rows {
+                if let Some((terms, weights)) = sparse.row(row) {
+                    document::validate_sparse_terms(
+                        terms.iter().copied(),
+                        weights.iter().copied(),
+                    )?;
+                }
+            }
         }
         for (name, column) in &self.attrs {
             if !schema.attrs.is_free_form() {
@@ -293,16 +332,22 @@ impl DocColumns {
         &self.attrs
     }
 
+    pub(crate) fn sparse(&self) -> Option<&SparseColumn> {
+        self.sparse.as_ref()
+    }
+
     /// Add `other`'s rows after these, for the stream's chunker. Both must
     /// have the same `dim` and the same attribute names; a column that is
-    /// [`AttrColumn::Null`] on one side takes the other side's kind.
+    /// [`AttrColumn::Null`] on one side takes the other side's kind. A batch
+    /// without a sparse column appends to one with it as rows without
+    /// sparse vectors, and the other way round.
     ///
     /// # Errors
     ///
     /// [`ItzmaError::InvalidColumns`] if the batches do not share their
     /// columns, or the result would not fit its `u32` offsets.
     pub(crate) fn append(&mut self, other: DocColumns) -> Result<()> {
-        if self.rows() == 0 && self.attrs.is_empty() {
+        if self.rows() == 0 && self.attrs.is_empty() && self.sparse.is_none() {
             *self = other;
             return Ok(());
         }
@@ -315,11 +360,23 @@ impl DocColumns {
         if self.dim != other.dim || !same_names {
             return malformed("batches in one stream must have the same columns");
         }
+        let (rows, other_rows) = (self.rows(), other.rows());
         append_offsets(&mut self.id_offsets, &other.id_offsets)?;
         self.ids.extend_from_slice(&other.ids);
         self.vectors.extend_from_slice(&other.vectors);
         for ((_, mine), (_, theirs)) in self.attrs.iter_mut().zip(other.attrs) {
             mine.append(theirs)?;
+        }
+        match (&mut self.sparse, other.sparse) {
+            (None, None) => {}
+            (Some(mine), theirs) => {
+                mine.append(theirs.unwrap_or_else(|| SparseColumn::empty(other_rows)))?;
+            }
+            (mine @ None, Some(theirs)) => {
+                let mut column = SparseColumn::empty(rows);
+                column.append(theirs)?;
+                *mine = Some(column);
+            }
         }
         Ok(())
     }
@@ -337,6 +394,7 @@ impl DocColumns {
                 .iter_mut()
                 .map(|(name, column)| (name.clone(), column.split_off(at)))
                 .collect(),
+            sparse: self.sparse.as_mut().map(|sparse| sparse.split_off(at)),
         }
     }
 
@@ -349,6 +407,12 @@ impl DocColumns {
         for (_, column) in &mut self.attrs {
             column.shrink_to_fit();
         }
+        if let Some(sparse) = &mut self.sparse {
+            sparse.valid.shrink_to_fit();
+            sparse.offsets.shrink_to_fit();
+            sparse.terms.shrink_to_fit();
+            sparse.weights.shrink_to_fit();
+        }
     }
 
     /// The batch without the column `name`, for tests that build a variant.
@@ -356,6 +420,12 @@ impl DocColumns {
     pub(crate) fn without_attr(mut self, name: &str) -> Self {
         self.attrs.retain(|(n, _)| n != name);
         self
+    }
+
+    /// Whether any row has a sparse vector, which makes the batch a version
+    /// 4 or 5 object that needs WAL level 5.
+    pub(crate) fn has_sparse(&self) -> bool {
+        self.sparse.as_ref().is_some_and(SparseColumn::any)
     }
 }
 
@@ -860,6 +930,76 @@ fn set_fits(
         && values == items_valid.len()
 }
 
+impl SparseColumn {
+    /// The sparse vectors of `valid.len()` rows.
+    ///
+    /// # Errors
+    ///
+    /// [`ItzmaError::InvalidColumns`] if `offsets` do not cut `terms` into one
+    /// run a row, or `terms` and `weights` differ in length.
+    pub fn new(
+        valid: Vec<bool>,
+        offsets: Vec<u32>,
+        terms: Vec<u32>,
+        weights: Vec<f32>,
+    ) -> Result<Self> {
+        if !offsets_fit(&offsets, valid.len(), terms.len()) || terms.len() != weights.len() {
+            return malformed(
+                "sparse offsets must cut the terms into one run a row, with a weight a term",
+            );
+        }
+        Ok(Self {
+            valid,
+            offsets,
+            terms,
+            weights,
+        })
+    }
+
+    /// `rows` rows with no sparse vector.
+    fn empty(rows: usize) -> Self {
+        Self {
+            valid: vec![false; rows],
+            offsets: vec![0; rows + 1],
+            terms: Vec::new(),
+            weights: Vec::new(),
+        }
+    }
+
+    fn append(&mut self, other: SparseColumn) -> Result<()> {
+        append_offsets(&mut self.offsets, &other.offsets)?;
+        self.valid.extend(other.valid);
+        self.terms.extend(other.terms);
+        self.weights.extend(other.weights);
+        Ok(())
+    }
+
+    fn split_off(&mut self, at: usize) -> SparseColumn {
+        let (offsets, cut) = split_offsets(&mut self.offsets, at);
+        SparseColumn {
+            valid: self.valid.split_off(at),
+            offsets,
+            terms: self.terms.split_off(cut),
+            weights: self.weights.split_off(cut),
+        }
+    }
+
+    /// Row `row`'s terms and weights, or `None` when it has no sparse vector.
+    pub(crate) fn row(&self, row: usize) -> Option<(&[u32], &[f32])> {
+        if !self.valid[row] {
+            return None;
+        }
+        let range = run_range(&self.offsets, row);
+        Some((&self.terms[range.clone()], &self.weights[range]))
+    }
+
+    /// Whether any row has a sparse vector, which is what makes a batch a
+    /// version 4 or 5 object.
+    pub(crate) fn any(&self) -> bool {
+        self.valid.iter().any(|&v| v)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,6 +1114,18 @@ mod tests {
     }
 
     #[test]
+    fn a_sparse_column_must_cover_every_row() {
+        let sparse = SparseColumn::new(vec![true], vec![0, 1], vec![7], vec![1.0]).unwrap();
+        malformed(two_rows().with_sparse(sparse));
+        malformed(SparseColumn::new(
+            vec![true],
+            vec![0, 2],
+            vec![7],
+            vec![1.0],
+        ));
+    }
+
+    #[test]
     fn a_good_batch_round_trips_its_accessors() {
         let cols = two_rows()
             .with_attr(
@@ -985,11 +1137,19 @@ mod tests {
             )
             .unwrap()
             .with_attr("a", AttrColumn::Null { rows: 2 })
+            .unwrap()
+            .with_sparse(
+                SparseColumn::new(vec![true, false], vec![0, 2, 2], vec![3, 9], vec![0.5, 1.0])
+                    .unwrap(),
+            )
             .unwrap();
         assert_eq!((cols.rows(), cols.dim()), (2, 2));
         assert_eq!((cols.id(0), cols.id(1)), ("a", "bc"));
         assert_eq!(cols.vector(1), &[3.0, 4.0]);
         let names: Vec<&str> = cols.attrs().iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["a", "z"]);
+        let sparse = cols.sparse().unwrap();
+        assert_eq!(sparse.row(0), Some((&[3, 9][..], &[0.5, 1.0][..])));
+        assert_eq!(sparse.row(1), None);
     }
 }

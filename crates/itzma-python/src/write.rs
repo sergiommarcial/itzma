@@ -16,7 +16,8 @@ pub(crate) const BATCH_TARGET_BYTES: usize = itzma_core::wal::MAX_BODY_BYTES / 2
 /// A rough encoded size: what dominates a WAL batch.
 pub(crate) fn doc_size(doc: &Document) -> usize {
     let attrs = doc.attrs.as_ref().map_or(0, |a| a.to_string().len());
-    doc.id.len() + doc.vector.len() * 4 + attrs + 16
+    let sparse = doc.sparse.as_ref().map_or(0, |s| s.len() * 8);
+    doc.id.len() + doc.vector.len() * 4 + attrs + sparse + 16
 }
 
 /// Split `items` into runs of at most `target` bytes. An empty input stays
@@ -43,6 +44,7 @@ pub(crate) fn chunks<T>(items: Vec<T>, size: impl Fn(&T) -> usize, target: usize
 fn precheck(ns: &Namespace, docs: &[Document]) -> itzma_core::Result<()> {
     for doc in docs {
         ns.schema().validate(&doc.vector)?;
+        doc.validate_sparse()?;
     }
     Ok(())
 }
@@ -227,7 +229,8 @@ mod tests {
             id: "abc".into(),
             vector: vec![0.0; 4],
             attrs: Some(serde_json::json!({"a": 1})),
+            sparse: Some(vec![(1, 1.0), (2, 2.0)]),
         };
-        assert_eq!(doc_size(&doc), 3 + 16 + r#"{"a":1}"#.len() + 16);
+        assert_eq!(doc_size(&doc), 3 + 16 + r#"{"a":1}"#.len() + 16 + 16);
     }
 }

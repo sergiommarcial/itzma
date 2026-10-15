@@ -67,7 +67,7 @@ def test_polars_types_are_accepted(store: itzma.Store, ns_id: str) -> None:
         assert hit.attrs == {"tag": "x", "year": 2020, "labels": ["red"]}
 
 
-def test_a_sparse_column_is_an_undeclared_attribute(store: itzma.Store, ns_id: str) -> None:
+def test_sparse_column(store: itzma.Store, ns_id: str) -> None:
     sparse_type = pa.list_(pa.struct([("term", pa.uint32()), ("weight", pa.float32())]))
     table = pa.table(
         {
@@ -77,9 +77,8 @@ def test_a_sparse_column_is_an_undeclared_attribute(store: itzma.Store, ns_id: s
         }
     )
     ns = itzma.Namespace.create(store, ns_id, schema())
-    with pytest.raises(itzma.InvalidInput):
-        ns.upsert(table)
-    assert len(ns.query(Q, 10)) == 0
+    ns.upsert(table)
+    assert len(ns.query(Q, 10)) == 2
 
 
 def test_missing_vector_column(store: itzma.Store, ns_id: str) -> None:

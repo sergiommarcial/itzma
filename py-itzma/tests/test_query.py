@@ -70,6 +70,23 @@ def test_invalid_options(store: itzma.Store, ns_id: str) -> None:
     assert info.value.field == "nope"
 
 
+def test_sparse_query_matches_the_model(store: itzma.Store, ns_id: str) -> None:
+    ns = itzma.Namespace.create(store, ns_id, schema())
+    rng = np.random.default_rng(5)
+    rows = random_rows(100)
+    for row in rows:
+        terms = rng.choice(50, size=5, replace=False)
+        row["sparse"] = [(int(t), float(rng.random())) for t in terms]
+    ns.upsert(rows)
+    query = [(3, 1.0), (7, 0.5), (11, 2.0)]
+    weights = dict(query)
+    scored = sorted(
+        (-sum(weights.get(t, 0.0) * w for t, w in row["sparse"]), row["id"]) for row in rows
+    )
+    expected = [i for score, i in scored if score < 0][:10]
+    assert ns.query_sparse(query, 10).ids == expected
+
+
 def test_arrow_output(store: itzma.Store, ns_id: str) -> None:
     ns = itzma.Namespace.create(store, ns_id, schema())
     ns.upsert(random_rows(10))
@@ -95,6 +112,19 @@ HIT_SCHEMA = {
     "tag": pl.String,
     "year": pl.Float64,
 }
+
+
+def test_sparse_hits_to_polars_are_typed(store: itzma.Store, ns_id: str) -> None:
+    ns = itzma.Namespace.create(store, ns_id, schema())
+    rows = random_rows(10)
+    for i, row in enumerate(rows):
+        row["sparse"] = [(i % 3, 1.0)]
+    ns.upsert(rows)
+    hits = ns.query_sparse([(1, 1.0)], 3)
+    df = hits.to_polars()
+    assert df.schema == pl.Schema(HIT_SCHEMA)
+    assert df["id"].to_list() == hits.ids
+    assert pa.table(hits).schema == hits.to_arrow().schema
 
 
 def test_read_budget(store: itzma.Store, ns_id: str) -> None:

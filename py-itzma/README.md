@@ -64,7 +64,7 @@ attr("tag") == None  # is_null()
 
 Wrap each comparison in parentheses: `&` and `|` bind tighter than `==` and `>=`. Leaving them out raises a `TypeError` that says so. A comparison with a missing or null field is false, and `~` flips it, so `~(attr("tag") == "x")` also matches documents with no tag.
 
-`ns.filter(where, limit=100, after=None)` pages through matching documents in id order with no vector.
+`ns.filter(where, limit=100, after=None)` pages through matching documents in id order with no vector. `ns.query_sparse(terms, top_k)` ranks by the dot product of sparse `(term id, weight)` vectors.
 
 ## Keeping it compacted and indexed
 

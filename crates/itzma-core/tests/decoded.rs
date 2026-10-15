@@ -35,6 +35,7 @@ fn document(rng: &mut Lcg, i: usize) -> Document {
         id: format!("d{i:05}"),
         vector: rng.vector(DIM),
         attrs: Some(serde_json::json!({ "active": i.is_multiple_of(3) })),
+        sparse: Some(vec![((i % 50) as u32, 1.0), (100 + (i % 7) as u32, 0.5)]),
     }
 }
 

@@ -130,6 +130,7 @@ impl std::error::Error for StreamError {
 struct Encoded {
     object: Object,
     rows: u64,
+    sparse: bool,
 }
 
 enum Object {
@@ -237,6 +238,7 @@ async fn encode(
     n: u64,
 ) -> Result<Encoded> {
     let rows = chunk.rows() as u64;
+    let sparse = chunk.has_sparse();
     // A rough size: the vectors and a little for each row's id and
     // attributes. It only decides whether to hand the work off.
     let cost = Cost::Bytes(chunk.vectors().len() * 4 + chunk.rows() * 64);
@@ -256,6 +258,7 @@ async fn encode(
     Ok(Encoded {
         object: encoded,
         rows,
+        sparse,
     })
 }
 
@@ -275,10 +278,10 @@ async fn write_stage(
     let mut report = StreamReport::default();
     while let Some(chunk) = rx.recv().await {
         let landed = match chunk.object {
-            Object::Plain(bytes) => ns.append_bytes(bytes).await,
+            Object::Plain(bytes) => ns.append_bytes(bytes, chunk.sparse).await,
             Object::Keyed(key, object) => {
                 let write = WriteKey { key, search_from };
-                ns.append_bytes_keyed(&write, object).await
+                ns.append_bytes_keyed(&write, object, chunk.sparse).await
             }
         };
         match landed {
@@ -302,9 +305,14 @@ async fn write_stage(
 /// bigger than `target` is a chunk of its own). So where the chunks fall
 /// depends only on the rows, never on how the input was batched, which a
 /// keyed stream needs: a retry must cut the same chunks to find them by key.
+/// A row's size counts its sparse entry whenever the input has a sparse
+/// column, a slight over-estimate for a chunk where no row has one; the
+/// batches of one stream must therefore all have a sparse column or none.
 pub(crate) struct Chunker {
     target: u64,
     pending: Option<DocColumns>,
+    /// Whether the stream's batches have a sparse column, set by the first.
+    sparse: Option<bool>,
     /// The body bytes `pending` would encode to, counts included.
     bytes: u64,
     scratch: Vec<u8>,
@@ -315,6 +323,7 @@ impl Chunker {
         Self {
             target,
             pending: None,
+            sparse: None,
             bytes: COUNTS_LEN as u64,
             scratch: Vec::new(),
         }
@@ -327,10 +336,18 @@ impl Chunker {
     /// [`ItzmaError::InvalidColumns`](crate::ItzmaError::InvalidColumns) if
     /// `cols` does not have the columns of the batches before it.
     pub(crate) fn push(&mut self, mut cols: DocColumns) -> Result<Vec<DocColumns>> {
+        // A row's size counts a sparse entry when the stream has a sparse
+        // column; a stream that switched would size rows by its batching.
+        let sparse = cols.sparse().is_some();
+        if *self.sparse.get_or_insert(sparse) != sparse {
+            return Err(ItzmaError::InvalidColumns(
+                "batches in one stream must all have a sparse column or none",
+            ));
+        }
         let mut rows_in_chunk = self.pending.as_ref().map_or(0, DocColumns::rows);
         let mut cuts = Vec::new();
         for row in 0..cols.rows() {
-            let size = wal_codec::row_body_bytes(&cols, row, &mut self.scratch);
+            let size = wal_codec::row_body_bytes(&cols, row, sparse, &mut self.scratch);
             if rows_in_chunk > 0 && self.bytes + size > self.target {
                 cuts.push(row);
                 self.bytes = COUNTS_LEN as u64;

@@ -146,7 +146,7 @@ async fn another_builds_index_magic_is_refused() {
 async fn a_manifest_at_a_wal_level_this_build_does_not_read_is_refused() {
     for b in cas_backends() {
         built(b.store.clone()).await;
-        manifest::update(&*b.store, "docs", |m| m.wal_format = 5)
+        manifest::update(&*b.store, "docs", |m| m.wal_format = 6)
             .await
             .unwrap();
         let before = snapshot(&*b.store).await;
@@ -155,7 +155,7 @@ async fn a_manifest_at_a_wal_level_this_build_does_not_read_is_refused() {
             .err()
             .unwrap();
         assert!(
-            matches!(err, ItzmaError::WalFormatTooNew { found: 5, .. }),
+            matches!(err, ItzmaError::WalFormatTooNew { found: 6, .. }),
             "{err:?}"
         );
         assert_untouched(&*b.store, &before).await;

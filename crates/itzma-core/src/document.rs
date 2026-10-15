@@ -15,7 +15,7 @@ use crate::error::{ItzmaError, Result};
 /// This is what appears inside WAL objects. `attrs` is left out when `None`:
 ///
 /// ```json
-/// {"id": "a", "vector": [0.1, 0.2], "attrs": {"title": "hello"}}
+/// {"id": "a", "vector": [0.1, 0.2], "attrs": {"title": "hello"}, "sparse": [[3, 0.9]]}
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Document {
@@ -29,7 +29,26 @@ pub struct Document {
     /// schema on write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attrs: Option<serde_json::Value>,
+    /// An optional sparse vector, searched by
+    /// [`Namespace::query_sparse`](crate::Namespace::query_sparse). A
+    /// namespace does not declare sparse support up front — some documents
+    /// carry one, some don't, the same shape `attrs` has. `None` on a
+    /// document written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sparse: Option<SparseVector>,
 }
+
+/// A sparse vector: term id and weight pairs, in the style SPLADE and
+/// similar learned-sparse models produce. Itzma assigns no meaning to a term
+/// id — it is the caller's own vocabulary (a tokenizer's ids, typically) —
+/// and keeps no string dictionary. See
+/// [`Namespace::query_sparse`](crate::Namespace::query_sparse).
+pub type SparseVector = Vec<(u32, f32)>;
+
+/// The most terms one document's sparse vector may hold. The term count is a
+/// `u16` in the WAL object and in `sparse.bin`, and a longer vector is refused
+/// by `upsert` with [`ItzmaError::InvalidVector`] before anything is written.
+pub const MAX_SPARSE_TERMS: usize = u16::MAX as usize;
 
 /// The most bytes an id may be: a document's `id` on `upsert`, or an id
 /// passed to `delete`. An id is a free-form string with no other structure
@@ -175,7 +194,7 @@ pub(crate) fn validate_id(id: &str) -> Result<()> {
 
 impl Document {
     /// Check this document's id without touching storage. Called on every
-    /// upsert.
+    /// upsert, before [`validate_sparse`](Self::validate_sparse).
     ///
     /// # Errors
     ///
@@ -184,6 +203,47 @@ impl Document {
     pub fn validate_id(&self) -> Result<()> {
         validate_id(&self.id)
     }
+
+    /// Check this document's sparse vector, if it has one, without touching
+    /// storage. Called on every upsert, after
+    /// [`Schema::validate`](Schema::validate).
+    ///
+    /// # Errors
+    ///
+    /// [`ItzmaError::InvalidVector`] if the same term id appears twice, a
+    /// weight is NaN or infinite, or there are more than [`MAX_SPARSE_TERMS`]
+    /// terms (the stored term count is a `u16`).
+    pub fn validate_sparse(&self) -> Result<()> {
+        match &self.sparse {
+            None => Ok(()),
+            Some(sparse) => validate_sparse_terms(
+                sparse.iter().map(|(term, _)| *term),
+                sparse.iter().map(|(_, weight)| *weight),
+            ),
+        }
+    }
+}
+
+/// The checks of [`Document::validate_sparse`] on terms and weights given
+/// apart, so a columnar batch runs exactly the same ones.
+pub(crate) fn validate_sparse_terms(
+    terms: impl ExactSizeIterator<Item = u32>,
+    mut weights: impl Iterator<Item = f32>,
+) -> Result<()> {
+    if terms.len() > MAX_SPARSE_TERMS {
+        return Err(ItzmaError::InvalidVector("too many sparse terms"));
+    }
+    if weights.any(|weight| !weight.is_finite()) {
+        return Err(ItzmaError::InvalidVector("non-finite sparse weight"));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(terms.len());
+    let mut terms = terms;
+    if terms.any(|term| !seen.insert(term)) {
+        return Err(ItzmaError::InvalidVector(
+            "duplicate term id in sparse vector",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -257,6 +317,7 @@ mod tests {
                 id: "a".into(),
                 vector: vec![0.1, -2.5, 3.0],
                 attrs: Some(serde_json::json!({"k": "v"})),
+                sparse: None,
             }),
             WalOp::Delete("b".into()),
         ];
@@ -265,11 +326,59 @@ mod tests {
         assert_eq!(ops, back);
     }
 
+    fn sparse_doc(id: &str, terms: &[(u32, f32)]) -> Document {
+        Document {
+            id: id.into(),
+            vector: vec![1.0, 2.0, 3.0],
+            attrs: None,
+            sparse: Some(terms.to_vec()),
+        }
+    }
+
+    #[test]
+    fn validate_sparse_accepts_none_and_distinct_terms() {
+        let mut d = sparse_doc("a", &[(3, 0.5), (10, 0.25)]);
+        assert!(d.validate_sparse().is_ok());
+        d.sparse = None;
+        assert!(d.validate_sparse().is_ok());
+    }
+
+    #[test]
+    fn validate_sparse_rejects_a_duplicate_term_id() {
+        let d = sparse_doc("a", &[(3, 0.5), (3, 0.25)]);
+        let err = d.validate_sparse().unwrap_err();
+        assert!(matches!(err, ItzmaError::InvalidVector(_)));
+    }
+
+    #[test]
+    fn validate_sparse_allows_exactly_the_most_terms_and_refuses_one_more() {
+        let terms = |n: u32| (0..n).map(|t| (t, 1.0)).collect::<Vec<_>>();
+        let at_limit = sparse_doc("a", &terms(MAX_SPARSE_TERMS as u32));
+        assert!(at_limit.validate_sparse().is_ok());
+        let over = sparse_doc("a", &terms(MAX_SPARSE_TERMS as u32 + 1));
+        assert!(matches!(
+            over.validate_sparse(),
+            Err(ItzmaError::InvalidVector("too many sparse terms"))
+        ));
+    }
+
+    #[test]
+    fn validate_sparse_rejects_a_non_finite_weight() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let d = sparse_doc("a", &[(1, 0.5), (2, bad)]);
+            assert!(matches!(
+                d.validate_sparse(),
+                Err(ItzmaError::InvalidVector(_))
+            ));
+        }
+    }
+
     fn doc_with_id(id: &str) -> Document {
         Document {
             id: id.into(),
             vector: vec![1.0, 2.0, 3.0],
             attrs: None,
+            sparse: None,
         }
     }
 
@@ -294,5 +403,32 @@ mod tests {
     #[test]
     fn validate_id_accepts_a_normal_id() {
         assert!(doc_with_id("doc-1").validate_id().is_ok());
+    }
+
+    #[test]
+    fn sparse_field_round_trips_and_is_omitted_when_none() {
+        let with = sparse_doc("a", &[(1, 0.5)]);
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["sparse"], serde_json::json!([[1, 0.5]]));
+        let back: Document = serde_json::from_value(json).unwrap();
+        assert_eq!(back, with);
+
+        let without = Document {
+            id: "b".into(),
+            vector: vec![1.0],
+            attrs: None,
+            sparse: None,
+        };
+        let json = serde_json::to_value(&without).unwrap();
+        assert!(
+            json.get("sparse").is_none(),
+            "sparse must be omitted, not null, when None"
+        );
+
+        // A pre-existing WAL object, written before this field existed, must
+        // still decode: no "sparse" key at all.
+        let old = serde_json::json!({"id": "c", "vector": [1.0]});
+        let decoded: Document = serde_json::from_value(old).unwrap();
+        assert_eq!(decoded.sparse, None);
     }
 }

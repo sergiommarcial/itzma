@@ -71,6 +71,10 @@ def _query_options(filter: Expr | None, rerank: int | None, nprobe: int | None, 
     )
 
 
+def _sparse_options(filter: Expr | None) -> str:
+    return json.dumps({"filter": None if filter is None else filter.to_dict()})
+
+
 def _filter_options(limit: int, after: str | None) -> str:
     return json.dumps({"limit": limit, "after": after})
 
@@ -241,6 +245,7 @@ class Namespace(_Handle):
         ids: Iterable[str] | None = None,
         vectors: Any | None = None,
         attrs: Iterable[Mapping[str, Any] | None] | None = None,
+        sparse: Iterable[_input.SparseLike | None] | None = None,
         key: str | None = None,
         retry_from: int | None = None,
         target_bytes: int = 33554432,
@@ -248,8 +253,8 @@ class Namespace(_Handle):
     ) -> int:
         """Write documents; returns the WAL sequence number of the last batch.
 
-        Pass rows (dicts with ``id``, ``vector`` and optional ``attrs``), an
-        Arrow table or stream (pyarrow, Polars, DuckDB), or
+        Pass rows (dicts with ``id``, ``vector``, optional ``attrs`` and
+        ``sparse``), an Arrow table or stream (pyarrow, Polars, DuckDB), or
         columns with ``ids=`` and ``vectors=`` (a 2-D array). A big unkeyed
         write is split into batches; if one fails, the error's ``last_seq``
         says how far it got. ``key`` makes the write idempotent;
@@ -265,7 +270,7 @@ class Namespace(_Handle):
         ``last_seq``) writes only the chunks that are missing. ``target_bytes`` and
         ``depth`` apply to Arrow input only.
         """
-        batch = _input.to_batch(data, ids, vectors, attrs)
+        batch = _input.to_batch(data, ids, vectors, attrs, sparse)
         return self._handle().upsert(
             batch, key=key, retry_from=retry_from, target_bytes=target_bytes, depth=depth
         )
@@ -296,6 +301,18 @@ class Namespace(_Handle):
         """
         options = _query_options(filter, rerank, nprobe, exact)
         return Hits(self._handle().query(_input.as_vector(vector), _top_k(top_k), options))
+
+    def query_sparse(
+        self, terms: _input.SparseLike, top_k: int = 10, *, filter: Expr | None = None
+    ) -> Hits:
+        """The ``top_k`` documents with the highest dot product against ``terms``.
+
+        ``terms`` is a list of ``(term id, weight)``. ``Hit.distance`` is the
+        negated score, so closest first still means best first.
+        """
+        return Hits(
+            self._handle().query_sparse(list(terms), _top_k(top_k), _sparse_options(filter))
+        )
 
     def filter(self, where: Expr, *, limit: int = 100, after: str | None = None) -> FilterPage:
         """Documents matching ``where``, in id order, ``limit`` at a time."""
@@ -422,13 +439,14 @@ class AsyncNamespace(_Handle):
         ids: Iterable[str] | None = None,
         vectors: Any | None = None,
         attrs: Iterable[Mapping[str, Any] | None] | None = None,
+        sparse: Iterable[_input.SparseLike | None] | None = None,
         key: str | None = None,
         retry_from: int | None = None,
         target_bytes: int = 33554432,
         depth: int = 2,
     ) -> int:
         """Write documents; see ``Namespace.upsert``."""
-        batch = _input.to_batch(data, ids, vectors, attrs)
+        batch = _input.to_batch(data, ids, vectors, attrs, sparse)
         return await self._handle().upsert_async(
             batch, key=key, retry_from=retry_from, target_bytes=target_bytes, depth=depth
         )
@@ -454,6 +472,15 @@ class AsyncNamespace(_Handle):
         return Hits(
             await self._handle().query_async(_input.as_vector(vector), _top_k(top_k), options)
         )
+
+    async def query_sparse(
+        self, terms: _input.SparseLike, top_k: int = 10, *, filter: Expr | None = None
+    ) -> Hits:
+        """Sparse top ``top_k``; see ``Namespace.query_sparse``."""
+        data = await self._handle().query_sparse_async(
+            list(terms), _top_k(top_k), _sparse_options(filter)
+        )
+        return Hits(data)
 
     async def filter(
         self, where: Expr, *, limit: int = 100, after: str | None = None

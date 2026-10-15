@@ -29,14 +29,15 @@ def test_negative_top_k_is_an_invalid_query(ns_id: str) -> None:
     ns.upsert(random_rows(5))
     with pytest.raises(itzma.InvalidQuery, match="top_k"):
         ns.query(Q, -1)
+    with pytest.raises(itzma.InvalidQuery, match="top_k"):
+        ns.query_sparse([(1, 1.0)], -1)
 
 
-def test_a_row_with_a_sparse_key_is_refused(ns_id: str) -> None:
+@pytest.mark.parametrize("term", [-1, 5_000_000_000])
+def test_sparse_query_with_a_term_out_of_range(ns_id: str, term: int) -> None:
     ns = itzma.Namespace.create(itzma.Store("memory://"), ns_id, schema())
-    row = random_rows(1)[0]
-    row["sparse"] = [(1, 1.0)]
-    with pytest.raises(itzma.InvalidInput, match="unknown key"):
-        ns.upsert([row])
+    with pytest.raises(itzma.InvalidInput, match="term"):
+        ns.query_sparse([(term, 1.0)], 5)
 
 
 def test_numpy_arrays_in_attrs(ns_id: str) -> None:

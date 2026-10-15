@@ -27,6 +27,7 @@ use crate::gc;
 use crate::layer;
 use crate::manifest::{self, Manifest};
 use crate::segment::SegmentWriter;
+use crate::sparse;
 use crate::{segment, wal};
 
 mod merge;
@@ -66,9 +67,9 @@ impl CompactionOptions {
     /// [`ItzmaError::InvalidConfig`] when `max_segment_bytes` is above
     /// `read_budget`: a merge group that size could never be read.
     ///
-    /// Passing is necessary, not sufficient: a group can exceed the cap, so
-    /// keep the budget well above the cap (the defaults are 1 GiB and
-    /// 128 MiB).
+    /// Passing is necessary, not sufficient: a group can exceed the cap, and
+    /// is also charged its `sparse.bin`, so keep the budget well above the cap
+    /// (the defaults are 1 GiB and 128 MiB).
     pub fn validate(&self, read_budget: u64) -> Result<()> {
         if self.max_segment_bytes > read_budget {
             return Err(ItzmaError::InvalidConfig(
@@ -296,7 +297,7 @@ pub(crate) async fn run(
                 layer.drop_tombstones();
             }
             let (docs, tombstones) = (layer.doc_count(), layer.tombstone_count());
-            let (_layer, data) = segment::encode_parts_on(
+            let (_layer, data, sparse) = segment::encode_parts_on(
                 Lane::Maintenance,
                 layer,
                 schema.dim,
@@ -305,6 +306,7 @@ pub(crate) async fn run(
             )
             .await?;
             write_segment(store, namespace, &id, data).await?;
+            write_sparse(store, namespace, &id, sparse).await?;
 
             let published = manifest::update_if(store, namespace, |m| {
                 if m.wal_folded_through != folded || m.live_segments != live {
@@ -372,8 +374,9 @@ pub(crate) async fn run(
                 docs += writer.docs();
                 tombstones += writer.tombstones();
                 let id = segment::segment_id(group_lo, group_hi);
-                let data = finish_on(writer).await?;
+                let (data, sparse) = finish_on(writer).await?;
                 write_segment(store, namespace, &id, data).await?;
+                write_sparse(store, namespace, &id, sparse).await?;
                 new_live.push(id);
                 start = end;
             }
@@ -408,7 +411,7 @@ pub(crate) async fn run(
 
 /// [`SegmentWriter::finish`] on the maintenance lane: it builds the Bloom
 /// filter and the directory over every row.
-async fn finish_on(writer: SegmentWriter) -> Result<PutPayload> {
+async fn finish_on(writer: SegmentWriter) -> Result<(PutPayload, Option<PutPayload>)> {
     let cost = Cost::Bytes(writer.docs() * 64 + writer.tombstones() * 16);
     cpu::run(Lane::Maintenance, cost, move || writer.finish()).await
 }
@@ -434,6 +437,31 @@ async fn write_segment(
         segment::missing,
         "an object already at this key differs from the segment this range produces; if the \
          manifest does not list it, delete it and rerun",
+    )
+    .await
+}
+
+/// Write the segment's sparse sidecar with the same put-if-absent,
+/// byte-compare-on-reuse rule [`write_segment`] uses for `data.bin` — only
+/// when the writer made one, which it does when at least one document has a
+/// sparse vector, since a segment with none legitimately has no `sparse.bin`.
+async fn write_sparse(
+    store: &dyn ObjectStore,
+    namespace: &str,
+    id: &str,
+    sparse: Option<PutPayload>,
+) -> Result<()> {
+    let Some(sparse) = sparse else {
+        return Ok(());
+    };
+    let path = sparse::sparse_path(namespace, id);
+    put_or_reuse(
+        store,
+        &path,
+        sparse,
+        sparse::missing,
+        "an object already at this key differs from the sparse sidecar this range produces; if \
+         the manifest's segment is not live, delete it and rerun",
     )
     .await
 }

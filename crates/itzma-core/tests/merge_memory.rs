@@ -74,6 +74,7 @@ async fn a_merge_holds_about_one_output_segment() {
                 id: format!("s{s}-{i:05}"),
                 vector: (0..DIM).map(|_| rng.next_f32()).collect(),
                 attrs: None,
+                sparse: None,
             })
             .collect();
         ns.upsert(docs).await.unwrap();

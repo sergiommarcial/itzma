@@ -14,11 +14,12 @@ use object_store::ObjectStore;
 
 use crate::budget::ReadBudget;
 use crate::cpu::{self, Cost, Lane};
-use crate::document::Document;
+use crate::document::{Document, SparseVector};
 use crate::error::{ItzmaError, Result};
 use crate::fetch::FetchPolicy;
 use crate::layer::{Layer, NewestWins};
 use crate::segment::{self, AttrIn, RangedSegment, SegmentWriter};
+use crate::sparse::{self, SparseRows};
 
 /// Bytes one input reads ahead (a guess, measured only on `InMemory` so
 /// far). A window is at least one block, so a block
@@ -121,6 +122,7 @@ impl WholeInput {
 pub(crate) struct RangedInput<'a> {
     label: String,
     segment: RangedSegment<'a>,
+    sparse: Option<SparseRows<'a>>,
     window: u64,
     next_doc_block: usize,
     next_tombstone_block: usize,
@@ -144,6 +146,12 @@ impl RangedInput<'_> {
         end
     }
 
+    fn rows_of_block(&self, block: usize) -> std::ops::Range<u64> {
+        let rows = segment::BLOCK_ROWS as u64;
+        let start = block as u64 * rows;
+        start..(start + rows).min(self.segment.doc_count())
+    }
+
     /// The next window, fetched only once the last one is drained; fetching
     /// it in the background is
     async fn refill_docs(&mut self) -> Result<()> {
@@ -152,11 +160,30 @@ impl RangedInput<'_> {
         if !self.docs.is_empty() || start >= count {
             return Ok(());
         }
-        let end = self.window_end(start, count, |b| self.segment.doc_window_bytes(b));
-        let window = self.segment.doc_window(start..end).await?;
+        let end = self.window_end(start, count, |b| {
+            let sparse = self
+                .sparse
+                .as_ref()
+                .map_or(0, |s| s.bytes_of(self.rows_of_block(b)));
+            // A damaged sidecar directory can claim nearly u64::MAX bytes;
+            // reading it is then an error, not an overflow here.
+            self.segment.doc_window_bytes(b).saturating_add(sparse)
+        });
+        let rows = self.rows_of_block(start).start..self.rows_of_block(end - 1).end;
+        let sidecar = async {
+            match &self.sparse {
+                Some(sparse) => sparse.rows(rows).await.map(Some),
+                None => Ok(None),
+            }
+        };
+        let (window, sparse) = futures::try_join!(self.segment.doc_window(start..end), sidecar)?;
+        let sparse = sparse.unwrap_or_else(|| vec![None; window.ids.len()]);
         let label = self.label.clone();
         let cost = Cost::Bytes(window.vectors.values.len() * 4 + window.attrs.stored_bytes());
-        let docs = cpu::run(Lane::Maintenance, cost, move || documents(&label, window)).await?;
+        let docs = cpu::run(Lane::Maintenance, cost, move || {
+            documents(&label, window, sparse)
+        })
+        .await?;
         // The queue is empty here, so the decoded window becomes it as is.
         self.docs = VecDeque::from(docs);
         self.next_doc_block = end;
@@ -189,18 +216,24 @@ impl RangedInput<'_> {
 }
 
 /// A window's rows as documents, attributes parsed from their JSON.
-fn documents(label: &str, window: segment::DocWindow) -> Result<Vec<Document>> {
+fn documents(
+    label: &str,
+    window: segment::DocWindow,
+    sparse: Vec<Option<SparseVector>>,
+) -> Result<Vec<Document>> {
     let dim = window.vectors.dim;
     window
         .ids
         .into_iter()
+        .zip(sparse)
         .enumerate()
-        .map(|(i, id)| {
+        .map(|(i, (id, sparse))| {
             let attrs = window.attrs.get(i).value(label)?;
             Ok(Document {
                 id,
                 vector: window.vectors.values[i * dim..(i + 1) * dim].to_vec(),
                 attrs,
+                sparse,
             })
         })
         .collect()
@@ -220,7 +253,7 @@ impl<'a> Input<'a> {
     /// Open segment `id` of `namespace`, whose `data.bin` the caller's
     /// listing says is `size` bytes: read forward when it is version 2 and
     /// bigger than [`WHOLE_BELOW`] (or `window`, if smaller), else decoded
-    /// whole. Everything is charged to `budget`, and
+    /// whole with its sparse vectors. Everything is charged to `budget`, and
     /// nothing goes through the decoded cache.
     ///
     /// # Errors
@@ -243,9 +276,12 @@ impl<'a> Input<'a> {
         if size > window.min(WHOLE_BELOW) {
             let segment =
                 RangedSegment::open(store, namespace, id, dim, budget, policy, None).await?;
+            let sparse =
+                SparseRows::open(store, namespace, id, segment.doc_count(), budget).await?;
             return Ok(Input::Ranged(RangedInput {
                 label,
                 segment,
+                sparse,
                 window,
                 next_doc_block: 0,
                 next_tombstone_block: 0,
@@ -254,7 +290,8 @@ impl<'a> Input<'a> {
             }));
         }
         let layer =
-            segment::fetch(store, namespace, id, dim, budget, policy, Lane::Maintenance).await?;
+            sparse::fetch_with_sparse(store, namespace, id, dim, budget, policy, Lane::Maintenance)
+                .await?;
         Ok(Input::Whole(WholeInput::new(label, layer)))
     }
 
@@ -357,7 +394,12 @@ async fn write(
     cpu::run(Lane::Maintenance, Cost::Bytes(weight), move || {
         for entry in batch {
             match entry {
-                Entry::Doc(doc) => writer.doc(&doc.id, &doc.vector, AttrIn::Owned(doc.attrs))?,
+                Entry::Doc(doc) => writer.doc(
+                    &doc.id,
+                    &doc.vector,
+                    AttrIn::Owned(doc.attrs),
+                    doc.sparse.as_ref(),
+                )?,
                 Entry::Tombstone(id) => writer.tombstone(&id)?,
             }
         }
@@ -410,6 +452,7 @@ mod tests {
                     id,
                     vector: vec![v, -v, 0.5],
                     attrs: (rng.below(2) == 0).then(|| serde_json::json!({ "v": v, "s": "x" })),
+                    sparse: (rng.below(3) == 0).then(|| vec![(n as u32, v)]),
                 }));
             }
         }
@@ -430,7 +473,7 @@ mod tests {
             .collect()
     }
 
-    fn expected(inputs: &[Layer], drop: bool) -> Vec<u8> {
+    fn expected(inputs: &[Layer], drop: bool) -> (Vec<u8>, Option<Vec<u8>>) {
         let mut all = Layer::new();
         for layer in inputs {
             all.overlay(layer.clone());
@@ -438,17 +481,25 @@ mod tests {
         if drop {
             all.drop_tombstones();
         }
-        Bytes::from(encode_parts(&all, DIM, 2, &AttrSchema::free_form()).unwrap()).to_vec()
+        let (data, sparse) = encode_parts(&all, DIM, 2, &AttrSchema::free_form()).unwrap();
+        (
+            Bytes::from(data).to_vec(),
+            sparse.map(|s| Bytes::from(s).to_vec()),
+        )
     }
 
-    async fn merged(inputs: Vec<Input<'_>>, drop: bool) -> Result<Vec<u8>> {
+    async fn merged(inputs: Vec<Input<'_>>, drop: bool) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
         let writer = merge_into(
             inputs,
             drop,
             SegmentWriter::new(DIM, 2, &AttrSchema::free_form())?,
         )
         .await?;
-        Ok(Bytes::from(writer.finish()?).to_vec())
+        let (data, sparse) = writer.finish()?;
+        Ok((
+            Bytes::from(data).to_vec(),
+            sparse.map(|s| Bytes::from(s).to_vec()),
+        ))
     }
 
     #[tokio::test]
@@ -462,17 +513,24 @@ mod tests {
         }
     }
 
-    /// Each input as a segment of `version`.
+    /// Each input as a segment of `version`, with its `sparse.bin`.
     async fn store_of(inputs: &[Layer], versions: &[u32]) -> InMemory {
         let store = InMemory::new();
         for (i, layer) in inputs.iter().enumerate() {
             let id = segment_id(i as u64 + 1, i as u64 + 1);
             let version = versions[i % versions.len()];
+            let (_, sparse) = encode_parts(layer, DIM, version, &AttrSchema::free_form()).unwrap();
             let data = encode_as(layer, DIM, version).unwrap();
             store
                 .put(&segment_path("ns", &id), data.into())
                 .await
                 .unwrap();
+            if let Some(sparse) = sparse {
+                store
+                    .put(&crate::sparse::sparse_path("ns", &id), sparse)
+                    .await
+                    .unwrap();
+            }
         }
         store
     }
@@ -536,6 +594,7 @@ mod tests {
                 id: format!("d{n:05}"),
                 vector: vec![n as f32; DIM],
                 attrs: Some(serde_json::json!({ "n": n })),
+                sparse: Some(vec![(n, 1.0)]),
             }));
         }
         for n in 0..700 {
@@ -566,7 +625,11 @@ mod tests {
             largest <= window + block + 2 * 64 * 1024,
             "a refill read {largest} bytes"
         );
-        let stored = encode_as(&layer, DIM, 2).unwrap().len() as u64;
+        let stored: u64 = {
+            let data = encode_as(&layer, DIM, 2).unwrap().len() as u64;
+            let (_, sparse) = encode_parts(&layer, DIM, 2, &AttrSchema::free_form()).unwrap();
+            data + sparse.map_or(0, |s| s.content_length() as u64)
+        };
         assert!(
             budget.used() <= stored + 64 * 1024 * 4,
             "read {}",
@@ -582,6 +645,7 @@ mod tests {
                 id: format!("d{n:04}"),
                 vector: vec![n as f32; DIM],
                 attrs: None,
+                sparse: None,
             }));
         }
         let store = store_of(std::slice::from_ref(&layer), &[2]).await;
@@ -600,6 +664,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sparse_directory_with_a_huge_offset_is_an_error_not_a_panic() {
+        let mut layer = Layer::new();
+        for n in 0..600u32 {
+            layer.apply(WalOp::Upsert(Document {
+                id: format!("d{n:04}"),
+                vector: vec![n as f32; DIM],
+                attrs: None,
+                sparse: Some(vec![(n, 1.0)]),
+            }));
+        }
+        let store = store_of(std::slice::from_ref(&layer), &[2]).await;
+        let path = crate::sparse::sparse_path("ns", &segment_id(1, 1));
+        let mut bytes = store
+            .get(&path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .to_vec();
+        // Row 255's directory entry, the last of the first block: a term
+        // count of 1 and an offset near the end of the u64 range.
+        let entry = 12 + 255 * 10;
+        bytes[entry + 2..entry + 10].copy_from_slice(&(u64::MAX - 100).to_le_bytes());
+        store.put(&path, bytes.into()).await.unwrap();
+
+        let budget = ReadBudget::unlimited();
+        let policy = FetchPolicy::local();
+        let mut input = open_all(&store, 1, &budget, &policy, SMALL_WINDOW)
+            .await
+            .remove(0);
+        let err = input.next().await.err().expect("damage is an error");
+        assert!(matches!(err, ItzmaError::CorruptSegment { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
     async fn an_input_out_of_order_is_refused() {
         let docs: Vec<Document> = ["b", "a"]
             .iter()
@@ -607,6 +707,7 @@ mod tests {
                 id: (*id).into(),
                 vector: vec![0.0; DIM],
                 attrs: None,
+                sparse: None,
             })
             .collect();
         let input = Input::Whole(WholeInput::from_parts_unchecked("forged", docs, vec![]));
@@ -623,6 +724,7 @@ mod tests {
             id: "a".into(),
             vector: vec![0.0; DIM],
             attrs: None,
+            sparse: None,
         }];
         let input = Input::Whole(WholeInput::from_parts_unchecked(
             "forged",

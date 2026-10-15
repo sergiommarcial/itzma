@@ -25,6 +25,7 @@ It is a library. You embed it in your process, open a namespace, and S3 (or a lo
 
 - Namespaces with a fixed dimension and metric (L2, cosine, dot product).
 - Dense vector search, exact or through an index: HNSW (the default) or SQ8 with clustered partitions.
+- Sparse vectors (term id, weight) beside the dense one, with an exact sparse query.
 - Typed attributes, declared at create, and filtering on them, alone or narrowing a vector query.
 - Batched upserts and deletes, safe with many concurrent writers, with optional idempotency keys.
 - S3 (and anything else `object_store` supports), local disk and in-memory stores.
@@ -68,11 +69,13 @@ async fn main() -> itzma_core::Result<()> {
                 id: "intro".into(),
                 vector: vec![0.9, 0.1, 0.0],
                 attrs: Some(serde_json::json!({ "title": "Introduction" })),
+                sparse: None,
             },
             Document {
                 id: "faq".into(),
                 vector: vec![0.0, 1.0, 0.2],
                 attrs: None,
+                sparse: None,
             },
         ])
         .await?;
@@ -168,6 +171,14 @@ A filter on `query_with` is applied after shadowing, and a source short of match
 
 **SQ8** (`IndexKind::Sq8`) stores each vector as one byte per dimension and reads only the partitions a query probes, which suits uncached reads. Segments of 100,000 rows or more are clustered into about `sqrt(rows)` partitions (`IndexOptions::nlist` overrides), and a query reads about `2 * sqrt(nlist)` of them by default. On SIFT1M and GloVe-25 the defaults gave recall@10 of 0.99 or more. `rebuild: true` builds again over existing indexes. An index needs `segment_format` 2 or above.
 
+## Sparse vectors
+
+A document can carry a sparse vector beside its dense one: `Document::sparse`, a list of `(term id, weight)` pairs, optional per document, nothing declared per namespace. Term ids must not repeat and weights must be finite; at most 65,535 terms per document.
+
+`Namespace::query_sparse(&terms, top_k, &SparseQueryOptions)` is exact and standalone: the score is the dot product, `Hit.distance` its negation, ties broken by id. It takes a `filter` like `query_with`. Shadowing across segments and the tail works as for dense queries.
+
+A batch with a sparse vector is written as WAL version 4 (5 with a key), which needs the namespace at WAL level 5. New namespaces start there; an older one needs `upgrade_wal_format(5)`.
+
 ## Compaction, garbage collection and maintenance
 
 **`compact`** folds the WAL tail into a new segment and publishes it with one conditional manifest update. When there are more than `max_segments` (default 8) live segments, or one is at `max_segment_bytes` (default 128 MiB), it merges instead, into size-capped segments, streaming the inputs. A segment's bytes depend only on its WAL range, so a rerun after a crash writes the same object, and racing compactors cannot publish different answers. Compaction never deletes anything.
@@ -178,7 +189,7 @@ A filter on `query_with` is applied after shadowing, and a source short of match
 
 **`recover`** writes a new manifest for a namespace that lost its own, from `schema.json`, the segment names and the WAL. It refuses if a manifest exists, and stops with `Unrecoverable` and the keys to restore if a range has no readable copy. It does not restore indexes; run `index` again.
 
-**Format levels.** The manifest records the newest WAL and segment formats the namespace may hold. A build that reads less refuses the namespace before touching it. `upgrade_wal_format(level)` and `upgrade_segment_format(level)` raise a level, one way. New namespaces start at WAL level 4 and segment level 2; `upgrade_segment_format(3)` turns on the typed attribute columns of segment format 3.
+**Format levels.** The manifest records the newest WAL and segment formats the namespace may hold. A build that reads less refuses the namespace before touching it. `upgrade_wal_format(level)` and `upgrade_segment_format(level)` raise a level, one way. New namespaces start at WAL level 5 and segment level 2; `upgrade_segment_format(3)` turns on the typed attribute columns of segment format 3.
 
 ## Caching and read budgets
 
@@ -222,6 +233,7 @@ Not guaranteed: exactly-once for plain writes (see [Writing](#writing)), and key
   wal/00000000000000000001.json       one object per batch (binary despite the name)
   segments/<lo>-<hi>/data.bin         a segment, named by the WAL range it covers
   segments/<lo>-<hi>/index-<n>.bin    its dense index (HNSW or SQ8), generation n
+  segments/<lo>-<hi>/sparse.bin       its sparse vectors, only if a document has one
   segments/<lo>-<hi>/generation       the highest index generation ever used
   gc/fenced-through                   a hint for gc, only with fence_wal
 ```
@@ -230,9 +242,10 @@ Not guaranteed: exactly-once for plain writes (see [Writing](#writing)), and key
 
 | Object | Magic | Versions |
 |---|---|---|
-| WAL batch | `ITZW` | 2, or 3 with an idempotency key; ZSTD-compressed when smaller |
+| WAL batch | `ITZW` | 2, or 3 with an idempotency key; 4 and 5 add a sparse column; ZSTD-compressed when smaller |
 | WAL fence | `ITZF` | 4 |
 | Segment | `ITZS`, ending in `ITZE` | 2 (block-addressable, Bloom filter); 3 adds typed attribute columns and zone maps |
+| Sparse vectors (`sparse.bin`) | `ITZS` | 1 |
 | Index | `ITZI` | 1, kind 1 (SQ8) or 2 (HNSW) |
 
 A reader that meets a version or kind it does not know refuses it instead of guessing; a segment whose index kind is unknown is scanned flat.

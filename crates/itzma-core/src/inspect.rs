@@ -97,6 +97,9 @@ pub struct SegmentReport {
     /// not name, oldest first. [`Namespace::gc`](crate::Namespace::gc) deletes
     /// them of a live segment once they are old enough.
     pub stray_indexes: Vec<u32>,
+    /// Whether the directory has a `sparse.bin`, so some document in the
+    /// segment carries a sparse vector.
+    pub has_sparse_data: bool,
 }
 
 /// An index the manifest names, and whether its object is there.
@@ -309,6 +312,10 @@ fn segment_report(
         .filter(|generation| Some(*generation) != named.map(|entry| entry.generation))
         .collect();
     stray_indexes.sort_unstable();
+    let has_sparse_data = found
+        .objects
+        .iter()
+        .any(|(path, _)| path.filename() == Some("sparse.bin"));
     SegmentReport {
         id: id.to_string(),
         lo: found.lo,
@@ -317,6 +324,7 @@ fn segment_report(
         state,
         index,
         stray_indexes,
+        has_sparse_data,
     }
 }
 
@@ -393,6 +401,9 @@ impl fmt::Display for Report {
             }
             if !s.stray_indexes.is_empty() {
                 write!(f, "  unnamed indexes {:?}", s.stray_indexes)?;
+            }
+            if s.has_sparse_data {
+                write!(f, "  sparse")?;
             }
             writeln!(f)?;
         }

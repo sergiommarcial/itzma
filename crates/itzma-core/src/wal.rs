@@ -28,18 +28,23 @@ use crate::document::WalOp;
 use crate::error::{ItzmaError, Result};
 use crate::wal_codec::{self, Peek};
 
-/// The newest `wal_format` level this build reads, and so the highest a
-/// namespace can hold before this build refuses it. [`read_log`]
-/// reads WAL object versions 2 (binary) and 3 (binary with an
-/// idempotency key), and rejects any other with
+/// The newest WAL object format this build reads, and so the highest
+/// `wal_format` a namespace can hold before this build refuses it.
+/// [`read_log`] reads versions 2 (binary), 3 (binary with an idempotency
+/// key), 4 (binary with a sparse-vector column) and 5 (4 plus a key), and
+/// rejects any other with
 /// [`ItzmaError::UnsupportedFormat`]. A decoded [`WalEntry`] carries the
-/// version of the object it came from. Level 4 adds the fence marker that
-/// garbage collection leaves at the key of an old object, which is
-/// not a batch and never comes out of [`read_log`] except as an error.
+/// version of the object it came from. Level 4 (the gate level, not to be
+/// confused with WAL object version 4 above: the two numbering schemes
+/// happen to coincide from here on) adds the fence marker that garbage
+/// collection leaves at the key of an old object, which is not a batch and
+/// never comes out of [`read_log`] except as an error.
 ///
-/// [`append`] writes version 2 for an ordinary batch. A keyed write produces
-/// version 3, needing a namespace at level [`KEYED_FORMAT_VERSION`].
-pub const FORMAT_VERSION: u32 = FENCE_FORMAT_VERSION;
+/// [`append`] still writes version 2 for an ordinary batch. A keyed write
+/// produces version 3, needing a namespace at level [`KEYED_FORMAT_VERSION`];
+/// a batch with any sparse vector produces version 4 (or 5 if also keyed),
+/// needing level [`SPARSE_FORMAT_VERSION`].
+pub const FORMAT_VERSION: u32 = SPARSE_FORMAT_VERSION;
 
 /// The WAL format of an object with an idempotency key, and the level a
 /// namespace's `wal_format` must have reached before a keyed write is allowed.
@@ -48,6 +53,12 @@ pub const KEYED_FORMAT_VERSION: u32 = 3;
 /// The level a namespace's `wal_format` must have reached before
 /// [`Namespace::gc`](crate::Namespace::gc) may fence WAL objects.
 pub const FENCE_FORMAT_VERSION: u32 = 4;
+
+/// The level a namespace's `wal_format` must have reached before a batch
+/// carrying a sparse vector may be written: WAL object version 4 (or 5,
+/// keyed). A plain batch never needs this level and stays at version 2 (or
+/// 3, keyed) regardless of how high the namespace's level is.
+pub const SPARSE_FORMAT_VERSION: u32 = 5;
 
 /// How many sequence numbers [`append`] tries before giving up with
 /// [`ItzmaError::WriteContention`].
@@ -240,6 +251,7 @@ pub(crate) fn parse_seq(path: &Path) -> Option<u64> {
 ///     id: id.into(),
 ///     vector: vec![1.0],
 ///     attrs: None,
+///     sparse: None,
 /// });
 ///
 /// assert_eq!(wal::append(&store, "docs", 1, vec![op("a")]).await?, 1);
@@ -321,6 +333,7 @@ pub(crate) async fn put_encoded(
 ///     id: "a".into(),
 ///     vector: vec![1.0],
 ///     attrs: None,
+///     sparse: None,
 /// })];
 ///
 /// let seq = wal::append_keyed(&store, "docs", 1, &WriteKey::new("load-7/batch-1"), batch()).await?;
@@ -665,6 +678,7 @@ mod tests {
             id: id.into(),
             vector: vec![1.0, 2.0],
             attrs: None,
+            sparse: None,
         })
     }
 
@@ -700,7 +714,8 @@ mod tests {
     #[test]
     fn the_build_reads_fences_and_says_so() {
         assert_eq!(FENCE_FORMAT_VERSION, 4);
-        assert_eq!(FORMAT_VERSION, FENCE_FORMAT_VERSION);
+        assert_eq!(SPARSE_FORMAT_VERSION, 5);
+        assert_eq!(FORMAT_VERSION, SPARSE_FORMAT_VERSION);
     }
 
     #[test]

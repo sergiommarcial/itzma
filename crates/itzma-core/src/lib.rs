@@ -22,7 +22,7 @@
 //! let schema = Schema::new(2, Metric::L2);
 //! let ns = Namespace::create(store, "docs", schema).await?;
 //!
-//! ns.upsert(vec![Document { id: "a".into(), vector: vec![1.0, 0.0], attrs: None }]).await?;
+//! ns.upsert(vec![Document { id: "a".into(), vector: vec![1.0, 0.0], attrs: None, sparse: None }]).await?;
 //! let hits = ns.query(&[0.0, 0.0], 5).await?;
 //! assert_eq!(hits[0].id, "a");
 //! # Ok(())
@@ -39,7 +39,7 @@
 //!
 //! | Module | Job |
 //! |---|---|
-//! | [`namespace`] | The [`Namespace`] handle: create, open, upsert, delete (each also keyed), query, filter, index, compact, gc, maintain, recover |
+//! | [`namespace`] | The [`Namespace`] handle: create, open, upsert, delete (each also keyed), query, query_sparse, filter, index, compact, gc, maintain, recover |
 //! | [`document`] | [`Document`], [`WalOp`], [`Schema`], [`Metric`] |
 //! | [`attrs`] | [`AttrSchema`], [`AttrType`]: the typed attribute fields a namespace declares |
 //! | [`predicate`] | [`Predicate`]: a typed condition over attributes |
@@ -52,6 +52,7 @@
 //! | [`compaction`] | [`Compaction`], [`CompactionOptions`] and the run behind [`Namespace::compact`] |
 //! | [`gc`] | [`GcOptions`], [`GcReport`] and the run behind [`Namespace::gc`] |
 //! | [`indexer`] | [`IndexOptions`], [`IndexReport`] and the run behind [`Namespace::index`] |
+//! | [`sparse`] | [`SparseVector`] storage beside a segment: `sparse.bin` |
 //! | [`maintain`] | [`MaintenanceOptions`] and the run behind [`Namespace::maintain`] |
 //! | [`columns`] | [`DocColumns`]: a batch of upserts held as columns, for Arrow input |
 //! | [`inspect`] | [`inspect::report`]: a read-only look at what a namespace holds and what looks wrong |
@@ -77,6 +78,7 @@
 //!   wal/00000000000000000002.json
 //!   segments/<lo>-<hi>/data.bin    compacted data, named by the WAL range it covers
 //!   segments/<lo>-<hi>/index-<n>.bin an index of that segment, generation n, once `index` built one
+//!   segments/<lo>-<hi>/sparse.bin  the segment's sparse vectors, only if a document has one
 //! ```
 //!
 //! The manifest is JSON. WAL objects and segments are binary, and a WAL object
@@ -84,7 +86,7 @@
 //! its `.json` suffix on purpose: every writer has to try the same key for the
 //! same sequence number, or put-if-absent stops deciding the race. A write that carries an
 //! idempotency key ([`WriteKey`]) is version 3, the same object with the key in
-//! the header.
+//! the header. A batch with a sparse vector is version 4, or 5 with a key.
 //!
 //! Nothing in the layout is ever overwritten but the manifest, and the WAL
 //! objects that [`Namespace::gc`] is asked to fence. GC deletes segments that a
@@ -143,6 +145,8 @@ mod scan;
 pub mod schema_object;
 pub mod search;
 pub mod segment;
+pub mod sparse;
+mod sparse_query;
 mod stream;
 mod view;
 pub mod wal;
@@ -151,11 +155,11 @@ mod wal_codec;
 pub use attrs::{AttrSchema, AttrType};
 pub use budget::DEFAULT_READ_BUDGET;
 pub use cache::{CacheOptions, CacheStore, DEFAULT_RAM_MAX_BYTES, NvmeOptions};
-pub use columns::{AttrColumn, DocColumns};
+pub use columns::{AttrColumn, DocColumns, SparseColumn};
 pub use compaction::{Compaction, CompactionOptions};
 pub use cpu::{CpuThreads, configure_cpu};
 pub use decoded::{DEFAULT_DECODED_MAX_BYTES, DecodedCache, DecodedCacheOptions};
-pub use document::{Document, Metric, Schema, WalOp};
+pub use document::{Document, Metric, Schema, SparseVector, WalOp};
 pub use error::{ItzmaError, Result};
 pub use fetch::FetchPolicy;
 pub use filter::{FilterOptions, FilterPage, Row};
@@ -168,6 +172,7 @@ pub use predicate::{AttrValue, Compare, Predicate, TextCompare};
 pub use query::{DEFAULT_RERANK, QueryOptions};
 pub use recover::RecoverReport;
 pub use search::Hit;
+pub use sparse_query::SparseQueryOptions;
 pub use stream::{
     DEFAULT_STREAM_DEPTH, DEFAULT_STREAM_TARGET_BYTES, StreamError, StreamOptions, StreamReport,
 };

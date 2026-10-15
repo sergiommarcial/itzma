@@ -16,7 +16,8 @@
 //! that the manifest does not name: an older generation that a rebuild replaced,
 //! or an orphan of a build that never published. Like a segment, such an object
 //! goes only once it and the index that replaced it are at least `min_age` old.
-//! The whole directory of a dead segment goes with the segment.
+//! The whole directory of a dead segment goes with the segment, `sparse.bin`
+//! included: it has one generation and lives and dies with its segment.
 //!
 //! With [`GcOptions::fence_wal`] it also lists `wal/` and replaces WAL objects
 //! that a segment has absorbed with an 8-byte fence at the same key, so that

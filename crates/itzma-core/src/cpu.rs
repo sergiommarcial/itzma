@@ -684,6 +684,7 @@ mod tests {
                 id: format!("d{i:06}"),
                 vector: (0..128).map(|d| ((i * 31 + d) % 97) as f32).collect(),
                 attrs: (i % 3 == 0).then(|| serde_json::json!({ "n": i, "tag": "x" })),
+                sparse: None,
             };
             ops.push(crate::document::WalOp::Upsert(doc.clone()));
             layer.apply(crate::document::WalOp::Upsert(doc));

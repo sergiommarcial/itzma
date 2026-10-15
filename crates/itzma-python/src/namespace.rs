@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use itzma_core::{
     CompactionOptions, FilterOptions, GcOptions, IndexOptions, MaintenanceOptions, QueryOptions,
-    StreamOptions, WriteKey,
+    SparseQueryOptions, StreamOptions, WriteKey,
 };
 
 use crate::convert::arrow::PyArrowStream;
@@ -539,6 +539,36 @@ impl PyNamespace {
         )
     }
 
+    fn query_sparse(
+        &self,
+        py: Python<'_>,
+        terms: &Bound<'_, PyAny>,
+        top_k: usize,
+        options: &str,
+    ) -> PyResult<PyHits> {
+        let (ns, terms) = (self.handle()?, vectors::sparse(terms)?);
+        let options: SparseQueryOptions = options::merge(options).map_err(error::input)?;
+        runtime::block_on(
+            py,
+            query_sparse_call(ns, terms, top_k, options, self.layout.clone()),
+        )
+    }
+
+    fn query_sparse_async<'py>(
+        &self,
+        py: Python<'py>,
+        terms: &Bound<'_, PyAny>,
+        top_k: usize,
+        options: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (ns, terms) = (self.handle()?, vectors::sparse(terms)?);
+        let options: SparseQueryOptions = options::merge(options).map_err(error::input)?;
+        runtime::spawn(
+            py,
+            query_sparse_call(ns, terms, top_k, options, self.layout.clone()),
+        )
+    }
+
     fn filter(&self, py: Python<'_>, predicate: &str, options: &str) -> PyResult<PyRows> {
         let ns = self.handle()?;
         let predicate = predicate::parse(predicate).map_err(error::input)?;
@@ -652,6 +682,20 @@ async fn query_call(
 ) -> PyResult<PyHits> {
     let hits = ns
         .query_with(&vector, top_k, &options)
+        .await
+        .map_err(error::to_py)?;
+    Ok(PyHits { hits, layout })
+}
+
+async fn query_sparse_call(
+    ns: Arc<Namespace>,
+    terms: Vec<(u32, f32)>,
+    top_k: usize,
+    options: SparseQueryOptions,
+    layout: Arc<ArrowLayout>,
+) -> PyResult<PyHits> {
+    let hits = ns
+        .query_sparse(&terms, top_k, &options)
         .await
         .map_err(error::to_py)?;
     Ok(PyHits { hits, layout })

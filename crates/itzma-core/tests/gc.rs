@@ -754,18 +754,19 @@ async fn a_merge_whose_input_is_collected_while_it_reads_is_superseded() {
             .await
             .unwrap();
         for (n, id) in ["a", "b"].into_iter().enumerate() {
-            ns.upsert(vec![doc(id, &[n as f32])]).await.unwrap();
+            let mut d = doc(id, &[n as f32]);
+            d.sparse = Some(vec![(1, 1.0)]);
+            ns.upsert(vec![d]).await.unwrap();
             ns.compact(&ROOMY).await.unwrap();
         }
 
         // Another merge publishes and 1-1 is collected while this run reads
-        // its inputs, just before it reads 2-2. These segments are small, so
-        // 1-1 was read whole and the read is already done: this run's publish
-        // finds the manifest moved. The next test covers a segment read in
-        // windows.
+        // its inputs. These segments are small, so they are read whole and
+        // the read is already done: this run's publish finds the manifest
+        // moved. The next test covers a segment read in windows.
         let raw = b.store.clone();
         faulty.before_get(
-            &format!("{}/data.bin", segment::segment_id(2, 2)),
+            &format!("{}/sparse.bin", segment::segment_id(1, 1)),
             async move {
                 let other = Namespace::open(raw.clone(), "docs").await.unwrap();
                 assert!(matches!(
@@ -793,18 +794,22 @@ async fn a_segment_collected_before_its_first_window_is_a_stale_read() {
             .unwrap();
         for s in 0..2u32 {
             let docs = (0..1200u32)
-                .map(|i| doc(&format!("s{s}-{i:05}"), &vec![i as f32; dim]))
+                .map(|i| {
+                    let mut d = doc(&format!("s{s}-{i:05}"), &vec![i as f32; dim]);
+                    d.sparse = Some(vec![(i, 1.0)]);
+                    d
+                })
                 .collect();
             ns.upsert(docs).await.unwrap();
             ns.compact(&ROOMY).await.unwrap();
         }
 
-        // 2-2 is opened after 1-1 and before any window is read: the merge
-        // and collection land in between, so 1-1's first window finds the
-        // object gone.
+        // 1-1's sidecar is opened after its data object and before its first
+        // window: the merge and collection land in between, so the window's
+        // read finds the object gone.
         let raw = b.store.clone();
         faulty.before_get(
-            &format!("{}/data.bin", segment::segment_id(2, 2)),
+            &format!("{}/sparse.bin", segment::segment_id(1, 1)),
             async move {
                 let other = Namespace::open(raw.clone(), "docs").await.unwrap();
                 assert!(matches!(

@@ -1,6 +1,5 @@
-//! Encoding and decoding of one WAL object, format versions 2 and 3,
-//! and the fence that garbage collection leaves
-//! in place of an old one.
+//! Encoding and decoding of one WAL object, format versions 2 through 5,
+//! and the fence that garbage collection leaves in place of an old one.
 //!
 //! Bytes in, bytes out: nothing here touches the object store. The layout is
 //! a 13-byte header followed by a payload:
@@ -22,9 +21,14 @@
 //! (`op_count`, `upsert_count`, `dim`), one kind byte per op, the ids, the
 //! vectors as four byte planes, and the attributes as length-prefixed JSON.
 //! Operation order and duplicates are kept, because the last op on an id in a
-//! batch wins. A new column would be a new format version. Versions 4 and 5
-//! are assigned elsewhere and are not read here
-//! ([`ItzmaError::UnsupportedFormat`]).
+//! batch wins. A new column would be a new format version — version 4 adds
+//! exactly one: a sparse-vector column after the attributes, one entry per
+//! upsert, `term_count` u16 then that many `(term_id u32, weight f32)` pairs.
+//! Version 5 is version 4 with the version-3 idempotency key in
+//! the header. Both are opt-in per batch: [`encode`]/[`encode_keyed`] only
+//! step up to them when at least one op in the batch actually carries a
+//! sparse vector, so an ordinary batch is unaffected and stays at version 2
+//! or 3 forever.
 //!
 //! A fence is not a batch. It is 8 bytes, the magic `ITZF` and a u32 version
 //! (1), and it stands at the key of a WAL object that garbage collection
@@ -38,7 +42,7 @@ use std::io::Read;
 use bytes::Bytes;
 
 use crate::columns::{AttrColumn, DocColumns};
-use crate::document::{Document, WalOp};
+use crate::document::{Document, SparseVector, WalOp};
 use crate::error::{ItzmaError, Result};
 use crate::wal::WalEntry;
 
@@ -50,6 +54,10 @@ const FENCE_VERSION: u32 = 1;
 pub(crate) const FENCE_LEN: usize = 8;
 const V2: u32 = 2;
 const V3: u32 = 3;
+/// Version 2's body plus a sparse-vector column. Unkeyed.
+const V4: u32 = 4;
+/// Version 4's body with version 3's idempotency key in the header. Keyed.
+const V5: u32 = 5;
 /// The fixed part of a binary header: magic, version, codec and `body_len`.
 pub(crate) const HEADER_LEN: usize = 13;
 /// The longest idempotency key, in bytes.
@@ -180,7 +188,11 @@ pub(crate) fn encode_keyed(ops: &[WalOp], max_body: usize, key: &str) -> Result<
 fn encode_with(ops: &[WalOp], max_body: usize, key: Option<&str>) -> Result<Keyed> {
     let (upserts, dim) = shape(ops)?;
     let attrs = attribute_json(ops)?;
-    let size = body_size(ops, upserts, dim, &attrs);
+    let has_sparse = ops
+        .iter()
+        .any(|op| matches!(op, WalOp::Upsert(doc) if doc.sparse.is_some()));
+    let sparse = has_sparse.then(|| sparse_terms(ops));
+    let size = body_size(ops, upserts, dim, &attrs, sparse.as_deref());
     if size > max_body as u64 {
         return Err(ItzmaError::BatchTooLarge {
             bytes: size,
@@ -188,13 +200,14 @@ fn encode_with(ops: &[WalOp], max_body: usize, key: Option<&str>) -> Result<Keye
         });
     }
 
-    let body = build_body(ops, upserts, dim, &attrs, size)?;
-    frame(body, key)
+    let body = build_body(ops, upserts, dim, &attrs, sparse.as_deref(), size)?;
+    frame(body, key, has_sparse)
 }
 
 /// Compress `body` when that makes it smaller, and put the header (and the
-/// key, for a keyed object) in front: version 3 with a key, else 2.
-fn frame(body: Vec<u8>, key: Option<&str>) -> Result<Keyed> {
+/// key, for a keyed object) in front. The version follows from the key and
+/// whether the body has a sparse column.
+fn frame(body: Vec<u8>, key: Option<&str>, has_sparse: bool) -> Result<Keyed> {
     let body_len = len32(body.len())?;
     let compressed = zstd::bulk::compress(&body, ZSTD_LEVEL)
         .map_err(|e| encoding_error(format!("ZSTD failed: {e}")))?;
@@ -204,7 +217,12 @@ fn frame(body: Vec<u8>, key: Option<&str>) -> Result<Keyed> {
         (CODEC_RAW, body)
     };
 
-    let version = if key.is_some() { V3 } else { V2 };
+    let version = match (key.is_some(), has_sparse) {
+        (false, false) => V2,
+        (true, false) => V3,
+        (false, true) => V4,
+        (true, true) => V5,
+    };
     let key_len = key.map_or(0, |k| 1 + k.len());
     let mut out = Vec::with_capacity(HEADER_LEN + key_len + payload.len());
     out.extend_from_slice(&MAGIC);
@@ -222,15 +240,16 @@ fn frame(body: Vec<u8>, key: Option<&str>) -> Result<Keyed> {
     })
 }
 
-/// Encode a columnar batch as the version 2 object that [`encode`]
-/// writes for the same documents, byte for byte: every row an upsert,
-/// attributes written as JSON straight from the columns. Same size rule and
-/// errors as [`encode`] (the batch's shape was checked when it was built).
+/// Encode a columnar batch as the version 2 or 4 object that
+/// [`encode`] writes for the same documents, byte for byte: every row an
+/// upsert, attributes written as JSON straight from the columns, a sparse
+/// column only when some row has a sparse vector. Same size rule and errors
+/// as [`encode`] (the batch's shape was checked when it was built).
 pub(crate) fn encode_columns(cols: &DocColumns, max_body: usize) -> Result<Bytes> {
     Ok(encode_columns_with(cols, max_body, None)?.bytes)
 }
 
-/// [`encode_columns`] as a version 3 object carrying `key`, as
+/// [`encode_columns`] as a version 3 or 5 object carrying `key`, as
 /// [`encode_keyed`] writes it.
 pub(crate) fn encode_columns_keyed(cols: &DocColumns, max_body: usize, key: &str) -> Result<Keyed> {
     validate_key(key)?;
@@ -253,13 +272,32 @@ pub(crate) fn columns_body_size(cols: &DocColumns) -> u64 {
     columns_size(cols, attrs)
 }
 
-/// What row `row` adds to a body: its kind byte, its id, its vector and its
-/// attribute entry. A body is [`COUNTS_LEN`] plus this over its rows, so the
-/// stream's chunker can cut a batch at a size without encoding it.
-pub(crate) fn row_body_bytes(cols: &DocColumns, row: usize, scratch: &mut Vec<u8>) -> u64 {
+/// What row `row` adds to a body: its kind byte, its id, its vector, its
+/// attribute entry, and with `sparse` its sparse entry. A body is
+/// [`COUNTS_LEN`] plus this over its rows, so the stream's chunker can cut a
+/// batch at a size without encoding it.
+pub(crate) fn row_body_bytes(
+    cols: &DocColumns,
+    row: usize,
+    sparse: bool,
+    scratch: &mut Vec<u8>,
+) -> u64 {
     scratch.clear();
     write_row_attrs(cols, row, scratch);
-    1 + 4 + cols.id(row).len() as u64 + cols.dim() as u64 * 4 + 4 + scratch.len() as u64
+    let sparse_bytes = match cols.sparse().filter(|_| sparse) {
+        None => 0,
+        Some(column) => {
+            2 + column
+                .row(row)
+                .map_or(0, |(terms, _)| terms.len() as u64 * 8)
+        }
+    };
+    1 + 4
+        + cols.id(row).len() as u64
+        + cols.dim() as u64 * 4
+        + 4
+        + scratch.len() as u64
+        + sparse_bytes
 }
 
 /// The body length given the attribute column's total length (length
@@ -270,7 +308,17 @@ fn columns_size(cols: &DocColumns, attrs: u64) -> u64 {
         .map(|row| 4 + cols.id(row).len() as u64)
         .sum();
     let vectors = (cols.vectors().len() as u64).saturating_mul(4);
-    COUNTS_LEN as u64 + rows + ids + vectors + attrs
+    let sparse: u64 = match cols.sparse().filter(|s| s.any()) {
+        None => 0,
+        Some(sparse) => (0..cols.rows())
+            .map(|row| {
+                2 + sparse
+                    .row(row)
+                    .map_or(0, |(terms, _)| terms.len() as u64 * 8)
+            })
+            .sum(),
+    };
+    COUNTS_LEN as u64 + rows + ids + vectors + attrs + sparse
 }
 
 fn encode_columns_with(cols: &DocColumns, max_body: usize, key: Option<&str>) -> Result<Keyed> {
@@ -318,7 +366,21 @@ fn encode_columns_with(cols: &DocColumns, max_body: usize, key: Option<&str>) ->
         put_bytes(&mut body, &attrs[from..end])?;
         from = end;
     }
-    frame(body, key)
+
+    let sparse = cols.sparse().filter(|s| s.any());
+    if let Some(sparse) = sparse {
+        for row in 0..rows {
+            let (terms, weights) = sparse.row(row).unwrap_or((&[], &[]));
+            let term_count = u16::try_from(terms.len())
+                .map_err(|_| encoding_error("a row has more sparse terms than fit a u16"))?;
+            body.extend_from_slice(&term_count.to_le_bytes());
+            for (term, weight) in terms.iter().zip(weights) {
+                body.extend_from_slice(&term.to_le_bytes());
+                body.extend_from_slice(&weight.to_le_bytes());
+            }
+        }
+    }
+    frame(body, key, sparse.is_some())
 }
 
 /// Row `row`'s attributes as the JSON `serde_json::to_vec` writes for the
@@ -470,6 +532,18 @@ fn attribute_json(ops: &[WalOp]) -> Result<Vec<Vec<u8>>> {
         .collect()
 }
 
+/// Each upsert's sparse vector, in upsert order, `None` as an empty `Vec`.
+/// Only called when the batch actually has at least one.
+fn sparse_terms(ops: &[WalOp]) -> Vec<Vec<(u32, f32)>> {
+    ops.iter()
+        .filter_map(|op| match op {
+            WalOp::Upsert(doc) => Some(doc),
+            WalOp::Delete(_) => None,
+        })
+        .map(|doc| doc.sparse.clone().unwrap_or_default())
+        .collect()
+}
+
 fn op_id(op: &WalOp) -> &str {
     match op {
         WalOp::Upsert(doc) => &doc.id,
@@ -477,14 +551,25 @@ fn op_id(op: &WalOp) -> &str {
     }
 }
 
-/// The exact length of the body, without building it.
-fn body_size(ops: &[WalOp], upserts: usize, dim: usize, attrs: &[Vec<u8>]) -> u64 {
+/// The exact length of the body, without building it. `sparse`, present only
+/// for a batch stepping up to version 4/5, adds one `term_count` u16 plus
+/// `term_id`/`weight` pairs (8 bytes each) per upsert.
+fn body_size(
+    ops: &[WalOp],
+    upserts: usize,
+    dim: usize,
+    attrs: &[Vec<u8>],
+    sparse: Option<&[Vec<(u32, f32)>]>,
+) -> u64 {
     let ids: u64 = ops.iter().map(|op| 4 + op_id(op).len() as u64).sum();
     let vectors = (upserts as u64)
         .saturating_mul(dim as u64)
         .saturating_mul(4);
     let attrs: u64 = attrs.iter().map(|a| 4 + a.len() as u64).sum();
-    COUNTS_LEN as u64 + ops.len() as u64 + ids + vectors + attrs
+    let sparse: u64 = sparse
+        .map(|rows| rows.iter().map(|r| 2 + r.len() as u64 * 8).sum())
+        .unwrap_or(0);
+    COUNTS_LEN as u64 + ops.len() as u64 + ids + vectors + attrs + sparse
 }
 
 fn build_body(
@@ -492,6 +577,7 @@ fn build_body(
     upserts: usize,
     dim: usize,
     attrs: &[Vec<u8>],
+    sparse: Option<&[Vec<(u32, f32)>]>,
     size: u64,
 ) -> Result<Vec<u8>> {
     let mut body = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
@@ -527,6 +613,18 @@ fn build_body(
 
     for json in attrs {
         put_bytes(&mut body, json)?;
+    }
+
+    if let Some(sparse) = sparse {
+        for terms in sparse {
+            let term_count = u16::try_from(terms.len())
+                .map_err(|_| encoding_error("a row has more sparse terms than fit a u16"))?;
+            body.extend_from_slice(&term_count.to_le_bytes());
+            for &(term, weight) in terms {
+                body.extend_from_slice(&term.to_le_bytes());
+                body.extend_from_slice(&weight.to_le_bytes());
+            }
+        }
     }
     Ok(body)
 }
@@ -569,12 +667,12 @@ fn read_header(head: &mut Reader<'_>) -> Result<Header> {
         return Err(head.corrupt("bad magic"));
     }
     let version = head.u32()?;
-    if !matches!(version, V2 | V3) {
+    if !matches!(version, V2 | V3 | V4 | V5) {
         return Err(ItzmaError::UnsupportedFormat { version });
     }
     let codec = head.u8()?;
     let body_len = head.u32()?;
-    let key = if version == V3 {
+    let key = if version == V3 || version == V5 {
         let len = usize::from(head.u8()?);
         if len == 0 || len > MAX_KEY_LEN {
             return Err(head.corrupt("key length is outside 1 to 128"));
@@ -597,8 +695,8 @@ fn read_header(head: &mut Reader<'_>) -> Result<Header> {
 
 /// Read the idempotency key from the start of an object, without decoding the
 /// body. `prefix` needs to be at least the header, which the first
-/// [`HEADER_PEEK_LEN`] bytes always are. Returns `None` for version 2, which
-/// carries no key, and for bytes that are not a WAL object.
+/// [`HEADER_PEEK_LEN`] bytes always are. Returns `None` for versions 2 and 4,
+/// which carry no key, and for bytes that are not a WAL object.
 ///
 /// # Errors
 ///
@@ -623,7 +721,7 @@ pub(crate) fn peek_key(path: &str, prefix: &[u8]) -> Result<Option<Peek>> {
 ///
 /// # Errors
 ///
-/// - [`ItzmaError::UnsupportedFormat`] for a version other than 2 or 3.
+/// - [`ItzmaError::UnsupportedFormat`] for a version other than 2 through 5.
 /// - [`ItzmaError::CorruptWal`] if the prefix is cut short.
 pub(crate) fn declared_body_len(path: &str, prefix: &[u8]) -> Result<Option<u64>> {
     if !is_binary(prefix) {
@@ -632,19 +730,19 @@ pub(crate) fn declared_body_len(path: &str, prefix: &[u8]) -> Result<Option<u64>
     let mut head = Reader::new(path, prefix);
     head.take(MAGIC.len())?;
     let version = head.u32()?;
-    if !matches!(version, V2 | V3) {
+    if !matches!(version, V2 | V3 | V4 | V5) {
         return Err(ItzmaError::UnsupportedFormat { version });
     }
     head.u8()?;
     Ok(Some(u64::from(head.u32()?)))
 }
 
-/// Decode a version 2 or 3 object. `path` only labels errors.
+/// Decode a version 2 through 5 object. `path` only labels errors.
 ///
 /// # Errors
 ///
 /// - [`ItzmaError::UnsupportedFormat`] if the header names a version other
-///   than 2 or 3.
+///   than 2 through 5.
 /// - [`ItzmaError::CorruptWal`] for anything else wrong with the bytes.
 pub(crate) fn decode(path: &str, bytes: &[u8]) -> Result<WalEntry> {
     let mut head = Reader::new(path, bytes);
@@ -759,9 +857,32 @@ fn parse_body(path: &str, body: &[u8], version: u32, key: Option<String>) -> Res
         });
     }
 
+    // The sparse column exists only for version 4/5, always right
+    // after the attributes, one entry per upsert. A count is bounds-checked
+    // against the bytes that remain before its terms are read, the same rule
+    // every other length here follows.
+    let mut sparse: Vec<Option<SparseVector>> = Vec::with_capacity(upsert_count);
+    if matches!(version, V4 | V5) {
+        for _ in 0..upsert_count {
+            let term_count = usize::from(r.u16()?);
+            if term_count == 0 {
+                sparse.push(None);
+                continue;
+            }
+            if term_count.saturating_mul(8) > r.remaining() {
+                return Err(r.corrupt("sparse term count exceeds the body size"));
+            }
+            let mut terms = Vec::with_capacity(term_count);
+            for _ in 0..term_count {
+                terms.push((r.u32()?, r.f32()?));
+            }
+            sparse.push(Some(terms));
+        }
+    }
     r.finish()?;
 
     let mut attrs = attrs.into_iter();
+    let mut sparse = sparse.into_iter();
     let mut upsert = 0;
     let mut ops = Vec::with_capacity(op_count);
     for (kind, id) in kinds.iter().zip(ids) {
@@ -770,6 +891,7 @@ fn parse_body(path: &str, body: &[u8], version: u32, key: Option<String>) -> Res
                 id,
                 vector: vector_of(upsert),
                 attrs: attrs.next().flatten(),
+                sparse: sparse.next().flatten(),
             }));
             upsert += 1;
         } else {
@@ -828,11 +950,22 @@ impl<'a> Reader<'a> {
             .ok_or_else(|| self.corrupt("object is truncated"))
     }
 
+    fn u16(&mut self) -> Result<u16> {
+        let bytes = self.take(2)?;
+        <[u8; 2]>::try_from(bytes)
+            .map(u16::from_le_bytes)
+            .map_err(|_| self.corrupt("object is truncated"))
+    }
+
     fn u32(&mut self) -> Result<u32> {
         let bytes = self.take(4)?;
         <[u8; 4]>::try_from(bytes)
             .map(u32::from_le_bytes)
             .map_err(|_| self.corrupt("object is truncated"))
+    }
+
+    fn f32(&mut self) -> Result<f32> {
+        Ok(f32::from_bits(self.u32()?))
     }
 
     /// A u32 used as a count or length. A u32 always fits in a `usize` on the
@@ -872,6 +1005,7 @@ mod tests {
             id: id.into(),
             vector: v.to_vec(),
             attrs,
+            sparse: None,
         })
     }
 
@@ -941,26 +1075,58 @@ mod tests {
         assert_eq!(entry.ops, ops);
     }
 
+    fn up_sparse(id: &str, v: &[f32], sparse: Option<Vec<(u32, f32)>>) -> WalOp {
+        WalOp::Upsert(Document {
+            id: id.into(),
+            vector: v.to_vec(),
+            attrs: None,
+            sparse,
+        })
+    }
+
     #[test]
-    fn a_plain_batch_is_version_2() {
+    fn a_plain_batch_stays_at_version_2_regardless_of_other_ops_in_the_wal() {
+        // No op in this batch has a sparse vector, so it must not step up.
         let ops = vec![up("a", &[1.0], None), del("b")];
         assert_eq!(roundtrip(&ops).format_version, 2);
     }
 
     #[test]
-    fn versions_4_and_5_are_not_read_here() {
-        let ops = vec![up("a", &[1.0], None)];
-        for version in [4u32, 5] {
-            let mut bytes = encode(&ops, BIG).unwrap().to_vec();
-            bytes[4..8].copy_from_slice(&version.to_le_bytes());
-            assert!(matches!(
-                decode("p", &bytes),
-                Err(ItzmaError::UnsupportedFormat { version: v }) if v == version
-            ));
-            assert!(matches!(
-                declared_body_len("p", &bytes),
-                Err(ItzmaError::UnsupportedFormat { .. })
-            ));
+    fn a_batch_with_any_sparse_vector_is_version_4_and_round_trips() {
+        let ops = vec![
+            up_sparse("a", &[1.0], Some(vec![(3, 0.5), (9, 1.0)])),
+            up_sparse("b", &[2.0], None), // no sparse vector of its own
+            del("c"),
+        ];
+        let entry = roundtrip(&ops);
+        assert_eq!(entry.format_version, 4);
+        assert_eq!(entry.ops, ops);
+    }
+
+    #[test]
+    fn a_keyed_batch_with_a_sparse_vector_is_version_5() {
+        let ops = vec![up_sparse("a", &[1.0], Some(vec![(1, 1.0)]))];
+        let keyed = encode_keyed(&ops, BIG, "k1").unwrap();
+        let entry = decode("wal/test", &keyed.bytes).unwrap();
+        assert_eq!(entry.format_version, 5);
+        assert_eq!(entry.key.as_deref(), Some("k1"));
+        assert_eq!(entry.ops, ops);
+    }
+
+    #[test]
+    fn every_truncation_and_bit_flip_of_a_sparse_batch_is_an_error_never_a_panic() {
+        let ops = vec![
+            up_sparse("a", &[1.0], Some(vec![(3, 0.5), (9, 1.0)])),
+            up_sparse("b", &[2.0], Some(vec![(4, 2.0)])),
+        ];
+        let good = encode(&ops, BIG).unwrap();
+        for len in 0..good.len() {
+            let _ = decode("wal/test", &good[..len]); // must not panic
+        }
+        for i in 0..good.len() {
+            let mut bad = good.to_vec();
+            bad[i] ^= 0xFF;
+            let _ = decode("wal/test", &bad); // must not panic
         }
     }
 
@@ -1549,7 +1715,7 @@ mod column_tests {
     use serde_json::{Map, Number, Value};
 
     use super::*;
-    use crate::columns::{AttrColumn, DocColumns};
+    use crate::columns::{AttrColumn, DocColumns, SparseColumn};
 
     const BIG: usize = 1 << 30;
 
@@ -1803,6 +1969,20 @@ mod column_tests {
             names.push(name);
             columns.push((kind, cells));
         }
+        let sparse: Option<Vec<Option<SparseVector>>> = (rng.below(3) == 0).then(|| {
+            (0..rows)
+                .map(|_| match rng.below(3) {
+                    0 => None,
+                    1 => Some(Vec::new()),
+                    _ => Some(
+                        (0..1 + rng.below(4))
+                            .map(|t| (t as u32 * 7, rng.float() as f32))
+                            .collect(),
+                    ),
+                })
+                .collect()
+        });
+
         let mut id_bytes = Vec::new();
         let mut id_offsets = vec![0u32];
         for id in &ids {
@@ -1813,6 +1993,22 @@ mod column_tests {
         for (name, (kind, cells)) in names.iter().zip(&columns) {
             cols = cols.with_attr(name.clone(), column(*kind, cells)).unwrap();
         }
+        if let Some(rows) = &sparse {
+            let (mut valid, mut offsets, mut terms, mut weights) =
+                (vec![], vec![0u32], vec![], vec![]);
+            for row in rows {
+                valid.push(row.is_some());
+                for &(t, w) in row.iter().flatten() {
+                    terms.push(t);
+                    weights.push(w);
+                }
+                offsets.push(terms.len() as u32);
+            }
+            cols = cols
+                .with_sparse(SparseColumn::new(valid, offsets, terms, weights).unwrap())
+                .unwrap();
+        }
+
         let ops = (0..rows)
             .map(|row| {
                 WalOp::Upsert(Document {
@@ -1825,6 +2021,7 @@ mod column_tests {
                         }
                         Value::Object(map)
                     }),
+                    sparse: sparse.as_ref().and_then(|rows| rows[row].clone()),
                 })
             })
             .collect();
@@ -1855,7 +2052,15 @@ mod column_tests {
             let size = columns_body_size(&cols);
             let (upserts, dim) = shape(&ops).unwrap();
             let attrs = attribute_json(&ops).unwrap();
-            assert_eq!(size, body_size(&ops, upserts, dim, &attrs), "seed {seed}");
+            let has_sparse = ops
+                .iter()
+                .any(|op| matches!(op, WalOp::Upsert(doc) if doc.sparse.is_some()));
+            let sparse = has_sparse.then(|| sparse_terms(&ops));
+            assert_eq!(
+                size,
+                body_size(&ops, upserts, dim, &attrs, sparse.as_deref()),
+                "seed {seed}"
+            );
             let at = usize::try_from(size).unwrap();
             assert!(matches!(
                 encode_columns(&cols, at - 1),

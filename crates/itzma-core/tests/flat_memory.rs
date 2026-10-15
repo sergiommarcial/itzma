@@ -56,6 +56,7 @@ async fn a_flat_query_does_not_allocate_per_document() {
                 })
                 .collect(),
             attrs: None,
+            sparse: None,
         })
         .collect();
     ns.upsert(docs).await.unwrap();
