@@ -39,7 +39,7 @@
 //!
 //! | Module | Job |
 //! |---|---|
-//! | [`namespace`] | The [`Namespace`] handle: create, open, upsert, delete (each also keyed), query, query_sparse, filter, index, compact, gc, maintain, recover |
+//! | [`namespace`] | The [`Namespace`] handle: create, open, upsert, delete (each also keyed), query, query_sparse, filter, index, index_sparse, compact, gc, maintain, recover |
 //! | [`document`] | [`Document`], [`WalOp`], [`Schema`], [`Metric`] |
 //! | [`attrs`] | [`AttrSchema`], [`AttrType`]: the typed attribute fields a namespace declares |
 //! | [`predicate`] | [`Predicate`]: a typed condition over attributes |
@@ -53,6 +53,7 @@
 //! | [`gc`] | [`GcOptions`], [`GcReport`] and the run behind [`Namespace::gc`] |
 //! | [`indexer`] | [`IndexOptions`], [`IndexReport`] and the run behind [`Namespace::index`] |
 //! | [`sparse`] | [`SparseVector`] storage beside a segment: `sparse.bin` |
+//! | [`sparse_indexer`] | [`IndexSparseOptions`], [`IndexSparseReport`] and the run behind [`Namespace::index_sparse`] |
 //! | [`maintain`] | [`MaintenanceOptions`] and the run behind [`Namespace::maintain`] |
 //! | [`columns`] | [`DocColumns`]: a batch of upserts held as columns, for Arrow input |
 //! | [`inspect`] | [`inspect::report`]: a read-only look at what a namespace holds and what looks wrong |
@@ -79,6 +80,7 @@
 //!   segments/<lo>-<hi>/data.bin    compacted data, named by the WAL range it covers
 //!   segments/<lo>-<hi>/index-<n>.bin an index of that segment, generation n, once `index` built one
 //!   segments/<lo>-<hi>/sparse.bin  the segment's sparse vectors, only if a document has one
+//!   segments/<lo>-<hi>/sparse-idx-<n>.bin its sparse inverted index, once `index_sparse` built one
 //! ```
 //!
 //! The manifest is JSON. WAL objects and segments are binary, and a WAL object
@@ -146,6 +148,8 @@ pub mod schema_object;
 pub mod search;
 pub mod segment;
 pub mod sparse;
+mod sparse_index;
+pub mod sparse_indexer;
 mod sparse_query;
 mod stream;
 mod view;
@@ -166,12 +170,13 @@ pub use filter::{FilterOptions, FilterPage, Row};
 pub use gc::{GcOptions, GcReport};
 pub use indexer::{IndexKind, IndexOptions, IndexReport};
 pub use maintain::{CompactTrigger, MaintenanceOptions, MaintenanceReport};
-pub use manifest::{IndexEntry, Manifest};
+pub use manifest::{IndexEntry, Manifest, SparseIndexEntry};
 pub use namespace::Namespace;
 pub use predicate::{AttrValue, Compare, Predicate, TextCompare};
 pub use query::{DEFAULT_RERANK, QueryOptions};
 pub use recover::RecoverReport;
 pub use search::Hit;
+pub use sparse_indexer::{IndexSparseOptions, IndexSparseReport};
 pub use sparse_query::SparseQueryOptions;
 pub use stream::{
     DEFAULT_STREAM_DEPTH, DEFAULT_STREAM_TARGET_BYTES, StreamError, StreamOptions, StreamReport,

@@ -35,6 +35,8 @@ use crate::recover::{self, RecoverReport};
 use crate::schema_object;
 use crate::search::Hit;
 use crate::segment;
+use crate::sparse_index;
+use crate::sparse_indexer::{self, IndexSparseOptions, IndexSparseReport};
 use crate::sparse_query::{self, SparseQueryOptions};
 use crate::stream::{self, StreamError, StreamOptions, StreamReport};
 use crate::view;
@@ -1052,6 +1054,95 @@ impl Namespace {
         Ok(report)
     }
 
+    /// Build and publish a sparse inverted index for each live segment that
+    /// has a `sparse.bin` and no sparse index yet. A segment with
+    /// no sparse documents has no `sparse.bin` and is skipped — there is
+    /// nothing to index. A segment with a sparse sidecar and no index is
+    /// still searchable by [`query_sparse`](Self::query_sparse), read whole;
+    /// the index only lets a query fetch the postings of its own terms
+    /// instead.
+    ///
+    /// Mirrors [`index`](Self::index)'s shape: one segment at a time, an
+    /// object written with put-if-absent, one manifest compare-and-swap.
+    /// [`IndexSparseOptions::rebuild`] writes generation `n + 1` for a
+    /// segment that already has generation `n`; the old object is left for
+    /// [`gc`](Self::gc), which removes sparse index objects no manifest names
+    /// once they are `min_age` old. A fold or merge (`compact`) never builds
+    /// one, and a merge drops the entries of the segments it retires.
+    ///
+    /// Needs conditional update on the store, like `compact`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ItzmaError::CorruptSegment`] if a `sparse.bin` is damaged. A
+    ///   segment a compaction and a garbage collection removed after this
+    ///   call loaded the manifest is counted as
+    ///   [`superseded`](IndexSparseReport::superseded) instead.
+    /// - [`ItzmaError::CorruptSparseIndex`] if an object already sits at the
+    ///   new index's key and does not fit the segment. Delete it and rerun.
+    /// - [`ItzmaError::ReadBudgetExceeded`] if one `sparse.bin` is bigger
+    ///   than the read budget.
+    /// - [`ItzmaError::ManifestContention`] after 32 lost publish rounds.
+    /// - Anything [`manifest::load`] can return.
+    ///
+    /// A failure part way leaves the segments before it indexed. Call again
+    /// to finish.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[tokio::main]
+    /// # async fn main() -> itzma_core::Result<()> {
+    /// use std::sync::Arc;
+    ///
+    /// use itzma_core::{CompactionOptions, Document, IndexSparseOptions, Metric, Namespace, Schema};
+    /// use object_store::memory::InMemory;
+    ///
+    /// let store = Arc::new(InMemory::new());
+    /// let ns = Namespace::create(store, "docs", Schema::new(1, Metric::L2)).await?;
+    /// ns.upsert(vec![Document {
+    ///     id: "a".into(),
+    ///     vector: vec![1.0],
+    ///     attrs: None,
+    ///     sparse: Some(vec![(7, 0.5)]),
+    /// }])
+    /// .await?;
+    /// ns.compact(&CompactionOptions::default()).await?;
+    ///
+    /// let report = ns.index_sparse(&IndexSparseOptions::default()).await?;
+    /// assert_eq!(report.indexed, 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn index_sparse(&self, options: &IndexSparseOptions) -> Result<IndexSparseReport> {
+        let manifest = self.load_manifest().await?;
+        let mut report = IndexSparseReport::default();
+        for id in &manifest.live_segments {
+            let outcome = sparse_indexer::index_segment(
+                &*self.store,
+                &self.id,
+                id,
+                manifest.sparse_indexes.get(id),
+                options,
+                self.read_budget,
+                &self.fetch_policy,
+            )
+            .await;
+            let outcome = match outcome {
+                // The segment is gone because a merge and a collection ran
+                // after the manifest was loaded. If the manifest has not
+                // moved, it is really missing and that is the error.
+                Err(err) if is_stale_read(&err) => {
+                    self.reload_if_moved(&manifest, err).await?;
+                    sparse_indexer::Outcome::Superseded
+                }
+                other => other?,
+            };
+            report.record(outcome);
+        }
+        Ok(report)
+    }
+
     /// Delete the segments that a merge or a later fold has superseded, and
     /// the orphans that can no longer be reused (phase A). With
     /// [`GcOptions::fence_wal`] it also replaces folded WAL objects with fences
@@ -1554,8 +1645,11 @@ impl Namespace {
     ///
     /// Shadowing works as it does for [`query_with`](Self::query_with): the
     /// newest version of an id decides, so an overwrite or a delete hides the
-    /// older document's sparse vector. The segments and the WAL tail are read
-    /// whole and scored directly. Reads go through the
+    /// older document's sparse vector. A segment with a sparse index
+    /// ([`index_sparse`](Self::index_sparse)) is read in pieces, fetching only
+    /// the postings of the query's own terms. Every other segment, and the WAL
+    /// tail, is read whole and scored directly, so an unindexed namespace
+    /// gives the same answer, only at a higher cost. Reads go through the
     /// handle's cache if [`with_cache`](Self::with_cache) set one, and are
     /// bounded by the read budget.
     ///
@@ -1564,6 +1658,10 @@ impl Namespace {
     /// - [`ItzmaError::InvalidQuery`] for a `top_k` of zero, an empty `query`
     ///   or a non-finite weight in it, before any storage call.
     /// - [`ItzmaError::CorruptSegment`] for a damaged `sparse.bin`.
+    /// - [`ItzmaError::CorruptSparseIndex`] for a damaged sparse index, or one
+    ///   that named a row past its segment. A query never falls back to a flat
+    ///   scan over one; [`index_sparse`](Self::index_sparse) with `rebuild`
+    ///   replaces it.
     /// - [`ItzmaError::ReadBudgetExceeded`] and the other errors of
     ///   [`query`](Self::query).
     ///
@@ -1605,6 +1703,7 @@ impl Namespace {
         let mut budget = ReadBudget::new(self.read_budget);
         let mut plan = self.views.plan(&self.reader(&budget)).await?;
         let mut attempt = 1;
+        let decoded = self.decoded();
         loop {
             let q = sparse_query::Query {
                 store: &*self.query_store,
@@ -1615,6 +1714,7 @@ impl Namespace {
                 filter: options.filter.as_ref(),
                 budget: &budget,
                 policy: &self.fetch_policy,
+                decoded: decoded.as_ref(),
             };
             let reader = self.reader(&budget);
             let tail = self.views.tail(&reader, &plan);
@@ -1787,7 +1887,10 @@ impl Namespace {
 /// can meet any of the three. All of them mean "reload and look again" before
 /// they mean damage.
 pub(crate) fn is_stale_read(err: &ItzmaError) -> bool {
-    segment::is_missing(err) || index::is_missing(err) || wal_codec::is_fenced(err)
+    segment::is_missing(err)
+        || index::is_missing(err)
+        || sparse_index::is_missing(err)
+        || wal_codec::is_fenced(err)
 }
 
 /// Whether any upsert in `ops` carries a sparse vector — such a

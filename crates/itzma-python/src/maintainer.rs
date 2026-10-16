@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use itzma_core::{IndexOptions, MaintenanceOptions, Namespace};
+use itzma_core::{IndexOptions, IndexSparseOptions, MaintenanceOptions, Namespace};
 use pyo3::prelude::*;
 use serde_json::Value;
 use tokio::task::AbortHandle;
@@ -18,7 +18,7 @@ use crate::{reports, runtime};
 pub(crate) struct Plan {
     pub(crate) every: Duration,
     pub(crate) maintain: MaintenanceOptions,
-    pub(crate) index: Option<IndexOptions>,
+    pub(crate) index: Option<(IndexOptions, IndexSparseOptions)>,
 }
 
 #[derive(Default)]
@@ -87,28 +87,37 @@ async fn tick(ns: &Namespace, plan: &Plan) -> (Option<String>, Option<String>) {
         .map(|r| reports::maintenance(&r))
         .map_err(|e| e.to_string());
     let indexed = match (&maintained, &plan.index) {
-        (Ok(_), Some(index)) => Some(
-            ns.index(index)
-                .await
-                .map(|r| serde_json::to_value(r).unwrap_or_default())
-                .map_err(|e| e.to_string()),
-        ),
+        (Ok(_), Some((index, sparse))) => Some(index_both(ns, index, sparse).await),
         _ => None,
     };
     outcome(maintained, indexed)
 }
 
+async fn index_both(
+    ns: &Namespace,
+    index: &IndexOptions,
+    sparse: &IndexSparseOptions,
+) -> Result<(Value, Value), String> {
+    let dense = ns.index(index).await.map_err(|e| e.to_string())?;
+    let sparse = ns.index_sparse(sparse).await.map_err(|e| e.to_string())?;
+    Ok((
+        serde_json::to_value(dense).unwrap_or_default(),
+        serde_json::to_value(sparse).unwrap_or_default(),
+    ))
+}
+
 fn outcome(
     maintained: Result<Value, String>,
-    indexed: Option<Result<Value, String>>,
+    indexed: Option<Result<(Value, Value), String>>,
 ) -> (Option<String>, Option<String>) {
     let mut report = match maintained {
         Ok(report) => report,
         Err(e) => return (None, Some(e)),
     };
     let error = match indexed {
-        Some(Ok(index)) => {
-            report["index"] = index;
+        Some(Ok((dense, sparse))) => {
+            report["index"] = dense;
+            report["index_sparse"] = sparse;
             None
         }
         Some(Err(e)) => Some(e),
@@ -186,15 +195,16 @@ mod tests {
     }
 
     #[test]
-    fn the_index_report_joins_the_maintain_report() {
+    fn index_reports_join_the_maintain_report() {
         let (report, error) = outcome(
             Ok(json!({"tail_objects": 1})),
-            Some(Ok(json!({"indexed": 1}))),
+            Some(Ok((json!({"indexed": 1}), json!({"indexed": 0})))),
         );
         assert_eq!(error, None);
         let report: serde_json::Value =
             serde_json::from_str(&report.expect("report")).expect("json");
         assert_eq!(report["index"]["indexed"], 1);
+        assert_eq!(report["index_sparse"]["indexed"], 0);
     }
 
     #[test]

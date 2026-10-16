@@ -20,6 +20,7 @@ for hit in hits:
     # distance is the negated dot product, so best first still means lowest.
     print(hit.id, round(-hit.distance, 3))
 
-# Fold the log into a segment; answers stay the same.
+# Fold the log into a segment and give it an inverted index; answers stay the same.
 ns.compact()
+print(ns.index_sparse())
 print(ns.query_sparse([(3, 1.0), (2, 0.5)], top_k=3).ids)

@@ -76,7 +76,7 @@ m = ns.start_maintenance(timedelta(seconds=60))  # maintain + index every minute
 m.stop()  # or ns.close()
 ```
 
-`ns.index()` builds HNSW by default; pass `kind="sq8"` for SQ8, which reads only the partitions a query probes and suits uncached reads.
+`ns.index()` builds HNSW by default; pass `kind="sq8"` for SQ8, which reads only the partitions a query probes and suits uncached reads. `ns.index_sparse()` builds the sparse inverted index.
 
 Errors are logged to the `itzma.maintenance` logger and kept in `m.last_error`; the loop keeps going. A `file://` store has no conditional update, so compaction and indexing fail there with `StoreError`; use S3 or `memory://` for those.
 

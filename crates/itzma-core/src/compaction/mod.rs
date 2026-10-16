@@ -392,6 +392,8 @@ pub(crate) async fn run(
                 // it. Every new segment starts without one.
                 let live_set: HashSet<&str> = m.live_segments.iter().map(String::as_str).collect();
                 m.indexes.retain(|id, _| live_set.contains(id.as_str()));
+                m.sparse_indexes
+                    .retain(|id, _| live_set.contains(id.as_str()));
                 true
             })
             .await?;

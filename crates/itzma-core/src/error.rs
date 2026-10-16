@@ -260,6 +260,20 @@ pub enum ItzmaError {
         reason: String,
     },
 
+    /// A sparse inverted-index object cannot be used: it is truncated, has
+    /// the wrong magic, counts or offsets that disagree with each other, or
+    /// a row count that differs from the segment it was built for. A query
+    /// never falls back to a flat scan over one, and
+    /// [`Namespace::index_sparse`](crate::Namespace::index_sparse) with
+    /// `rebuild` replaces it.
+    #[error("corrupt sparse index {path}: {reason}")]
+    CorruptSparseIndex {
+        /// Object key of the index, or `"(encoding)"` on the write side.
+        path: String,
+        /// What is wrong with it.
+        reason: String,
+    },
+
     /// A binary WAL object (format version 2) cannot be used: it is
     /// truncated, names an unknown codec, disagrees with its own lengths or
     /// counts, holds a ZSTD frame that does not match its header, has invalid

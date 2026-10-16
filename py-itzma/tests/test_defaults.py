@@ -40,6 +40,7 @@ EXPECTED: dict[tuple[str, str], Any] = {
     ("index", "min_rows"): D["index"]["min_rows"],
     ("index", "nlist"): D["index"]["nlist"],
     ("index", "rebuild"): D["index"]["rebuild"],
+    ("index_sparse", "rebuild"): D["index_sparse"]["rebuild"],
     ("compact", "max_segments"): D["compaction"]["max_segments"],
     ("compact", "max_segment_bytes"): D["compaction"]["max_segment_bytes"],
     ("gc", "min_age"): D["gc"]["min_age_secs"],

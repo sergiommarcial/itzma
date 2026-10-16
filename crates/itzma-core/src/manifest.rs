@@ -50,7 +50,8 @@ pub const MAX_UPDATE_ATTEMPTS: u32 = 32;
 ///   "wal_folded_through": 0,
 ///   "wal_format": 5,
 ///   "segment_format": 2,
-///   "indexes": {}
+///   "indexes": {},
+///   "sparse_indexes": {}
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -95,6 +96,12 @@ pub struct Manifest {
     /// entry when it retires the segment, and nothing else depends on it.
     #[serde(default)]
     pub indexes: BTreeMap<String, IndexEntry>,
+    /// The sparse inverted index built for each live segment that has one,
+    /// by segment id. A segment not listed here has no sparse
+    /// index — it may still have `sparse.bin` and be searched flat by
+    /// `Namespace::query_sparse`. A manifest without the field has none.
+    #[serde(default)]
+    pub sparse_indexes: BTreeMap<String, SparseIndexEntry>,
 }
 
 /// Which index object belongs to a segment: the object is
@@ -114,6 +121,21 @@ pub struct IndexEntry {
     pub kind: String,
 }
 
+/// Which sparse inverted-index object belongs to a segment: the object is
+/// `segments/<id>/sparse-idx-<generation>.bin`. Unlike
+/// [`IndexEntry`] there is no `kind` — one algorithm, an inverted index over
+/// term-weight pairs.
+///
+/// JSON form: `{"gen": 1}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SparseIndexEntry {
+    /// Starts at 1 and goes up by one each time the segment's sparse index is
+    /// rebuilt, so a rebuild never overwrites the object a reader may be
+    /// using.
+    #[serde(rename = "gen")]
+    pub generation: u32,
+}
+
 impl Manifest {
     /// A fresh manifest for a new namespace: current format version, no
     /// segments, nothing folded, the newest WAL format this build writes and
@@ -127,6 +149,7 @@ impl Manifest {
             wal_format: wal::FORMAT_VERSION,
             segment_format: segment::DEFAULT_FORMAT,
             indexes: BTreeMap::new(),
+            sparse_indexes: BTreeMap::new(),
         }
     }
 }

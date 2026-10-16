@@ -9,7 +9,7 @@ uv run python examples/quickstart.py
 - `quickstart.py`: create a namespace, write, query with a filter, open it again.
 - `filters.py`: every kind of condition, the null rule, and paging with `filter()`.
 - `bulk_load.py`: loading from numpy, pyarrow and Polars, and a keyed write that is safe to retry.
-- `sparse.py`: sparse (term id, weight) vectors.
+- `sparse.py`: sparse (term id, weight) vectors and their index.
 - `maintenance.py`: `compact`, `index`, `gc` and `maintain` by hand, then the background maintainer.
 - `asyncio_queries.py`: `AsyncNamespace` with many queries in flight.
 

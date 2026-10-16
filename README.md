@@ -25,7 +25,7 @@ It is a library. You embed it in your process, open a namespace, and S3 (or a lo
 
 - Namespaces with a fixed dimension and metric (L2, cosine, dot product).
 - Dense vector search, exact or through an index: HNSW (the default) or SQ8 with clustered partitions.
-- Sparse vectors (term id, weight) beside the dense one, with an exact sparse query.
+- Sparse vectors (term id, weight) beside the dense one, with an exact sparse query and an optional inverted index.
 - Typed attributes, declared at create, and filtering on them, alone or narrowing a vector query.
 - Batched upserts and deletes, safe with many concurrent writers, with optional idempotency keys.
 - S3 (and anything else `object_store` supports), local disk and in-memory stores.
@@ -177,6 +177,8 @@ A document can carry a sparse vector beside its dense one: `Document::sparse`, a
 
 `Namespace::query_sparse(&terms, top_k, &SparseQueryOptions)` is exact and standalone: the score is the dot product, `Hit.distance` its negation, ties broken by id. It takes a `filter` like `query_with`. Shadowing across segments and the tail works as for dense queries.
 
+`Namespace::index_sparse(&IndexSparseOptions)` builds an inverted index per segment (`sparse-idx-<n>.bin`), so a query reads only its own terms' postings instead of every sparse vector. The answer is the same with or without it.
+
 A batch with a sparse vector is written as WAL version 4 (5 with a key), which needs the namespace at WAL level 5. New namespaces start there; an older one needs `upgrade_wal_format(5)`.
 
 ## Compaction, garbage collection and maintenance
@@ -187,7 +189,7 @@ A batch with a sparse vector is written as WAL version 4 (5 with a key), which n
 
 **`maintain`** is the one call to schedule (from cron, a loop, a worker): it compacts when the tail is long enough (64 objects, 64 MiB, or an optional age) or there are too many segments, then runs `gc`. The library starts no background task itself; the Python bridge has an optional maintainer.
 
-**`recover`** writes a new manifest for a namespace that lost its own, from `schema.json`, the segment names and the WAL. It refuses if a manifest exists, and stops with `Unrecoverable` and the keys to restore if a range has no readable copy. It does not restore indexes; run `index` again.
+**`recover`** writes a new manifest for a namespace that lost its own, from `schema.json`, the segment names and the WAL. It refuses if a manifest exists, and stops with `Unrecoverable` and the keys to restore if a range has no readable copy. It does not restore indexes; run `index` and `index_sparse` again.
 
 **Format levels.** The manifest records the newest WAL and segment formats the namespace may hold. A build that reads less refuses the namespace before touching it. `upgrade_wal_format(level)` and `upgrade_segment_format(level)` raise a level, one way. New namespaces start at WAL level 5 and segment level 2; `upgrade_segment_format(3)` turns on the typed attribute columns of segment format 3.
 
@@ -234,6 +236,7 @@ Not guaranteed: exactly-once for plain writes (see [Writing](#writing)), and key
   segments/<lo>-<hi>/data.bin         a segment, named by the WAL range it covers
   segments/<lo>-<hi>/index-<n>.bin    its dense index (HNSW or SQ8), generation n
   segments/<lo>-<hi>/sparse.bin       its sparse vectors, only if a document has one
+  segments/<lo>-<hi>/sparse-idx-<n>.bin its sparse inverted index, generation n
   segments/<lo>-<hi>/generation       the highest index generation ever used
   gc/fenced-through                   a hint for gc, only with fence_wal
 ```
@@ -247,6 +250,7 @@ Not guaranteed: exactly-once for plain writes (see [Writing](#writing)), and key
 | Segment | `ITZS`, ending in `ITZE` | 2 (block-addressable, Bloom filter); 3 adds typed attribute columns and zone maps |
 | Sparse vectors (`sparse.bin`) | `ITZS` | 1 |
 | Index | `ITZI` | 1, kind 1 (SQ8) or 2 (HNSW) |
+| Sparse index | `ITZP` | 1 |
 
 A reader that meets a version or kind it does not know refuses it instead of guessing; a segment whose index kind is unknown is scanned flat.
 
@@ -266,7 +270,7 @@ Every fallible call returns `itzma_core::Result<T>` with `ItzmaError`, which is 
 | `ReadBudgetExceeded` | a read past the handle's budget |
 | `WalFormatTooNew`, `SegmentFormatTooNew` | the namespace is at a level this build does not read; upgrade the build |
 | `WalFormatTooOld`, `SegmentFormatTooOld` | the call needs a higher level; run the matching `upgrade_*` |
-| `CorruptWal`, `CorruptSegment`, `CorruptIndex`, `CorruptManifest` | an object is damaged or does not match; a query never falls back to a flat scan over a damaged index |
+| `CorruptWal`, `CorruptSegment`, `CorruptIndex`, `CorruptSparseIndex`, `CorruptManifest` | an object is damaged or does not match; a query never falls back to a flat scan over a damaged index |
 | `ManifestExists`, `Unrecoverable` | from `recover` |
 | `Storage` | the backend failed |
 

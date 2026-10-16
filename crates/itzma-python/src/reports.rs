@@ -1,5 +1,5 @@
-//! Core reports as JSON, for the Python dataclasses. `IndexReport` is serde
-//! already; these three are not.
+//! Core reports as JSON, for the Python dataclasses. `IndexReport` and
+//! `IndexSparseReport` are serde already; these three are not.
 
 use itzma_core::{Compaction, GcReport, MaintenanceReport};
 use serde_json::{Value, json};
@@ -35,6 +35,8 @@ pub(crate) fn gc(r: &GcReport) -> Value {
         "wal_too_young": r.wal_too_young,
         "indexes_deleted": r.indexes_deleted,
         "indexes_too_young": r.indexes_too_young,
+        "sparse_indexes_deleted": r.sparse_indexes_deleted,
+        "sparse_indexes_too_young": r.sparse_indexes_too_young,
     })
 }
 

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use itzma_core::{
     CompactionOptions, DEFAULT_RAM_MAX_BYTES, DEFAULT_READ_BUDGET, FetchPolicy, FilterOptions,
-    GcOptions, IndexOptions, MaintenanceOptions, QueryOptions, StreamOptions,
+    GcOptions, IndexOptions, IndexSparseOptions, MaintenanceOptions, QueryOptions, StreamOptions,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -171,6 +171,7 @@ pub(crate) fn defaults() -> Value {
         "query": serde_json::to_value(QueryOptions::default()).unwrap_or_default(),
         "filter": serde_json::to_value(FilterOptions::default()).unwrap_or_default(),
         "index": serde_json::to_value(IndexOptions::default()).unwrap_or_default(),
+        "index_sparse": serde_json::to_value(IndexSparseOptions::default()).unwrap_or_default(),
         "compaction": compaction_json(&CompactionOptions::default()),
         "gc": gc_json(&GcOptions::default()),
         "maintain": {

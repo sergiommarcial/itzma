@@ -12,8 +12,9 @@ use std::sync::Arc;
 use common::faulty::{Fault, FaultyStore};
 use common::{Lcg, cas_backends, doc, naive_top_k};
 use itzma_core::{
-    AttrSchema, AttrType, CompactionOptions, Compare, Document, IndexOptions, ItzmaError, Metric,
-    Namespace, Predicate, QueryOptions, Schema, SparseQueryOptions, SparseVector,
+    AttrSchema, AttrType, CompactionOptions, Compare, Document, IndexOptions, IndexSparseOptions,
+    ItzmaError, Metric, Namespace, Predicate, QueryOptions, Schema, SparseQueryOptions,
+    SparseVector,
 };
 use object_store::{ObjectStore, ObjectStoreExt};
 use serde_json::json;
@@ -381,6 +382,9 @@ async fn a_filtered_sparse_query_equals_filter_then_rank_at_every_stage() {
         ns.compact(&ROOMY).await.unwrap();
         assert_sparse_matches_naive(&ns, &state_of(&batches)).await;
 
+        ns.index_sparse(&IndexSparseOptions::default())
+            .await
+            .unwrap();
         assert_sparse_matches_naive(&ns, &state_of(&batches)).await;
 
         let second = vec![
@@ -398,12 +402,18 @@ async fn a_filtered_sparse_query_equals_filter_then_rank_at_every_stage() {
         // with a delete from the tail above them.
         ns.compact(&ROOMY).await.unwrap();
         assert_sparse_matches_naive(&ns, &state).await;
+        ns.index_sparse(&IndexSparseOptions::default())
+            .await
+            .unwrap();
         assert_sparse_matches_naive(&ns, &state).await;
         ns.delete(vec!["d003".into()]).await.unwrap();
         state.remove("d003");
         assert_sparse_matches_naive(&ns, &state).await;
 
         ns.compact(&TIGHT).await.unwrap();
+        ns.index_sparse(&IndexSparseOptions::default())
+            .await
+            .unwrap();
         assert_sparse_matches_naive(&ns, &state).await;
     }
 }
@@ -420,6 +430,9 @@ async fn a_sparse_filter_matching_few_documents_returns_exactly_those() {
             .collect();
         ns.upsert(batch).await.unwrap();
         ns.compact(&ROOMY).await.unwrap();
+        ns.index_sparse(&IndexSparseOptions::default())
+            .await
+            .unwrap();
 
         let options = SparseQueryOptions::default().filter(Some(cheap()));
         let hits = ns
@@ -467,6 +480,9 @@ async fn indexed_namespace(store: Arc<dyn ObjectStore>) -> Namespace {
     ns.upsert(batch).await.unwrap();
     ns.compact(&ROOMY).await.unwrap();
     ns.index(&every()).await.unwrap();
+    ns.index_sparse(&IndexSparseOptions::default())
+        .await
+        .unwrap();
     ns
 }
 

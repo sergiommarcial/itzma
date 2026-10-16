@@ -7,7 +7,7 @@ from itzma.reports import MaintenanceReport, parse_maintenance
 
 
 class Maintainer:
-    """Runs ``maintain`` (and, if asked, ``index``) every so often.
+    """Runs ``maintain`` (and, if asked, ``index`` and ``index_sparse``) every so often.
 
     Errors are logged to the ``itzma.maintenance`` logger and kept in
     ``last_error``; the loop keeps going. It stops on ``stop()``, on the

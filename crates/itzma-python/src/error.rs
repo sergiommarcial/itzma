@@ -181,6 +181,7 @@ pub(crate) fn classify(e: &Core) -> (Kind, Fields) {
         ),
         Core::CorruptSegment { path, reason } => corrupt("segment", path, reason),
         Core::CorruptIndex { path, reason } => corrupt("index", path, reason),
+        Core::CorruptSparseIndex { path, reason } => corrupt("sparse_index", path, reason),
         Core::CorruptWal { path, reason } => corrupt("wal", path, reason),
         Core::CorruptManifest(reason) => corrupt("manifest", "", reason),
         Core::KeyConflict { key } => (Kind::KeyConflict, vec![("key", Text(key.clone()))]),
@@ -337,6 +338,10 @@ mod tests {
                 reason: "r".into(),
             },
             Core::CorruptIndex {
+                path: "p".into(),
+                reason: "r".into(),
+            },
+            Core::CorruptSparseIndex {
                 path: "p".into(),
                 reason: "r".into(),
             },

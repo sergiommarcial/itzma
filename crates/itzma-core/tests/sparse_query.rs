@@ -1,6 +1,6 @@
 //! `Namespace::query_sparse`: equality with a naive scan at every
-//! stage a namespace goes through (tail only, folded, merged, mixed), and
-//! shadowing by overwrites and deletes.
+//! stage a namespace goes through (tail only, folded, indexed, merged, mixed),
+//! shadowing by overwrites and deletes, damage, and the read budget.
 
 mod common;
 
@@ -11,9 +11,11 @@ use std::sync::Arc;
 
 use common::{Lcg, cas_backends, doc, schema};
 use itzma_core::{
-    CompactionOptions, Document, ItzmaError, Metric, Namespace, SparseQueryOptions, SparseVector,
+    CompactionOptions, Document, IndexSparseOptions, ItzmaError, Metric, Namespace,
+    SparseQueryOptions, SparseVector, segment,
 };
-use object_store::ObjectStore;
+use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt};
 
 const ROOMY: CompactionOptions = CompactionOptions {
     max_segments: 8,
@@ -83,7 +85,7 @@ fn naive(
 }
 
 #[tokio::test]
-async fn the_same_answer_in_the_tail_and_folded() {
+async fn the_same_answer_in_the_tail_folded_and_indexed() {
     for backend in cas_backends() {
         let ns = create(backend.store.clone()).await;
         ns.upsert(vec![
@@ -101,24 +103,35 @@ async fn the_same_answer_in_the_tail_and_folded() {
         assert_eq!(ids(&ns, &query, 10).await, want, "{} tail", backend.name);
         ns.compact(&ROOMY).await.expect("compact");
         assert_eq!(ids(&ns, &query, 10).await, want, "{} folded", backend.name);
+        ns.index_sparse(&IndexSparseOptions::default())
+            .await
+            .expect("index_sparse");
+        assert_eq!(ids(&ns, &query, 10).await, want, "{} indexed", backend.name);
     }
 }
 
 #[tokio::test]
 async fn hits_carry_the_negated_score_and_the_attributes() {
-    let ns = create(common::memory()).await;
-    let mut d = sdoc("a", &[(1, 2.0), (2, 1.0)]);
-    d.attrs = Some(serde_json::json!({"title": "cats"}));
-    ns.upsert(vec![d]).await.expect("upsert");
-    ns.compact(&ROOMY).await.expect("compact");
+    for indexed in [false, true] {
+        let ns = create(common::memory()).await;
+        let mut d = sdoc("a", &[(1, 2.0), (2, 1.0)]);
+        d.attrs = Some(serde_json::json!({"title": "cats"}));
+        ns.upsert(vec![d]).await.expect("upsert");
+        ns.compact(&ROOMY).await.expect("compact");
+        if indexed {
+            ns.index_sparse(&IndexSparseOptions::default())
+                .await
+                .expect("index_sparse");
+        }
 
-    let hits = ns
-        .query_sparse(&vec![(1, 1.5), (2, 1.0)], 1, &SparseQueryOptions::default())
-        .await
-        .expect("query_sparse");
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].distance, -4.0);
-    assert_eq!(hits[0].attrs, Some(serde_json::json!({"title": "cats"})));
+        let hits = ns
+            .query_sparse(&vec![(1, 1.5), (2, 1.0)], 1, &SparseQueryOptions::default())
+            .await
+            .expect("query_sparse");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].distance, -4.0, "indexed: {indexed}");
+        assert_eq!(hits[0].attrs, Some(serde_json::json!({"title": "cats"})));
+    }
 }
 
 #[tokio::test]
@@ -148,13 +161,16 @@ async fn top_k_truncates_and_ties_break_by_id() {
 }
 
 #[tokio::test]
-async fn an_overwrite_or_a_delete_shadows_an_older_match() {
+async fn an_overwrite_or_a_delete_shadows_an_older_indexed_match() {
     for backend in cas_backends() {
         let ns = create(backend.store.clone()).await;
         ns.upsert(vec![sdoc("a", &[(3, 1.0)]), sdoc("b", &[(3, 0.5)])])
             .await
             .expect("upsert");
         ns.compact(&ROOMY).await.expect("compact");
+        ns.index_sparse(&IndexSparseOptions::default())
+            .await
+            .expect("index_sparse");
         let query: SparseVector = vec![(3, 1.0)];
         assert_eq!(ids(&ns, &query, 10).await, ["a", "b"]);
 
@@ -188,7 +204,7 @@ async fn an_overwrite_or_a_delete_shadows_an_older_match() {
 }
 
 #[tokio::test]
-async fn a_mix_of_segments_and_tail_sources_agrees_with_a_naive_scan() {
+async fn a_mix_of_indexed_unindexed_and_tail_sources_agrees_with_a_naive_scan() {
     let ns = create(common::memory()).await;
     let mut model: BTreeMap<String, Option<SparseVector>> = BTreeMap::new();
     let mut put = |id: &str, terms: &[(u32, f32)]| {
@@ -200,6 +216,9 @@ async fn a_mix_of_segments_and_tail_sources_agrees_with_a_naive_scan() {
         .await
         .expect("upsert");
     ns.compact(&ROOMY).await.expect("first fold");
+    ns.index_sparse(&IndexSparseOptions::default())
+        .await
+        .expect("index the first segment");
 
     ns.upsert(vec![put("c", &[(2, 3.0)]), put("a", &[(2, 0.5)])])
         .await
@@ -264,7 +283,12 @@ async fn random_history(raise_to_3: bool) {
                     let opts = if rng.below(2) == 0 { ROOMY } else { TIGHT };
                     ns.compact(&opts).await.expect("compact");
                 }
-                _ => {}
+                _ => {
+                    let rebuild = rng.below(3) == 0;
+                    ns.index_sparse(&IndexSparseOptions::default().rebuild(rebuild))
+                        .await
+                        .expect("index_sparse");
+                }
             }
 
             let query: SparseVector = (0..1 + rng.below(3))
@@ -338,6 +362,174 @@ async fn an_upsert_with_a_bad_sparse_vector_is_refused_and_writes_nothing() {
         assert!(matches!(err, ItzmaError::InvalidVector(_)), "{err:?}");
     }
     assert_eq!(common::snapshot(&*store).await, before);
+}
+
+#[tokio::test]
+async fn a_damaged_sparse_index_is_an_error_not_a_flat_fallback() {
+    let store = common::memory();
+    let ns = create(store.clone()).await;
+    ns.upsert(vec![sdoc("a", &[(3, 1.0)])])
+        .await
+        .expect("upsert");
+    ns.compact(&ROOMY).await.expect("compact");
+    ns.index_sparse(&IndexSparseOptions::default())
+        .await
+        .expect("index_sparse");
+
+    let id = segment::segment_id(1, 1);
+    let path = Path::from(format!("docs/segments/{id}/sparse-idx-1.bin"));
+    store
+        .put(&path, bytes::Bytes::from_static(b"garbage").into())
+        .await
+        .expect("damage");
+
+    let err = ns
+        .query_sparse(&vec![(3, 1.0)], 1, &SparseQueryOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ItzmaError::CorruptSparseIndex { .. }),
+        "{err:?}"
+    );
+
+    // Rebuilding replaces it with a new generation, and the query works again.
+    ns.index_sparse(&IndexSparseOptions::default().rebuild(true))
+        .await
+        .expect("rebuild");
+    assert_eq!(ids(&ns, &vec![(3, 1.0)], 1).await, ["a"]);
+}
+
+#[tokio::test]
+async fn a_missing_sparse_index_under_an_unchanged_manifest_is_an_error() {
+    let store = common::memory();
+    let ns = create(store.clone()).await;
+    ns.upsert(vec![sdoc("a", &[(3, 1.0)])])
+        .await
+        .expect("upsert");
+    ns.compact(&ROOMY).await.expect("compact");
+    ns.index_sparse(&IndexSparseOptions::default())
+        .await
+        .expect("index_sparse");
+
+    let id = segment::segment_id(1, 1);
+    store
+        .delete(&Path::from(format!("docs/segments/{id}/sparse-idx-1.bin")))
+        .await
+        .expect("delete");
+
+    let err = ns
+        .query_sparse(&vec![(3, 1.0)], 1, &SparseQueryOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ItzmaError::CorruptSparseIndex { .. }),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_indexed_query_fits_a_budget_that_a_whole_read_does_not() {
+    let store = common::memory();
+    let ns = Namespace::create(store.clone(), "docs", schema(64, Metric::L2))
+        .await
+        .expect("create")
+        .with_fetch_policy(itzma_core::FetchPolicy::local());
+    let mut rng = Lcg(3);
+    let docs: Vec<Document> = (0..2000)
+        .map(|i| Document {
+            id: format!("d{i:05}"),
+            vector: rng.vector(64),
+            attrs: None,
+            sparse: Some(vec![(i as u32 % 50, 1.0)]),
+        })
+        .collect();
+    ns.upsert(docs).await.expect("upsert");
+    ns.compact(&ROOMY).await.expect("compact");
+    ns.index_sparse(&IndexSparseOptions::default())
+        .await
+        .expect("index_sparse");
+
+    // The data object alone is about half a megabyte.
+    let small = Namespace::open(store.clone(), "docs")
+        .await
+        .expect("open")
+        .with_read_budget(300_000)
+        .with_fetch_policy(itzma_core::FetchPolicy::local());
+    let hits = small
+        .query_sparse(&vec![(7, 1.0)], 5, &SparseQueryOptions::default())
+        .await
+        .expect("an indexed query must fit");
+    assert_eq!(hits.len(), 5);
+
+    // The same namespace unindexed needs the whole sidecar and data object.
+    ns.index_sparse(&IndexSparseOptions::default())
+        .await
+        .expect("noop");
+    itzma_core::manifest::update(&*store, "docs", |m| m.sparse_indexes.clear())
+        .await
+        .expect("drop the entry");
+    let err = small
+        .query_sparse(&vec![(7, 1.0)], 5, &SparseQueryOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ItzmaError::ReadBudgetExceeded { .. }),
+        "{err:?}"
+    );
+}
+
+/// Ids are resolved down the ranking in growing chunks, so a tie at the
+/// `top_k`th score has to be followed past the first chunk.
+#[tokio::test]
+async fn a_tie_at_the_cut_off_is_resolved_by_id_across_chunks() {
+    for backend in cas_backends() {
+        let ns = create(backend.store.clone()).await;
+        let mut docs: Vec<Document> = (0..600)
+            .map(|i| sdoc(&format!("d{i:03}"), &[(1, 1.0)]))
+            .collect();
+        docs.push(sdoc("z", &[(1, 2.0)]));
+        ns.upsert(docs).await.expect("upsert");
+        ns.compact(&ROOMY).await.expect("compact");
+        ns.index_sparse(&IndexSparseOptions::default())
+            .await
+            .expect("index_sparse");
+
+        assert_eq!(
+            ids(&ns, &vec![(1, 1.0)], 3).await,
+            ["z", "d000", "d001"],
+            "{}",
+            backend.name
+        );
+    }
+}
+
+/// The best-scoring rows of an indexed segment are all overwritten by a newer
+/// source, so the answer lies far down the ranking, past several chunks.
+#[tokio::test]
+async fn a_deeply_shadowed_ranking_still_gives_the_exact_answer() {
+    for backend in cas_backends() {
+        let ns = create(backend.store.clone()).await;
+        let docs: Vec<Document> = (0..300)
+            .map(|i| sdoc(&format!("d{i:03}"), &[(1, 1.0 + i as f32 * 0.25)]))
+            .collect();
+        ns.upsert(docs).await.expect("upsert");
+        ns.compact(&ROOMY).await.expect("compact");
+        ns.index_sparse(&IndexSparseOptions::default())
+            .await
+            .expect("index_sparse");
+        // The 150 highest scores now hold no term, and the tail says so.
+        let replaced: Vec<Document> = (150..300)
+            .map(|i| sdoc(&format!("d{i:03}"), &[(2, 1.0)]))
+            .collect();
+        ns.upsert(replaced).await.expect("overwrite");
+
+        assert_eq!(
+            ids(&ns, &vec![(1, 1.0)], 4).await,
+            ["d149", "d148", "d147", "d146"],
+            "{}",
+            backend.name
+        );
+    }
 }
 
 /// A second sparse query over an unchanged tail lists the WAL

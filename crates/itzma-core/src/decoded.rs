@@ -76,6 +76,8 @@ pub(crate) enum What {
     Sq8Head,
     /// One SQ8 partition, parsed.
     Partition(u32),
+    /// A sparse index's term directory.
+    SparseDirectory,
     /// A whole segment for the query's flat path, as a `SegmentView`.
     View,
 }

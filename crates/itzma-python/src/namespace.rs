@@ -15,8 +15,8 @@ use std::future::Future;
 use std::time::Duration;
 
 use itzma_core::{
-    CompactionOptions, FilterOptions, GcOptions, IndexOptions, MaintenanceOptions, QueryOptions,
-    SparseQueryOptions, StreamOptions, WriteKey,
+    CompactionOptions, FilterOptions, GcOptions, IndexOptions, IndexSparseOptions,
+    MaintenanceOptions, QueryOptions, SparseQueryOptions, StreamOptions, WriteKey,
 };
 
 use crate::convert::arrow::PyArrowStream;
@@ -598,6 +598,20 @@ impl PyNamespace {
         self.report_async(py, |ns| index_call(ns, o))
     }
 
+    fn index_sparse(&self, py: Python<'_>, options: &str) -> PyResult<String> {
+        let o: IndexSparseOptions = options::merge(options).map_err(error::input)?;
+        self.report(py, |ns| index_sparse_call(ns, o))
+    }
+
+    fn index_sparse_async<'py>(
+        &self,
+        py: Python<'py>,
+        options: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let o: IndexSparseOptions = options::merge(options).map_err(error::input)?;
+        self.report_async(py, |ns| index_sparse_call(ns, o))
+    }
+
     fn compact(&self, py: Python<'_>, options: &str) -> PyResult<String> {
         let o = options::compaction(options).map_err(error::input)?;
         self.report(py, |ns| compact_call(ns, o))
@@ -628,12 +642,13 @@ impl PyNamespace {
         self.report_async(py, |ns| maintain_call(ns, o))
     }
 
-    #[pyo3(signature = (every_secs, maintain, index=None))]
+    #[pyo3(signature = (every_secs, maintain, index=None, index_sparse=None))]
     fn start_maintenance(
         &self,
         every_secs: f64,
         maintain: &str,
         index: Option<&str>,
+        index_sparse: Option<&str>,
     ) -> PyResult<maintainer::PyMaintainer> {
         self.handle()?;
         let every = Duration::try_from_secs_f64(every_secs)
@@ -641,9 +656,14 @@ impl PyNamespace {
             .filter(|d| !d.is_zero())
             .ok_or_else(|| error::input("every must be more than zero seconds".into()))?;
         let maintain = options::maintenance(maintain).map_err(error::input)?;
-        let index = index
-            .map(|i| options::merge::<IndexOptions>(i).map_err(error::input))
-            .transpose()?;
+        let index = match (index, index_sparse) {
+            (Some(i), Some(s)) => Some((
+                options::merge::<IndexOptions>(i).map_err(error::input)?,
+                options::merge::<IndexSparseOptions>(s).map_err(error::input)?,
+            )),
+            (None, None) => None,
+            _ => return Err(error::input("index and index_sparse go together".into())),
+        };
         let plan = maintainer::Plan {
             every,
             maintain,
@@ -655,6 +675,11 @@ impl PyNamespace {
 
 async fn index_call(ns: Arc<Namespace>, o: IndexOptions) -> PyResult<String> {
     let r = ns.index(&o).await.map_err(error::to_py)?;
+    Ok(serde_json::to_string(&r).unwrap_or_default())
+}
+
+async fn index_sparse_call(ns: Arc<Namespace>, o: IndexSparseOptions) -> PyResult<String> {
+    let r = ns.index_sparse(&o).await.map_err(error::to_py)?;
     Ok(serde_json::to_string(&r).unwrap_or_default())
 }
 

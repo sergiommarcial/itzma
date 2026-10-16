@@ -14,8 +14,8 @@ use common::faulty::FaultyStore;
 use futures::future::{BoxFuture, FutureExt};
 use itzma_core::{
     AttrSchema, AttrType, CompactionOptions, DecodedCache, DecodedCacheOptions, Document,
-    FilterOptions, Hit, IndexKind, IndexOptions, Metric, Namespace, Predicate, QueryOptions,
-    Schema,
+    FilterOptions, Hit, IndexKind, IndexOptions, IndexSparseOptions, Metric, Namespace, Predicate,
+    QueryOptions, Schema, SparseQueryOptions,
 };
 use object_store::ObjectStore;
 
@@ -61,6 +61,9 @@ async fn built_at(store: Arc<dyn ObjectStore>, kind: IndexKind, level: u32) -> N
         .unwrap();
     ns.compact(&ROOMY).await.unwrap();
     ns.index(&IndexOptions::default().min_rows(0).kind(kind))
+        .await
+        .unwrap();
+    ns.index_sparse(&IndexSparseOptions::default())
         .await
         .unwrap();
     ns
@@ -204,6 +207,30 @@ async fn a_warm_filter_reads_only_the_manifest() {
     })
     .await;
     assert_eq!(paths, [MANIFEST]);
+}
+
+/// The term directory is cached; the postings of the query's own terms are
+/// not, so a warm sparse query reads those
+/// and nothing of the segments.
+#[tokio::test]
+async fn a_warm_sparse_query_reads_only_the_manifest_and_postings() {
+    let (counting, plain, cached) = setup(IndexKind::Sq8).await;
+    let terms = vec![(3u32, 1.0f32), (101, 2.0)];
+    let paths = warm_paths(&counting, &plain, &cached, |ns| {
+        let terms = terms.clone();
+        async move {
+            ns.query_sparse(&terms, 10, &SparseQueryOptions::default())
+                .await
+                .unwrap()
+        }
+        .boxed()
+    })
+    .await;
+    assert_eq!(paths[0], MANIFEST);
+    assert!(
+        paths[1..].iter().all(|p| p.contains("/sparse-idx-")),
+        "only postings after the manifest: {paths:?}"
+    );
 }
 
 #[tokio::test]

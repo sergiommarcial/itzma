@@ -20,6 +20,7 @@ from itzma.reports import (
     Compaction,
     GcReport,
     IndexReport,
+    IndexSparseReport,
     MaintenanceReport,
     parse_maintenance,
 )
@@ -187,6 +188,7 @@ class _Handle:
             every.total_seconds(),
             options,
             "{}" if index else None,
+            "{}" if index else None,
         )
         maintainer = Maintainer(inner)
         self._maintainers.append(maintainer)
@@ -329,6 +331,11 @@ class Namespace(_Handle):
         """Build and publish an index for each live segment that has none."""
         options = _index_options(kind, min_rows, nlist, rebuild)
         return IndexReport(**json.loads(self._handle().index(options)))
+
+    def index_sparse(self, *, rebuild: bool = False) -> IndexSparseReport:
+        """Build and publish a sparse index for each segment with sparse vectors."""
+        raw = self._handle().index_sparse(json.dumps({"rebuild": rebuild}))
+        return IndexSparseReport(**json.loads(raw))
 
     def compact(self, *, max_segments: int = 8, max_segment_bytes: int = 128 << 20) -> Compaction:
         """Fold the WAL tail into a segment, merging when there are too many.
@@ -500,6 +507,11 @@ class AsyncNamespace(_Handle):
         """Build and publish an index for each live segment that has none."""
         options = _index_options(kind, min_rows, nlist, rebuild)
         return IndexReport(**json.loads(await self._handle().index_async(options)))
+
+    async def index_sparse(self, *, rebuild: bool = False) -> IndexSparseReport:
+        """Build and publish a sparse index for each segment with sparse vectors."""
+        raw = await self._handle().index_sparse_async(json.dumps({"rebuild": rebuild}))
+        return IndexSparseReport(**json.loads(raw))
 
     async def compact(
         self, *, max_segments: int = 8, max_segment_bytes: int = 128 << 20

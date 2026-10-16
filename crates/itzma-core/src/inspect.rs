@@ -32,7 +32,7 @@ use object_store::{ObjectMeta, ObjectStore};
 use crate::document::Schema;
 use crate::error::{ItzmaError, Result};
 use crate::gc::{self, Found};
-use crate::manifest::{self, IndexEntry, Manifest};
+use crate::manifest::{self, IndexEntry, Manifest, SparseIndexEntry};
 use crate::namespace::validate_id;
 use crate::{schema_object, segment, wal_codec};
 
@@ -100,6 +100,12 @@ pub struct SegmentReport {
     /// Whether the directory has a `sparse.bin`, so some document in the
     /// segment carries a sparse vector.
     pub has_sparse_data: bool,
+    /// The sparse index the manifest names for this segment, if it names one.
+    pub sparse_index: Option<SparseIndexInfo>,
+    /// Generations of sparse index objects in the directory that the manifest
+    /// does not name, oldest first. [`Namespace::gc`](crate::Namespace::gc)
+    /// deletes them of a live segment once they are old enough.
+    pub stray_sparse_indexes: Vec<u32>,
 }
 
 /// An index the manifest names, and whether its object is there.
@@ -109,6 +115,16 @@ pub struct IndexInfo {
     pub generation: u32,
     /// The algorithm's name in the manifest, such as `sq8`.
     pub kind: String,
+    /// The object's stored size, or `None` if it is not in the directory (also
+    /// a problem).
+    pub bytes: Option<u64>,
+}
+
+/// A sparse index the manifest names, and whether its object is there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseIndexInfo {
+    /// The generation, as `sparse-idx-<generation>.bin`.
+    pub generation: u32,
     /// The object's stored size, or `None` if it is not in the directory (also
     /// a problem).
     pub bytes: Option<u64>,
@@ -231,13 +247,30 @@ pub async fn report(store: &dyn ObjectStore, namespace: &str) -> Result<Report> 
         let live: HashSet<&str> = manifest.live_segments.iter().map(String::as_str).collect();
         segments = found
             .iter()
-            .map(|(id, f)| segment_report(id, f, folded, &live, &manifest.indexes))
+            .map(|(id, f)| {
+                segment_report(
+                    id,
+                    f,
+                    folded,
+                    &live,
+                    &manifest.indexes,
+                    &manifest.sparse_indexes,
+                )
+            })
             .collect();
         for report in &segments {
             if let Some(index) = &report.index {
                 if index.bytes.is_none() {
                     problems.push(format!(
                         "segment {} is listed with index generation {} but has no such index object",
+                        report.id, index.generation
+                    ));
+                }
+            }
+            if let Some(index) = &report.sparse_index {
+                if index.bytes.is_none() {
+                    problems.push(format!(
+                        "segment {} is listed with sparse index generation {} but has no such object",
                         report.id, index.generation
                     ));
                 }
@@ -250,12 +283,24 @@ pub async fn report(store: &dyn ObjectStore, namespace: &str) -> Result<Report> 
                 ));
             }
         }
+        for id in manifest.sparse_indexes.keys() {
+            if !live.contains(id.as_str()) {
+                problems.push(format!(
+                    "the manifest lists a sparse index for {id}, which is not a live segment"
+                ));
+            }
+        }
     } else {
-        segments.extend(
-            found
-                .iter()
-                .map(|(id, f)| segment_report(id, f, 0, &HashSet::new(), &BTreeMap::new())),
-        );
+        segments.extend(found.iter().map(|(id, f)| {
+            segment_report(
+                id,
+                f,
+                0,
+                &HashSet::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            )
+        }));
     }
 
     Ok(Report {
@@ -287,6 +332,7 @@ fn segment_report(
     folded: u64,
     live: &HashSet<&str>,
     indexes: &BTreeMap<String, IndexEntry>,
+    sparse_indexes: &BTreeMap<String, SparseIndexEntry>,
 ) -> SegmentReport {
     let state = if live.contains(id) {
         SegmentState::Live
@@ -312,6 +358,24 @@ fn segment_report(
         .filter(|generation| Some(*generation) != named.map(|entry| entry.generation))
         .collect();
     stray_indexes.sort_unstable();
+    let named_sparse = sparse_indexes
+        .get(id)
+        .filter(|_| state == SegmentState::Live);
+    let sparse_index = named_sparse.map(|entry| SparseIndexInfo {
+        generation: entry.generation,
+        bytes: found
+            .sparse_indexes
+            .iter()
+            .find(|object| object.generation == entry.generation)
+            .map(|object| object.size),
+    });
+    let mut stray_sparse_indexes: Vec<u32> = found
+        .sparse_indexes
+        .iter()
+        .map(|object| object.generation)
+        .filter(|generation| Some(*generation) != named_sparse.map(|entry| entry.generation))
+        .collect();
+    stray_sparse_indexes.sort_unstable();
     let has_sparse_data = found
         .objects
         .iter()
@@ -325,6 +389,8 @@ fn segment_report(
         index,
         stray_indexes,
         has_sparse_data,
+        sparse_index,
+        stray_sparse_indexes,
     }
 }
 
@@ -404,6 +470,15 @@ impl fmt::Display for Report {
             }
             if s.has_sparse_data {
                 write!(f, "  sparse")?;
+            }
+            if let Some(index) = &s.sparse_index {
+                match index.bytes {
+                    Some(bytes) => write!(f, "  sparse index {} {bytes} bytes", index.generation)?,
+                    None => write!(f, "  sparse index {} missing", index.generation)?,
+                }
+            }
+            if !s.stray_sparse_indexes.is_empty() {
+                write!(f, "  unnamed sparse indexes {:?}", s.stray_sparse_indexes)?;
             }
             writeln!(f)?;
         }

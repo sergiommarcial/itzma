@@ -32,8 +32,8 @@ use itzma_core::search::distance;
 use itzma_core::{
     AttrColumn, AttrSchema, AttrType, CompactionOptions, Compare, DEFAULT_STREAM_TARGET_BYTES,
     DecodedCache, DecodedCacheOptions, DocColumns, Document, FilterOptions, IndexKind,
-    IndexOptions, Metric, Namespace, Predicate, QueryOptions, Schema, SparseQueryOptions,
-    SparseVector, StreamOptions,
+    IndexOptions, IndexSparseOptions, Metric, Namespace, Predicate, QueryOptions, Schema,
+    SparseQueryOptions, SparseVector, StreamOptions,
 };
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
@@ -501,8 +501,8 @@ fn sparse_documents(rng: &mut Rng, first: usize, count: usize) -> Vec<Document> 
 }
 
 /// A compacted namespace of `batches` times [`BATCH`] documents with sparse
-/// vectors.
-async fn sparse_segment(batches: usize) -> Namespace {
+/// vectors, indexed or not.
+async fn sparse_segment(batches: usize, indexed: bool) -> Namespace {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let ns = Namespace::create(store, "bench", SPARSE_SCHEMA)
         .await
@@ -516,11 +516,18 @@ async fn sparse_segment(batches: usize) -> Namespace {
     ns.compact(&CompactionOptions::default())
         .await
         .expect("compact");
+    if indexed {
+        ns.index_sparse(&IndexSparseOptions::default())
+            .await
+            .expect("index_sparse");
+    }
     ns
 }
 
-/// Sparse writes and `query_sparse`. `InMemory` has no request latency, so
-/// the query numbers are CPU only.
+/// Sparse writes, the inverted index build, and `query_sparse` with and
+/// without the index. `InMemory` has no request latency, so the query numbers
+/// are CPU only; the requests and bytes an index saves are in
+/// `tests/sparse_query.rs`.
 fn sparse(c: &mut Criterion, rt: &Runtime) {
     let mut group = c.benchmark_group("sparse");
     group.sample_size(10);
@@ -557,18 +564,40 @@ fn sparse(c: &mut Criterion, rt: &Runtime) {
         });
     }
 
+    group.throughput(Throughput::Elements(100 * BATCH as u64));
+    group.bench_function("index_sparse/100k_100_terms", |b| {
+        b.iter_custom(|iters| {
+            rt.block_on(async {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let ns = sparse_segment(100, false).await;
+                    let start = Instant::now();
+                    black_box(
+                        ns.index_sparse(&IndexSparseOptions::default())
+                            .await
+                            .expect("index_sparse"),
+                    );
+                    total += start.elapsed();
+                }
+                total
+            })
+        });
+    });
+
     let query = Rng(7).sparse(QUERY_TERMS);
     let options = SparseQueryOptions::default();
     for batches in [10, 100] {
         let docs = batches * BATCH;
         group.throughput(Throughput::Elements(docs as u64));
-        let ns = OnceCell::new();
-        group.bench_function(format!("query/{}k_100_terms_unindexed", docs / 1000), |b| {
-            let ns = ns.get_or_init(|| rt.block_on(sparse_segment(batches)));
-            b.to_async(rt).iter(|| async {
-                black_box(ns.query_sparse(&query, 10, &options).await.expect("query"))
+        for (kind, indexed) in [("unindexed", false), ("indexed", true)] {
+            let ns = OnceCell::new();
+            group.bench_function(format!("query/{}k_100_terms_{kind}", docs / 1000), |b| {
+                let ns = ns.get_or_init(|| rt.block_on(sparse_segment(batches, indexed)));
+                b.to_async(rt).iter(|| async {
+                    black_box(ns.query_sparse(&query, 10, &options).await.expect("query"))
+                });
             });
-        });
+        }
     }
     group.finish();
 }
@@ -668,6 +697,9 @@ async fn filtered_query_segment_at(batches: usize, level: u32) -> Namespace {
     ns.index(&IndexOptions::default().kind(IndexKind::Sq8).min_rows(0))
         .await
         .expect("index");
+    ns.index_sparse(&IndexSparseOptions::default())
+        .await
+        .expect("index_sparse");
     ns
 }
 
@@ -808,6 +840,22 @@ fn decoded(c: &mut Criterion, rt: &Runtime) {
                 .iter(|| async { black_box(indexed.query(&probe, 10).await.expect("query")) });
         });
     }
+
+    let terms = Rng(7).sparse(QUERY_TERMS);
+    group.throughput(Throughput::Elements(10 * BATCH as u64));
+    let sparse = OnceCell::new();
+    group.bench_function("sparse/query/10k_100_terms_indexed", |b| {
+        let sparse =
+            sparse.get_or_init(|| rt.block_on(async { cached(sparse_segment(10, true).await) }));
+        b.to_async(rt).iter(|| async {
+            black_box(
+                sparse
+                    .query_sparse(&terms, 10, &SparseQueryOptions::default())
+                    .await
+                    .expect("query"),
+            )
+        });
+    });
 
     let loose = QueryOptions::default().filter(Some(Predicate::is_true("active")));
     let small_probe = [3.0, 1.5, 2.0, 1.0];

@@ -16,8 +16,10 @@
 //! that the manifest does not name: an older generation that a rebuild replaced,
 //! or an orphan of a build that never published. Like a segment, such an object
 //! goes only once it and the index that replaced it are at least `min_age` old.
-//! The whole directory of a dead segment goes with the segment, `sparse.bin`
-//! included: it has one generation and lives and dies with its segment.
+//! The whole directory of a dead segment goes with the segment. The sparse index
+//! objects (`sparse-idx-<generation>.bin`) follow the same rule against
+//! the manifest's `sparse_indexes`. `sparse.bin` needs none of it: it has one
+//! generation and lives and dies with its segment.
 //!
 //! With [`GcOptions::fence_wal`] it also lists `wal/` and replaces WAL objects
 //! that a segment has absorbed with an 8-byte fence at the same key, so that
@@ -42,6 +44,7 @@ use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use crate::error::{ItzmaError, Result};
 use crate::index;
 use crate::manifest::Manifest;
+use crate::sparse_index;
 use crate::{segment, wal, wal_codec};
 
 /// The default for [`GcOptions::min_age`]: 24 hours.
@@ -134,6 +137,14 @@ pub struct GcReport {
     /// Index objects left for a later run because they, or the index that
     /// replaced them, are younger than `min_age`.
     pub indexes_too_young: usize,
+    /// Sparse index objects removed from segments that are still live: an older
+    /// generation a rebuild replaced, or an orphan of a build that never
+    /// published. One inside a dead segment's directory goes with the
+    /// segment and is counted there. Their size is part of `bytes_freed`.
+    pub sparse_indexes_deleted: usize,
+    /// Sparse index objects left for a later run because they, or the index that
+    /// replaced them, are younger than `min_age`.
+    pub sparse_indexes_too_young: usize,
 }
 
 /// One `segments/<id>/` directory, as the listing shows it.
@@ -146,6 +157,8 @@ pub(crate) struct Found {
     pub(crate) objects: Vec<(Path, u64)>,
     /// The index objects among them (`index-<generation>.bin`).
     pub(crate) indexes: Vec<FoundIndex>,
+    /// The sparse index objects among them (`sparse-idx-<generation>.bin`).
+    pub(crate) sparse_indexes: Vec<FoundIndex>,
 }
 
 /// One index object in a segment directory.
@@ -236,11 +249,24 @@ pub(crate) fn group(prefix: &Path, listing: Vec<ObjectMeta>) -> BTreeMap<String,
             modified_ms: i64::MIN,
             objects: Vec::new(),
             indexes: Vec::new(),
+            sparse_indexes: Vec::new(),
         });
         let modified_ms = meta.last_modified.timestamp_millis();
         entry.modified_ms = entry.modified_ms.max(modified_ms);
         if let Some(generation) = meta.location.filename().and_then(index::generation_of) {
             entry.indexes.push(FoundIndex {
+                generation,
+                path: meta.location.clone(),
+                size: meta.size,
+                modified_ms,
+            });
+        }
+        if let Some(generation) = meta
+            .location
+            .filename()
+            .and_then(sparse_index::generation_of)
+        {
+            entry.sparse_indexes.push(FoundIndex {
                 generation,
                 path: meta.location.clone(),
                 size: meta.size,
@@ -312,6 +338,27 @@ fn plan_indexes(manifest: &Manifest, found: &BTreeMap<String, Found>, age: Age) 
         age,
         |id| manifest.indexes.get(id).map(|entry| entry.generation),
         |dir| &dir.indexes,
+    )
+}
+
+/// [`plan_indexes`] for the sparse index objects, against the manifest's
+/// `sparse_indexes`.
+fn plan_sparse_indexes(
+    manifest: &Manifest,
+    found: &BTreeMap<String, Found>,
+    age: Age,
+) -> IndexPlan {
+    plan_generations(
+        manifest,
+        found,
+        age,
+        |id| {
+            manifest
+                .sparse_indexes
+                .get(id)
+                .map(|entry| entry.generation)
+        },
+        |dir| &dir.sparse_indexes,
     )
 }
 
@@ -422,6 +469,7 @@ pub(crate) async fn run(
     let covering = Covering::new(manifest, &found);
     let age = Age::new(now_millis(), options.min_age);
     let indexes = plan_indexes(manifest, &found, age);
+    let sparse_indexes = plan_sparse_indexes(manifest, &found, age);
     let Plan { delete, too_young } = plan(manifest, found, &covering, age);
     let hint = if options.fence_wal {
         read_hint(store, namespace).await?
@@ -445,6 +493,7 @@ pub(crate) async fn run(
             .flat_map(|found| &found.objects)
             .map(|(_, size)| size)
             .chain(indexes.delete.iter().map(|(_, size)| size))
+            .chain(sparse_indexes.delete.iter().map(|(_, size)| size))
             .sum(),
         segments_too_young: too_young,
         wal_objects_fenced: wal_plan.fence.len(),
@@ -456,12 +505,15 @@ pub(crate) async fn run(
         wal_too_young: wal_plan.too_young,
         indexes_deleted: indexes.delete.len(),
         indexes_too_young: indexes.too_young,
+        sparse_indexes_deleted: sparse_indexes.delete.len(),
+        sparse_indexes_too_young: sparse_indexes.too_young,
     };
     if !options.dry_run {
         let paths: Vec<Path> = delete
             .into_iter()
             .flat_map(|found| found.objects)
             .chain(indexes.delete)
+            .chain(sparse_indexes.delete)
             .map(|(path, _)| path)
             .collect();
         delete_all(store, paths).await?;
@@ -657,6 +709,7 @@ mod tests {
                 modified_ms: NOW - age_hours * HOUR_MS,
                 objects: vec![(path, 100)],
                 indexes: Vec::new(),
+                sparse_indexes: Vec::new(),
             },
         )
     }

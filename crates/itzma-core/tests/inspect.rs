@@ -10,8 +10,8 @@ use common::faulty::{Fault, FaultyStore};
 use common::{backends, cas_backends, doc, publish, put_segment, schema, snapshot};
 use itzma_core::inspect::{self, Report, SegmentState};
 use itzma_core::{
-    CompactionOptions, Document, GcOptions, ItzmaError, Metric, Namespace, WalOp, manifest,
-    schema_object, segment, wal,
+    CompactionOptions, Document, GcOptions, IndexSparseOptions, ItzmaError, Metric, Namespace,
+    WalOp, manifest, schema_object, segment, wal,
 };
 use object_store::{ObjectStore, ObjectStoreExt};
 
@@ -531,6 +531,60 @@ async fn a_segments_sparse_data_and_index_show_in_the_report() {
         let report = inspect::report(&*b.store, "docs").await.unwrap();
         let seg = &report.segments[0];
         assert!(seg.has_sparse_data, "{}", b.name);
+        assert!(seg.sparse_index.is_none());
         assert!(report.problems.is_empty(), "{:?}", report.problems);
+
+        ns.index_sparse(&IndexSparseOptions::default())
+            .await
+            .unwrap();
+        ns.index_sparse(&IndexSparseOptions::default().rebuild(true))
+            .await
+            .unwrap();
+        let report = inspect::report(&*b.store, "docs").await.unwrap();
+        let seg = &report.segments[0];
+        let info = seg.sparse_index.as_ref().expect("named");
+        assert_eq!(info.generation, 2);
+        assert!(info.bytes.is_some());
+        assert_eq!(seg.stray_sparse_indexes, [1]);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert!(report.to_string().contains("sparse index 2"), "{report}");
     }
+}
+
+#[tokio::test]
+async fn a_named_sparse_index_with_no_object_is_a_problem() {
+    let store = common::memory();
+    let ns = Namespace::create(store.clone(), "docs", schema(DIM, Metric::L2))
+        .await
+        .unwrap();
+    ns.upsert(vec![Document {
+        id: "a".into(),
+        vector: vec![1.0],
+        attrs: None,
+        sparse: Some(vec![(3, 0.5)]),
+    }])
+    .await
+    .unwrap();
+    ns.compact(&ROOMY).await.unwrap();
+    ns.index_sparse(&IndexSparseOptions::default())
+        .await
+        .unwrap();
+    let (m, _) = manifest::load(&*store, "docs").await.unwrap();
+    let id = &m.live_segments[0];
+    store
+        .delete(&object_store::path::Path::from(format!(
+            "docs/segments/{id}/sparse-idx-1.bin"
+        )))
+        .await
+        .unwrap();
+
+    let report = inspect::report(&*store, "docs").await.unwrap();
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("sparse index generation 1")),
+        "{:?}",
+        report.problems
+    );
 }

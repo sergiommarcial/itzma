@@ -25,6 +25,7 @@ from itzma.reports import (
     Compaction,
     GcReport,
     IndexReport,
+    IndexSparseReport,
     MaintenanceReport,
 )
 from itzma.results import FilterPage, Hit, Hits, Row
@@ -44,6 +45,7 @@ __all__ = [
     "Hit",
     "Hits",
     "IndexReport",
+    "IndexSparseReport",
     "Maintainer",
     "MaintenanceReport",
     "Metric",

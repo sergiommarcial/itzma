@@ -1,15 +1,28 @@
 //! The sparse query engine behind
 //! [`Namespace::query_sparse`](crate::Namespace::query_sparse).
 //!
-//! The namespace is a list of *sources*, oldest to newest: the live segments
-//! folded into one in-memory layer and scored directly, and the WAL tail,
-//! kept folded by the handle between queries and always its own, newest
-//! source. Each source proposes every document that shares a term with the
+//! The namespace is a list of *sources*, oldest to newest, planned the way the
+//! dense engine plans them (`query.rs`) but grouped by the manifest's
+//! `sparse_indexes` instead of `indexes`. A live segment with a sparse index is
+//! an indexed source: its term directory is fetched once, and only the
+//! postings of the query's own terms after that. Every run of segments without
+//! one is folded into one in-memory layer and scored directly, and so is the
+//! WAL tail, kept folded by the handle between queries and always
+//! its own, newest source. Each source proposes every document that shares a term with the
 //! query, and the engine drops any proposal a newer source holds as a document
 //! or a tombstone, merges the sources and keeps the closest `top_k`.
 //!
-//! There is no rerank. A sparse dot product over stored weights is exact, so
-//! shadowing can only shrink the set of real matches.
+//! An indexed source reuses [`RangedSegment`], built for `data.bin`, for the
+//! three things it needs a segment for: row to id, the shadow check, and the
+//! attributes of the final hits. A sparse index only adds the term lookup.
+//!
+//! There is no rerank and no re-reading of postings. A sparse dot product over
+//! stored weights is exact, and the full postings scan of every query term
+//! returns every row that shares one, so shadowing can only shrink the set of
+//! real matches. The one loop is local: an indexed source ranks its rows by
+//! score and resolves ids and the shadow check down that ranking only until
+//! `top_k` live rows are in hand, so an unshadowed query reads about `top_k`
+//! ids, not one per matching row.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,10 +30,12 @@ use std::sync::Arc;
 use futures::future::try_join_all;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use object_store::ObjectStore;
+use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::budget::ReadBudget;
 use crate::cpu::{self, Cost, Lane};
+use crate::decoded::{DecodedRef, What};
 use crate::document::SparseVector;
 use crate::error::{ItzmaError, Result};
 use crate::fetch::FetchPolicy;
@@ -28,7 +43,9 @@ use crate::layer::Layer;
 use crate::manifest::Manifest;
 use crate::predicate::Predicate;
 use crate::search::Hit;
+use crate::segment::{Held, RangedSegment};
 use crate::sparse;
+use crate::sparse_index::{self, TermDirectory};
 
 /// Requests in flight at once when a step fans out over segments or ids.
 const FETCH_CONCURRENCY: usize = 16;
@@ -100,24 +117,37 @@ pub(crate) struct Query<'a> {
     pub(crate) filter: Option<&'a Predicate>,
     pub(crate) budget: &'a ReadBudget,
     pub(crate) policy: &'a FetchPolicy,
+    /// Parsed structures kept between queries, if the handle has a
+    /// decoded cache.
+    pub(crate) decoded: Option<&'a DecodedRef>,
 }
 
 /// What the manifest's live segments turn into.
 enum Step<'a> {
-    /// The live segments, oldest first.
+    /// A segment with a sparse index.
+    Indexed { id: &'a str, generation: u32 },
+    /// A run of consecutive segments without one.
     Flat(&'a [String]),
 }
 
 /// A place a document can come from, newest last.
-enum Source {
-    /// The live segments overlaid into one layer, or the WAL tail;
+enum Source<'a> {
+    Indexed(Box<Indexed<'a>>),
+    /// A run of unindexed segments overlaid into one layer, or the WAL tail;
     /// either way its documents carry their sparse vectors.
     Flat(Arc<Layer>),
 }
 
-/// A hit's attributes, already in memory.
+struct Indexed<'a> {
+    segment: RangedSegment<'a>,
+    index_path: Path,
+    dir: Arc<TermDirectory>,
+}
+
+/// Where a hit's attributes are: already in memory, or in the data object.
 enum Attrs {
     Have(Option<serde_json::Value>),
+    Row(u32),
 }
 
 /// A live candidate with its score, negated so lower is closer like every
@@ -125,27 +155,43 @@ enum Attrs {
 struct Scored {
     distance: f32,
     id: String,
+    source: usize,
     attrs: Attrs,
 }
 
-/// The live segments as one step: overlaying them gives their net effect,
-/// and nothing between them needs a separate shadow check.
+/// Group the live segments into steps, oldest first. Consecutive segments
+/// without a sparse index stay together, since overlaying them gives their
+/// net effect and nothing between them needs a separate shadow check.
 fn plan<'a>(manifest: &'a Manifest) -> Vec<Step<'a>> {
     let live = &manifest.live_segments;
-    if live.is_empty() {
-        Vec::new()
-    } else {
-        vec![Step::Flat(live)]
+    let mut steps = Vec::new();
+    let mut run_start = 0;
+    for (at, id) in live.iter().enumerate() {
+        if let Some(entry) = manifest.sparse_indexes.get(id) {
+            if run_start < at {
+                steps.push(Step::Flat(&live[run_start..at]));
+            }
+            steps.push(Step::Indexed {
+                id,
+                generation: entry.generation,
+            });
+            run_start = at + 1;
+        }
     }
+    if run_start < live.len() {
+        steps.push(Step::Flat(&live[run_start..]));
+    }
+    steps
 }
 
 /// Run the query over `manifest`.
 ///
 /// # Errors
 ///
-/// The errors of reading segments, sparse sidecars and the tail (a missing
-/// segment or a fenced WAL object is what the caller reloads the manifest
-/// for), and [`ItzmaError::ReadBudgetExceeded`].
+/// The errors of reading segments, sparse sidecars, sparse indexes and the
+/// tail (a missing segment or index, or a fenced WAL object, is what the
+/// caller reloads the manifest for), [`ItzmaError::CorruptSparseIndex`] for a
+/// damaged index or a row it made up, and [`ItzmaError::ReadBudgetExceeded`].
 pub(crate) async fn run<'a>(
     q: &Query<'a>,
     manifest: &'a Manifest,
@@ -174,10 +220,10 @@ pub(crate) async fn run<'a>(
             .then_with(|| a.id.cmp(&b.id))
     });
     live.truncate(q.top_k);
-    finish(live)
+    finish(sources, live).await
 }
 
-async fn open_sources<'a>(q: &Query<'a>, steps: Vec<Step<'a>>) -> Result<Vec<Source>> {
+async fn open_sources<'a>(q: &Query<'a>, steps: Vec<Step<'a>>) -> Result<Vec<Source<'a>>> {
     // Indexed by position, not mapped over the owned `Step` values: a closure
     // whose parameter itself borrows `'a` is inferred as higher-ranked, which
     // then fails to prove the stream `Send` (see `query::open_sources`).
@@ -188,8 +234,41 @@ async fn open_sources<'a>(q: &Query<'a>, steps: Vec<Step<'a>>) -> Result<Vec<Sou
         .await
 }
 
-async fn open_source<'a>(q: &Query<'a>, step: &Step<'a>) -> Result<Source> {
+async fn open_source<'a>(q: &Query<'a>, step: &Step<'a>) -> Result<Source<'a>> {
     match *step {
+        Step::Indexed { id, generation } => {
+            let segment = RangedSegment::open(
+                q.store,
+                q.namespace,
+                id,
+                q.dim,
+                q.budget,
+                q.policy,
+                q.decoded,
+            )
+            .await?;
+            let index_path = sparse_index::sparse_index_path(q.namespace, id, generation);
+            let rows = segment.doc_count();
+            let load = || async {
+                let (_prefix, dir) =
+                    sparse_index::open(q.store, q.budget, &index_path, rows).await?;
+                let weight = dir.weight();
+                Ok((dir, weight))
+            };
+            let dir = match q.decoded {
+                Some(decoded) => {
+                    decoded
+                        .get_or_load(&index_path, What::SparseDirectory, load)
+                        .await?
+                }
+                None => Arc::new(load().await?.0),
+            };
+            Ok(Source::Indexed(Box::new(Indexed {
+                segment,
+                index_path,
+                dir,
+            })))
+        }
         Step::Flat(ids) => Ok(Source::Flat(Arc::new(
             sparse::read_all_with_sparse(
                 q.store,
@@ -207,13 +286,133 @@ async fn open_source<'a>(q: &Query<'a>, step: &Step<'a>) -> Result<Source> {
 
 async fn search_source(
     q: &Query<'_>,
-    sources: &[Source],
+    sources: &[Source<'_>],
     at: usize,
     weights: &HashMap<u32, f32>,
 ) -> Result<Vec<Scored>> {
     match &sources[at] {
+        Source::Indexed(source) => evaluate_indexed(q, sources, at, source, weights).await,
         Source::Flat(layer) => evaluate_flat(q, sources, at, layer, weights).await,
     }
+}
+
+/// Score every row the postings of the query's terms name, then keep the best
+/// live ones: at least `top_k`, plus any that tie with the last. One ranged read
+/// per matched term, and ids are resolved only as far down the ranking as needed.
+async fn evaluate_indexed(
+    q: &Query<'_>,
+    sources: &[Source<'_>],
+    at: usize,
+    source: &Indexed<'_>,
+    weights: &HashMap<u32, f32>,
+) -> Result<Vec<Scored>> {
+    let mut postings: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
+    for (&term, &weight) in weights {
+        let Some(entry) = source.dir.find(term) else {
+            continue;
+        };
+        let found =
+            sparse_index::postings_of(q.store, q.budget, &source.index_path, &source.dir, entry)
+                .await?;
+        postings.push((weight, found));
+    }
+    let rows_in_segment = source.segment.doc_count();
+    let path = source.index_path.to_string();
+    let cost = Cost::Distances {
+        rows: postings.iter().map(|(_, p)| p.len()).sum(),
+        dim: 1,
+    };
+    let ranked = cpu::run(Lane::Query, cost, move || {
+        score_postings(postings, rows_in_segment, &path)
+    })
+    .await?;
+
+    // Resolve ids and check shadowing down the ranking, in growing chunks, and
+    // stop once `top_k` live rows that match are in hand and the next row
+    // scores strictly less than the last of them. A row tied with it can still
+    // win on id, so ties are all kept. With no newer source and no filter
+    // nothing is dropped, and this reads the ids of about `top_k` rows, not of
+    // every row a term names. A filter can drop most rows, so it reads further
+    // down the ranking.
+    let mut kept: Vec<Scored> = Vec::new();
+    let mut next = 0;
+    let mut chunk = q.top_k;
+    while next < ranked.len() {
+        if kept.len() >= q.top_k && ranked[next].1 < -kept[q.top_k - 1].distance {
+            break;
+        }
+        let end = (next + chunk).min(ranked.len());
+        let rows: Vec<u32> = ranked[next..end].iter().map(|(row, _)| *row).collect();
+        let ids = source.segment.ids_of(&rows).await?;
+        let live = unshadowed(sources, at, &ids).await?;
+        let survivors: Vec<(u32, f32, String)> = ranked[next..end]
+            .iter()
+            .zip(ids)
+            .zip(live)
+            .filter_map(|(((row, score), id), live)| live.then_some((*row, *score, id)))
+            .collect();
+        // The attributes are fetched once per chunk for the live rows only, and
+        // stay on the hit so `finish` does not fetch them again.
+        let fetched = match q.filter {
+            None => None,
+            Some(_) => {
+                let rows: Vec<u32> = survivors.iter().map(|(row, _, _)| *row).collect();
+                Some(source.segment.attrs_of(&rows).await?)
+            }
+        };
+        for (n, (row, score, id)) in survivors.into_iter().enumerate() {
+            let attrs = match (&fetched, q.filter) {
+                (Some(fetched), Some(predicate)) => {
+                    let value = fetched[n].clone();
+                    if !predicate.matches(value.as_ref()) {
+                        continue;
+                    }
+                    Attrs::Have(value)
+                }
+                _ => Attrs::Row(row),
+            };
+            kept.push(Scored {
+                distance: -score,
+                id,
+                source: at,
+                attrs,
+            });
+        }
+        next = end;
+        chunk = chunk.saturating_mul(2);
+    }
+    Ok(kept)
+}
+
+/// Sum `weight * doc_weight` per row over every term's postings, in the
+/// order given, and rank the rows: highest score first, row order among
+/// equals so a run is repeatable.
+///
+/// # Errors
+///
+/// [`ItzmaError::CorruptSparseIndex`] for a row at or past `rows_in_segment`.
+fn score_postings(
+    postings: Vec<(f32, Vec<(u32, f32)>)>,
+    rows_in_segment: u64,
+    path: &str,
+) -> Result<Vec<(u32, f32)>> {
+    let mut scores: HashMap<u32, f32> = HashMap::new();
+    for (weight, found) in postings {
+        for (row, doc_weight) in found {
+            if u64::from(row) >= rows_in_segment {
+                return Err(ItzmaError::CorruptSparseIndex {
+                    path: path.to_string(),
+                    reason: format!(
+                        "the index named row {row}, the segment has {rows_in_segment} rows"
+                    ),
+                });
+            }
+            *scores.entry(row).or_insert(0.0) += weight * doc_weight;
+        }
+    }
+    let mut ranked: Vec<(u32, f32)> = scores.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    Ok(ranked)
 }
 
 /// The negated score of every document of `layer` against the query's
@@ -259,7 +458,7 @@ fn flat_scores(
 /// candidate.
 async fn evaluate_flat(
     q: &Query<'_>,
-    sources: &[Source],
+    sources: &[Source<'_>],
     at: usize,
     layer: &Arc<Layer>,
     weights: &HashMap<u32, f32>,
@@ -296,6 +495,7 @@ async fn evaluate_flat(
         .map(|((distance, doc), _)| Scored {
             distance,
             id: doc.id.clone(),
+            source: at,
             attrs: Attrs::Have(doc.attrs.clone()),
         })
         .collect())
@@ -304,7 +504,7 @@ async fn evaluate_flat(
 /// For each of `ids`, proposed by source `at`: whether it is still the live
 /// version, that is, no newer source holds the id as a document or a
 /// tombstone.
-async fn unshadowed(sources: &[Source], at: usize, ids: &[String]) -> Result<Vec<bool>> {
+async fn unshadowed(sources: &[Source<'_>], at: usize, ids: &[String]) -> Result<Vec<bool>> {
     // Owned ids: a closure over `&String` is inferred as higher-ranked, which
     // makes the stream not provably `Send` (see `segment::read_all`).
     stream::iter(ids.iter().cloned())
@@ -314,7 +514,7 @@ async fn unshadowed(sources: &[Source], at: usize, ids: &[String]) -> Result<Vec
         .await
 }
 
-async fn is_live(sources: &[Source], at: usize, id: &str) -> Result<bool> {
+async fn is_live(sources: &[Source<'_>], at: usize, id: &str) -> Result<bool> {
     let newer = &sources[at + 1..];
     // Layers in memory first: they cost no request.
     if newer
@@ -323,21 +523,58 @@ async fn is_live(sources: &[Source], at: usize, id: &str) -> Result<bool> {
     {
         return Ok(false);
     }
+    for source in newer {
+        if let Source::Indexed(newer) = source {
+            if newer.segment.holds(id).await? != Held::No {
+                return Ok(false);
+            }
+        }
+    }
     Ok(true)
 }
 
-/// Build the hits.
-fn finish(live: Vec<Scored>) -> Result<Vec<Hit>> {
+/// Fetch the attributes the final hits still lack, one request per block, and
+/// build the hits.
+async fn finish(sources: &[Source<'_>], live: Vec<Scored>) -> Result<Vec<Hit>> {
+    let mut wanted: HashMap<usize, Vec<u32>> = HashMap::new();
+    for hit in &live {
+        if let Attrs::Row(row) = hit.attrs {
+            wanted.entry(hit.source).or_default().push(row);
+        }
+    }
+    let fetched = try_join_all(
+        wanted
+            .into_iter()
+            .map(|(at, rows)| fetch_attrs(sources, at, rows)),
+    )
+    .await?;
+    let mut attrs: HashMap<(usize, u32), Option<serde_json::Value>> = HashMap::new();
+    for (at, rows, values) in fetched {
+        attrs.extend(rows.into_iter().zip(values).map(|(row, v)| ((at, row), v)));
+    }
     Ok(live
         .into_iter()
         .map(|hit| Hit {
             attrs: match hit.attrs {
                 Attrs::Have(value) => value,
+                Attrs::Row(row) => attrs.remove(&(hit.source, row)).flatten(),
             },
             id: hit.id,
             distance: hit.distance,
         })
         .collect())
+}
+
+async fn fetch_attrs(
+    sources: &[Source<'_>],
+    at: usize,
+    rows: Vec<u32>,
+) -> Result<(usize, Vec<u32>, Vec<Option<serde_json::Value>>)> {
+    let Source::Indexed(source) = &sources[at] else {
+        return Ok((at, rows, Vec::new()));
+    };
+    let values = source.segment.attrs_of(&rows).await?;
+    Ok((at, rows, values))
 }
 
 #[cfg(test)]
@@ -379,6 +616,41 @@ mod tests {
             .await;
             assert_eq!(pooled, inline);
         }
+    }
+
+    #[tokio::test]
+    async fn scored_postings_on_the_pool_equal_the_inline_ones() {
+        let postings: Vec<(f32, Vec<(u32, f32)>)> = (0..30u32)
+            .map(|t| {
+                (
+                    1.0 + t as f32 / 10.0,
+                    (0..50_000)
+                        .step_by(1 + t as usize)
+                        .map(|r| (r, 0.5))
+                        .collect(),
+                )
+            })
+            .collect();
+        let inline = score_postings(postings.clone(), 50_000, "p").expect("score");
+        let p = postings.clone();
+        let pooled = cpu::run(
+            Lane::Query,
+            Cost::Distances {
+                rows: 2_000_000,
+                dim: 1,
+            },
+            move || score_postings(p, 50_000, "p"),
+        )
+        .await
+        .expect("score");
+        assert_eq!(pooled, inline);
+        assert!(
+            inline
+                .windows(2)
+                .all(|w| w[0].1 > w[1].1 || (w[0].1 == w[1].1 && w[0].0 < w[1].0))
+        );
+        let err = score_postings(postings, 10, "p").expect_err("row past the segment");
+        assert!(matches!(err, ItzmaError::CorruptSparseIndex { .. }));
     }
 
     #[test]

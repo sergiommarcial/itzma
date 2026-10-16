@@ -48,7 +48,7 @@ def test_stages_match_the_model(cas_store: itzma.Store, ns_id: str) -> None:
     assert ns.compact().kind == "nothing"
 
 
-def test_sparse_vectors_survive_compaction(cas_store: itzma.Store, ns_id: str) -> None:
+def test_sparse_index(cas_store: itzma.Store, ns_id: str) -> None:
     ns = itzma.Namespace.create(cas_store, ns_id, schema())
     rows = random_rows(50)
     for i, row in enumerate(rows):
@@ -56,6 +56,7 @@ def test_sparse_vectors_survive_compaction(cas_store: itzma.Store, ns_id: str) -
     ns.upsert(rows)
     before = ns.query_sparse([(3, 1.0)], 10).ids
     ns.compact()
+    assert ns.index_sparse().indexed >= 1
     assert ns.query_sparse([(3, 1.0)], 10).ids == before
 
 

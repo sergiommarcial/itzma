@@ -341,6 +341,7 @@ async fn a_new_manifest_has_exactly_the_known_fields() {
             "live_segments",
             "schema",
             "segment_format",
+            "sparse_indexes",
             "wal_folded_through",
             "wal_format"
         ]
