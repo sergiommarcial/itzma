@@ -49,6 +49,21 @@ ignore = true
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Older copies that only third-party crates pull in, none of them ours to
+# bump. Pinned to the exact version, so an upstream release that drops one
+# shows up as an unmatched skip and the entry can go, and a duplicate we add
+# ourselves still warns.
+skip = [
+    { crate = "base64@0.22.1", reason = "hyper-util, under object_store's reqwest" },
+    { crate = "crypto-common@0.1.7", reason = "digest 0.10, from object_store's crc-fast" },
+    { crate = "digest@0.10.7", reason = "object_store's crc-fast" },
+    { crate = "getrandom@0.2.17", reason = "const-random, under arrow's ahash (Python bridge)" },
+    { crate = "getrandom@0.3.4", reason = "ahash (Python bridge) and tempfile (dev)" },
+    { crate = "r-efi@5.3.0", reason = "getrandom 0.3" },
+    { crate = "syn@2.0.119", reason = "pyo3-macros-backend (Python bridge)" },
+    { crate = "thiserror@1.0.69", reason = "pyo3-arrow (Python bridge)" },
+    { crate = "thiserror-impl@1.0.69", reason = "thiserror 1, from pyo3-arrow" },
+]
 
 [sources]
 unknown-registry = "deny"
