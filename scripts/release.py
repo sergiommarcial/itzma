@@ -132,8 +132,14 @@ def notes(text: str, version: str) -> str:
 
 
 def prepare(root: Path, bump: str, day: str) -> str:
-    version = next_version(current_version(root), bump)
+    current = current_version(root)
     changelog = root / "CHANGELOG.md"
+    # The version in the manifests may itself be unreleased (the very first
+    # release): it can be released as it is while it has no section yet.
+    if bump == current and f"## [{current}]" not in changelog.read_text():
+        version = current
+    else:
+        version = next_version(current, bump)
     # Cut the changelog first: if it refuses, no file has changed yet.
     cut = cut_changelog(changelog.read_text(), version, day)
     set_version(root, version)

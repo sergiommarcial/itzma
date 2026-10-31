@@ -134,3 +134,13 @@ def test_prepare_does_everything_or_nothing(repo: Path) -> None:
     with pytest.raises(release.ReleaseError):
         release.prepare(repo, "patch", "2026-11-02")
     assert release.current_version(repo) == "0.2.0"
+
+
+def test_the_current_version_can_be_released_once(repo: Path) -> None:
+    # 0.1.0 is the current version but has no section yet: the first release.
+    (repo / "CHANGELOG.md").write_text(CHANGELOG.split("## [0.1.0]")[0])
+    assert release.prepare(repo, "0.1.0", "2026-11-01") == "0.1.0"
+    assert "## [0.1.0] - 2026-11-01" in (repo / "CHANGELOG.md").read_text()
+    # Once it has a section, the same version is refused.
+    with pytest.raises(release.ReleaseError):
+        release.prepare(repo, "0.1.0", "2026-11-02")
