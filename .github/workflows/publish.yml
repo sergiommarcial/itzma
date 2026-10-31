@@ -33,7 +33,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
       - id: version
@@ -41,7 +41,9 @@ jobs:
           python3 scripts/release.py check "$TAG"
           python3 scripts/release.py notes "$TAG" > /dev/null
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       - name: the crate packages and builds on its own
         run: cargo publish --locked --dry-run -p itzma-core
 
@@ -66,10 +68,10 @@ jobs:
           - { os: ubuntu-latest, target: x86_64, libc: musllinux, manylinux: musllinux_1_2, smoke-musl: true }
           - { os: ubuntu-24.04-arm, target: aarch64, libc: musllinux, manylinux: musllinux_1_2 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
-      - uses: PyO3/maturin-action@v1
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           working-directory: py-itzma
           target: ${{ matrix.target }}
@@ -86,7 +88,7 @@ jobs:
         run: >
           docker run --rm -v "$PWD:/w" -w /w python:3.12-alpine
           sh -c "pip install --quiet py-itzma/dist/*.whl && python scripts/smoke.py"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wheel-${{ matrix.libc }}-${{ matrix.target }}
           path: py-itzma/dist/*.whl
@@ -96,15 +98,15 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
-      - uses: PyO3/maturin-action@v1
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           working-directory: py-itzma
           command: sdist
           args: --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sdist
           path: py-itzma/dist/*.tar.gz
@@ -123,10 +125,12 @@ jobs:
       # only be set up once the crate exists. Delete the secret afterwards.
       HAS_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       - id: published
         name: already on crates.io?
         run: |
@@ -136,7 +140,7 @@ jobs:
           echo "done=$([ "$code" = 200 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
       - id: auth
         if: steps.published.outputs.done == 'false' && env.HAS_TOKEN != 'true'
-        uses: rust-lang/crates-io-auth-action@v1
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
       - if: steps.published.outputs.done == 'false'
         run: cargo publish --locked -p itzma-core
         env:
@@ -149,11 +153,11 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           skip-existing: true
 
@@ -163,10 +167,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
