@@ -1,0 +1,43 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The smallest code that shows it. Rust or Python is fine.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The crate or Python package version, or a commit.
+    validations:
+      required: true
+  - type: dropdown
+    id: api
+    attributes:
+      label: API
+      options: [Rust, Python, both]
+    validations:
+      required: true
+  - type: input
+    id: backend
+    attributes:
+      label: Storage backend
+      description: S3 (which provider), local file, memory.
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Logs, the output of the dump example, OS, Python version.

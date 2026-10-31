@@ -318,6 +318,10 @@ Requires Rust 1.87 or newer (edition 2024).
 
 The crate and the Python package share one version and are released together. Changes go under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md) as they land. To release, run the **Release** workflow from the Actions tab with `patch`, `minor`, `major` or an exact version (the first release is `0.1.0`, the version already in the manifests). It bumps the version, turns `[Unreleased]` into that version's notes, commits, tags `vX.Y.Z`, and starts **Publish**, which runs the full CI on the tag, builds the wheels and the sdist, publishes `itzma-core` to crates.io and `itzma` to PyPI, and creates the GitHub Release. A failed Publish can be run again for the same tag; steps already done are skipped. `make package` builds the crate and the sdist locally without publishing.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Report security problems privately, as described in [SECURITY.md](SECURITY.md).
+
 ## License
 
 Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
