@@ -1182,6 +1182,29 @@ mod tests {
         assert_eq!(decode("wal/test", &bytes).unwrap().ops, ops);
     }
 
+    /// `compressible()` as a build with `zstd` 0.13.3 wrote it. Buckets hold WAL
+    /// objects like this, so every later `zstd` must still read them.
+    const ZSTD_0_13_WAL: &[u8] = include_bytes!("../tests/fixtures/wal_zstd_0_13.bin");
+
+    #[test]
+    fn a_wal_object_from_zstd_0_13_still_decodes() {
+        assert_eq!(ZSTD_0_13_WAL[8], 1, "the fixture is a ZSTD frame");
+        assert_eq!(
+            decode("wal/old", ZSTD_0_13_WAL).unwrap().ops,
+            compressible()
+        );
+    }
+
+    #[test]
+    fn encoding_matches_the_zstd_0_13_bytes() {
+        // Not a format rule (WAL objects are never byte-compared), but a change
+        // here means the compressor changed, which is worth knowing.
+        assert_eq!(
+            encode(&compressible(), BIG).unwrap().as_ref(),
+            ZSTD_0_13_WAL
+        );
+    }
+
     #[test]
     fn a_tiny_batch_stays_raw_because_zstd_would_not_shrink_it() {
         let bytes = encode(&sample_ops(), BIG).unwrap();

@@ -31,7 +31,7 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 thiserror = "2"
 # C-backed ZSTD for WAL objects. Default features are legacy-format
 # support and dictionary training, neither of which is used.
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 # `aws` is only for the S3 test backend in tests/common; the library itself
