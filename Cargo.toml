@@ -12,7 +12,12 @@ default-members = [
 ]
 
 [workspace.package]
+# The one version: both crates inherit it, maturin reads it for the Python
+# package, and scripts/release.py bumps it.
+version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sergiommarcial/itzma"
 # 1.87, not object_store's declared 1.85: yoke-derive (via url and icu) uses
 # str::from_utf8, stable in 1.87, but declares no rust-version of its own.
 rust-version = "1.87"

@@ -116,6 +116,12 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![warn(missing_docs)]
 
+// The crate README, which crates.io shows, runs as a doctest so its example
+// can't drift from the API.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctest;
+
 pub mod attrs;
 mod bloom;
 mod bound;

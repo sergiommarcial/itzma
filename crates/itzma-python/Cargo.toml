@@ -1,8 +1,10 @@
 [package]
 name = "itzma-python"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Python bindings for itzma-core, built by maturin as itzma._itzma"
 publish = false
 
@@ -21,7 +23,9 @@ extension-module = ["pyo3/extension-module"]
 arrow-array = "59"
 arrow-cast = "59"
 arrow-schema = "59"
-itzma-core = { path = "../itzma-core", version = "0.1.0" }
+# Exact pin: the wheel and the crate are released together, and
+# scripts/release.py moves this with the workspace version.
+itzma-core = { path = "../itzma-core", version = "=0.1.0" }
 # The Arrow reader becomes a `Stream` of batches for `upsert_stream`. Already
 # in the tree through itzma-core and pyo3-async-runtimes.
 futures = "0.3"

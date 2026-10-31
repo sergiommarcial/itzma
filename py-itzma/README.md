@@ -1,10 +1,19 @@
 # itzma for Python
 
-Python bindings for [Itzma](../README.md): vector retrieval with an object store as the only durable state. The package embeds Itzma in your process. You open a namespace once, keep it warm in memory, and S3 (or a local directory) holds the data.
+Python bindings for [Itzma](https://github.com/sergiommarcial/itzma#readme): vector retrieval with an object store as the only durable state. The package embeds Itzma in your process. You open a namespace once, keep it warm in memory, and S3 (or a local directory) holds the data.
+
+## Install
+
+```sh
+pip install itzma               # or: uv add itzma
+pip install "itzma[pyarrow]"    # Arrow input and output through pyarrow
+```
+
+Wheels cover macOS (Apple silicon and Intel) and Linux (x86_64 and aarch64, glibc and musl), Python 3.10 and later. Elsewhere pip builds from the source distribution, which needs Rust.
 
 ## Install from source
 
-There are no wheels yet. You need Rust (see `rust-version` in the root `Cargo.toml`) and [uv](https://docs.astral.sh/uv/).
+You need Rust (see `rust-version` in the root `Cargo.toml`) and [uv](https://docs.astral.sh/uv/).
 
 ```sh
 make py-dev      # creates py-itzma/.venv and builds the extension into it
@@ -40,7 +49,7 @@ print(hits.ids, hits.distances)
 print(hits.to_polars())  # id, distance, then one typed column per declared attribute
 ```
 
-More runnable scripts are in [examples/](examples/README.md).
+More runnable scripts are in [examples/](https://github.com/sergiommarcial/itzma/tree/main/py-itzma/examples).
 
 Writes take three shapes:
 

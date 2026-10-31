@@ -24,6 +24,7 @@ PY_BASE_PYTHON = $(shell $(PY_VENV_PYTHON) -c 'import os, sys; print(os.path.rea
 	lint fmt-check clippy doc deny machete \
 	format doc-open \
 	py-env py-dev py-rust py-rust-one py-lint py-test py \
+	release-test package \
 	ci clean
 
 ##@ General
@@ -159,9 +160,18 @@ py-test: py-dev ## Run the Python tests (MinIO too when ITZMA_TEST_S3_ENDPOINT i
 
 py: py-rust py-lint py-test ## Everything CI's python job runs
 
+##@ Release
+
+release-test: check-uv ## Test scripts/release.py (version bumps, changelog, tag checks)
+	uv run --no-project --with pytest pytest -q scripts
+
+package: check-cargo check-uv ## Build what a release publishes, without publishing: the crate (cargo publish --dry-run) and the Python sdist
+	cargo publish --locked --dry-run --allow-dirty -p itzma-core
+	cd py-itzma && uvx --from 'maturin>=1.9,<2' maturin sdist --out ../target/dist
+
 ##@ CI
 
-ci: lint test py ## Run what .github/workflows/ci.yml runs on stable, without docker (test-s3 and test-msrv cover the other two test jobs)
+ci: lint release-test test py ## Run what .github/workflows/ci.yml runs on stable, without docker (test-s3 and test-msrv cover the other two test jobs)
 
 ##@ Cleanup
 

@@ -4,10 +4,30 @@ build-backend = "maturin"
 
 [project]
 name = "itzma"
-version = "0.1.0"
-description = "Vector retrieval on object storage, embedded in a Python service"
+# maturin takes the version from the workspace Cargo.toml.
+dynamic = ["version"]
+description = "Vector search on object storage: an embedded library, no server, just your bucket"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.22"]
+keywords = ["vector-search", "object-storage", "hnsw", "embeddings", "s3"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Repository = "https://github.com/sergiommarcial/itzma"
+Changelog = "https://github.com/sergiommarcial/itzma/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 pyarrow = ["pyarrow>=14"]

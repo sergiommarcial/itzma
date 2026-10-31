@@ -42,11 +42,11 @@ It is a library. You embed it in your process, open a namespace, and S3 (or a lo
 
 ## Quick start
 
-`itzma-core` is not published, so depend on it by path. This example uses the in-memory store.
+Rust: add `itzma-core` from crates.io. Python: `pip install itzma` (wheels for macOS and Linux, Python 3.10 and later; see [py-itzma](py-itzma/README.md)). This example uses the in-memory store.
 
 ```toml
 [dependencies]
-itzma-core = { path = "crates/itzma-core" }
+itzma-core = "0.1"
 object_store = "0.14"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
@@ -313,3 +313,11 @@ make bench            # timings, in-memory store
 ```
 
 Requires Rust 1.87 or newer (edition 2024).
+
+## Releases
+
+The crate and the Python package share one version and are released together. Changes go under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md) as they land. To release, run the **Release** workflow from the Actions tab with `patch`, `minor`, `major` or an exact version. It bumps the version, turns `[Unreleased]` into that version's notes, commits, tags `vX.Y.Z`, and starts **Publish**, which runs the full CI on the tag, builds the wheels and the sdist, publishes `itzma-core` to crates.io and `itzma` to PyPI, and creates the GitHub Release. A failed Publish can be run again for the same tag; steps already done are skipped. `make package` builds the crate and the sdist locally without publishing.
+
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
