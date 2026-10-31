@@ -24,3 +24,5 @@ rustc-ice-*.txt
 #.idea/
 
 CLAUDE.md
+# Python bytecode from running scripts/
+__pycache__/
