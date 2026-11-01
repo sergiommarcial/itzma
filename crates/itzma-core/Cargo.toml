@@ -19,7 +19,7 @@ futures = "0.3"
 # The RAM tier of the tiered read cache (cache.rs). Bounds by entry
 # count, not bytes, so CacheStore tracks used bytes itself. At least 0.18.2,
 # which fixes RUSTSEC-2026-0002 and RUSTSEC-2026-0253.
-lru = "0.18.2"
+lru = "0.19.0"
 object_store = "0.14"
 # The compute pools (cpu.rs): CPU work runs off the tokio workers.
 rayon = "1"
