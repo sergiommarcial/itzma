@@ -96,7 +96,7 @@ async fn another_builds_wal_magic_is_refused() {
     for b in cas_backends() {
         let ns = built(b.store.clone()).await;
         let tail = object(&*b.store, "docs/wal", "00000000000000000002.json").await;
-        relabel(&*b.store, &tail, [b'C', b'A', b'L', b'W']).await;
+        relabel(&*b.store, &tail, *b"CALW").await;
         every_read_refuses(&*b.store, &ns, b.name).await;
         let err = ns
             .compact(&CompactionOptions::default())
@@ -124,7 +124,7 @@ async fn another_builds_segment_magic_is_refused() {
     for b in cas_backends() {
         let ns = built(b.store.clone()).await;
         let data = object(&*b.store, "docs/segments", "/data.bin").await;
-        relabel(&*b.store, &data, [b'C', b'A', b'L', b'S']).await;
+        relabel(&*b.store, &data, *b"CALS").await;
         every_read_refuses(&*b.store, &ns, b.name).await;
     }
 }
@@ -134,7 +134,7 @@ async fn another_builds_index_magic_is_refused() {
     for b in cas_backends() {
         let ns = built(b.store.clone()).await;
         let index = object(&*b.store, "docs/segments", "/index-1.bin").await;
-        relabel(&*b.store, &index, [b'C', b'A', b'L', b'I']).await;
+        relabel(&*b.store, &index, *b"CALI").await;
         let before = snapshot(&*b.store).await;
         let err = ns.query(&[0.0, 0.0], 5).await.err().unwrap();
         assert!(matches!(err, ItzmaError::CorruptIndex { .. }), "{err:?}");
