@@ -10,6 +10,8 @@ that section into the version's notes.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-01
+
 ### Added
 
 - First release. Namespaces with a fixed dimension and metric (L2, cosine,
@@ -29,3 +31,4 @@ that section into the version's notes.
   budgets.
 - Python bindings (`pip install itzma`) with NumPy and Arrow input, sync and
   async APIs.
+
