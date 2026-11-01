@@ -4,6 +4,13 @@
   <img alt="ITZMA: vector search on object storage" src=".github/assets/banner-dark.png" width="100%">
 </picture>
 
+[![CI](https://github.com/sergiommarcial/itzma/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sergiommarcial/itzma/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/itzma-core.svg)](https://crates.io/crates/itzma-core)
+[![docs.rs](https://img.shields.io/docsrs/itzma-core)](https://docs.rs/itzma-core)
+[![PyPI](https://img.shields.io/pypi/v/itzma.svg)](https://pypi.org/project/itzma/)
+[![Python versions](https://img.shields.io/pypi/pyversions/itzma.svg)](https://pypi.org/project/itzma/)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 # Itzma
 
 Itzma is vector retrieval on top of object storage, written in Rust, with Python bindings. Vectors are stored as plain objects in a bucket. There is no server between the caller and the data: any process that can reach the bucket can write, and any process can query. Correctness rests on two things the object store already does, put-if-absent and conditional update.
