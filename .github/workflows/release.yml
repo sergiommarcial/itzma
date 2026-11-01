@@ -34,7 +34,9 @@ jobs:
         name: bump the version and cut the changelog
         env:
           BUMP: ${{ inputs.version }}
-        run: echo "version=$(python3 scripts/release.py prepare "$BUMP")" >> "$GITHUB_OUTPUT"
+        run: |
+          version=$(python3 scripts/release.py prepare "$BUMP")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: the lockfiles still agree
         run: |
           cargo metadata --locked --format-version 1 > /dev/null
