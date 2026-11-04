@@ -21,7 +21,7 @@ default-members = [
 [workspace.package]
 # The one version: both crates inherit it, maturin reads it for the Python
 # package, and scripts/release.py bumps it.
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sergiommarcial/itzma"

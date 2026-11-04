@@ -10,6 +10,8 @@ that section into the version's notes.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-04
+
 ### Added
 
 - `gs://` and `az://` stores in Python, and three Rust crates that wrap the

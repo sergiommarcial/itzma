@@ -26,10 +26,10 @@ arrow-cast = "59"
 arrow-schema = "59"
 # Exact pin: the wheel and the crate are released together, and
 # scripts/release.py moves this with the workspace version.
-itzma-core = { path = "../itzma-core", version = "=0.1.0" }
-itzma-store-aws = { path = "../itzma-store-aws", version = "=0.1.0" }
-itzma-store-azure = { path = "../itzma-store-azure", version = "=0.1.0" }
-itzma-store-gcs = { path = "../itzma-store-gcs", version = "=0.1.0" }
+itzma-core = { path = "../itzma-core", version = "=0.2.0" }
+itzma-store-aws = { path = "../itzma-store-aws", version = "=0.2.0" }
+itzma-store-azure = { path = "../itzma-store-azure", version = "=0.2.0" }
+itzma-store-gcs = { path = "../itzma-store-gcs", version = "=0.2.0" }
 # The Arrow reader becomes a `Stream` of batches for `upsert_stream`. Already
 # in the tree through itzma-core and pyo3-async-runtimes.
 futures = "0.3"
