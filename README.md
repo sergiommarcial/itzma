@@ -11,11 +11,11 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/itzma.svg)](https://pypi.org/project/itzma/)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-# Itzma
+# ITZMA
 
 Itzma is vector retrieval on top of object storage, written in Rust, with Python bindings. Vectors are stored as plain objects in a bucket. There is no server between the caller and the data: any process that can reach the bucket can write, and any process can query. Correctness rests on two things the object store already does, put-if-absent and conditional update.
 
-It is a library. You embed it in your process, open a namespace, and S3 (or a local directory, or memory) holds the data.
+It is a library that runs in your process. Open a namespace, and S3 (or a local directory, or memory) holds the data.
 
 - [What it does](#what-it-does)
 - [Quick start](#quick-start)
@@ -38,9 +38,9 @@ It is a library. You embed it in your process, open a namespace, and S3 (or a lo
 
 - Namespaces with a fixed dimension and metric (L2, cosine, dot product).
 - Dense vector search, exact or through an index: HNSW (the default) or SQ8 with clustered partitions.
-- Sparse vectors (term id, weight) beside the dense one, with an exact sparse query and an optional inverted index.
-- Typed attributes, declared at create, and filtering on them, alone or narrowing a vector query.
-- Batched upserts and deletes, safe with many concurrent writers, with optional idempotency keys.
+- Sparse vectors of (term id, weight) pairs beside the dense one. Sparse queries are exact, and the inverted index is optional.
+- Typed attributes declared at create. Filter on them alone, or use them to narrow a vector query.
+- Upserts and deletes go in batches, and many writers can send them at once. Idempotency keys are optional.
 - S3 (and anything else `object_store` supports), local disk and in-memory stores.
 - Compaction, garbage collection and manifest recovery.
 - A RAM and NVMe read cache and a cache of decoded structures.
@@ -220,11 +220,11 @@ A batch with a sparse vector is written as WAL version 4 (5 with a key), which n
 
 `inspect::report(store, id)` lists what a namespace holds (manifest, segments, indexes, WAL, fences) and what looks wrong, without changing anything. Damage is a line in the report; only a failing store is an error.
 
+The `dump` example prints that report for a namespace on local disk and exits 1 if it found a problem:
+
 ```bash
 cargo run --example dump -- <namespace> --dir <path>
 ```
-
-prints that report for a namespace on local disk and exits 1 if it found a problem.
 
 ## Guarantees
 
@@ -265,7 +265,7 @@ Not guaranteed: exactly-once for plain writes (see [Writing](#writing)), and key
 | Index | `ITZI` | 1, kind 1 (SQ8) or 2 (HNSW) |
 | Sparse index | `ITZP` | 1 |
 
-A reader that meets a version or kind it does not know refuses it instead of guessing; a segment whose index kind is unknown is scanned flat.
+A reader refuses any version or kind it does not know. The one exception is an unknown index kind: that segment is scanned flat, as if it had no index.
 
 ## Errors
 
@@ -341,7 +341,7 @@ Requires Rust 1.87 or newer (edition 2024).
 
 ## Releases
 
-The crate and the Python package share one version and are released together. Changes go under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md) as they land. To release, run the **Release** workflow from the Actions tab with `patch`, `minor`, `major` or an exact version (the first release is `0.1.0`, the version already in the manifests). It bumps the version, turns `[Unreleased]` into that version's notes, commits, tags `vX.Y.Z`, and starts **Publish**, which runs the full CI on the tag, builds the wheels and the sdist, publishes `itzma-core`, `itzma-store` and the three store adapters to crates.io and `itzma` to PyPI, and creates the GitHub Release. A failed Publish can be run again for the same tag; steps already done are skipped. `make package` builds the crate and the sdist locally without publishing.
+The crate and the Python package share one version and are released together. Changes go under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md) as they land. To release, run the **Release** workflow from the Actions tab with `patch`, `minor`, `major` or an exact version. It bumps the version, turns `[Unreleased]` into that version's notes, commits, tags `vX.Y.Z`, and starts **Publish**, which runs the full CI on the tag, builds the wheels and the sdist, publishes `itzma-core`, `itzma-store` and the three store adapters to crates.io and `itzma` to PyPI, and creates the GitHub Release. A failed Publish can be run again for the same tag; steps already done are skipped. `make package` builds the crate and the sdist locally without publishing.
 
 ## Contributing
 

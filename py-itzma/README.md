@@ -1,6 +1,6 @@
 # itzma for Python
 
-Python bindings for [Itzma](https://github.com/sergiommarcial/itzma#readme): vector retrieval with an object store as the only durable state. The package embeds Itzma in your process. You open a namespace once, keep it warm in memory, and S3 (or a local directory) holds the data.
+Python bindings for [Itzma](https://github.com/sergiommarcial/itzma#readme), vector search with an object store as the only durable state. Itzma runs inside your process: open a namespace once and keep the handle warm in memory, while S3, GCS, Azure or a local directory holds the data.
 
 ## Install
 
@@ -77,7 +77,7 @@ Wrap each comparison in parentheses: `&` and `|` bind tighter than `==` and `>=`
 
 ## Keeping it compacted and indexed
 
-Writes land in a log that queries also read. Something has to fold it into segments and build indexes. You can call `ns.maintain()`, `ns.compact()`, `ns.index()` and `ns.gc()` yourself, or start a background loop:
+Writes land in a log that queries also read. Nothing folds that log into segments or builds indexes on its own, so either call `ns.maintain()`, `ns.compact()`, `ns.index()` and `ns.gc()` yourself or start a background loop:
 
 ```python
 m = ns.start_maintenance(timedelta(seconds=60))  # maintain + index every minute
