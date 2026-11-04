@@ -1,10 +1,12 @@
+from importlib.metadata import version
+
 import pytest
 
 import itzma
 
 
 def test_version_matches_the_crate() -> None:
-    assert itzma.__version__ == "0.1.0"
+    assert itzma.__version__ == version("itzma")
 
 
 def test_configure_refuses_zero_workers() -> None:
