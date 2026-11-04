@@ -8,12 +8,15 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import azure_sas
 import numpy as np
 import pytest
 
 import itzma
 
 S3_ENDPOINT = os.environ.get("ITZMA_TEST_S3_ENDPOINT")
+GCS_ENDPOINT = os.environ.get("ITZMA_TEST_GCS_ENDPOINT")
+AZURE_ENDPOINT = os.environ.get("ITZMA_TEST_AZURE_ENDPOINT")
 
 ATTRS = {
     "tag": itzma.AttrType.STRING,
@@ -29,6 +32,10 @@ def make_store(kind: str, tmp_path: Path) -> itzma.Store:
         return itzma.Store("memory://")
     if kind == "file":
         return itzma.Store(f"file://{tmp_path}")
+    if kind == "gs":
+        return make_gcs_store()
+    if kind == "az":
+        return make_azure_store()
     if S3_ENDPOINT is None:
         pytest.skip("ITZMA_TEST_S3_ENDPOINT is not set")
     bucket = os.environ.get("ITZMA_TEST_S3_BUCKET", "itzma-test")
@@ -43,13 +50,41 @@ def make_store(kind: str, tmp_path: Path) -> itzma.Store:
     )
 
 
-@pytest.fixture(params=["memory", "file", "s3"])
+def make_gcs_store(url: str | None = None) -> itzma.Store:
+    """storage-testbench from ``make gcs-up``, anonymous, under a fresh prefix
+    unless ``url`` names one (to reopen a store, as after a fork)."""
+    if GCS_ENDPOINT is None:
+        pytest.skip("ITZMA_TEST_GCS_ENDPOINT is not set")
+    bucket = os.environ.get("ITZMA_TEST_GCS_BUCKET", "itzma-test")
+    return itzma.Store(
+        url or f"gs://{bucket}/py-{uuid.uuid4().hex[:12]}",
+        endpoint=GCS_ENDPOINT,
+        control_endpoint=os.environ["ITZMA_TEST_GCS_CONTROL_ENDPOINT"],
+        anonymous=True,
+    )
+
+
+def make_azure_store(url: str | None = None) -> itzma.Store:
+    """Azurite from ``make azure-up`` through a SAS, under a fresh prefix
+    unless ``url`` names one (to reopen a store, as after a fork)."""
+    if AZURE_ENDPOINT is None:
+        pytest.skip("ITZMA_TEST_AZURE_ENDPOINT is not set")
+    container = os.environ.get("ITZMA_TEST_AZURE_CONTAINER", "itzma-test")
+    return itzma.Store(
+        url or f"az://{container}/py-{uuid.uuid4().hex[:12]}",
+        account=azure_sas.ACCOUNT,
+        endpoint=AZURE_ENDPOINT,
+        sas_token=azure_sas.account_sas(),
+    )
+
+
+@pytest.fixture(params=["memory", "file", "s3", "gs", "az"])
 def store(request: pytest.FixtureRequest, tmp_path: Path) -> itzma.Store:
     """Every backend. file:// has no conditional update."""
     return make_store(request.param, tmp_path)
 
 
-@pytest.fixture(params=["memory", "s3"])
+@pytest.fixture(params=["memory", "s3", "gs", "az"])
 def cas_store(request: pytest.FixtureRequest, tmp_path: Path) -> itzma.Store:
     """Backends with conditional update, for compact, index and maintain."""
     return make_store(request.param, tmp_path)

@@ -24,3 +24,43 @@ services:
       interval: 2s
       timeout: 5s
       retries: 30
+  # Google's storage-testbench for the GCS adapter (crates/itzma-store-gcs).
+  # fake-gcs-server does not fit: the official SDK lists, deletes and copies
+  # over gRPC google.storage.v2, which only this emulator serves. It is in a
+  # profile so a plain `docker compose up` (the MinIO jobs) leaves it out;
+  # `make gcs-up` starts it, its gRPC server and the test bucket.
+  gcs:
+    profiles: ["gcs"]
+    image: gcr.io/cloud-devrel-public-resources/storage-testbench:v0.67.0
+    platform: linux/amd64
+    # Two testbench bugs are patched at start, each where it parts from real
+    # GCS, so the adapter is tested on its production path:
+    # - The SDK's single-request upload sends its media part with no content
+    #   type, which the parser indexes directly (KeyError, a 500); it now
+    #   defaults to octet-stream. (Resumable uploads cannot stand in: the SDK
+    #   drops the port from the Host header, so the testbench hands back an
+    #   upload URL on port 80.)
+    # - A suffix range longer than the object starts below zero
+    #   (`bytes -90-9/10`); it now starts at 0, as RFC 9110 and GCS do.
+    # Each `grep -q` stops the container if a new image no longer matches.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        sed -i 's/headers\[content_type_key\]\.decode/headers.get(content_type_key, b"application\/octet-stream").decode/'
+        testbench/common.py
+        && grep -q 'headers.get(content_type_key' testbench/common.py
+        && sed -i 's/begin = end - last$/begin = max(0, end - last)/' gcs/object.py
+        && grep -q 'begin = max(0, end - last)' gcs/object.py
+        && exec python3 testbench_run.py 0.0.0.0 9000 10
+    ports:
+      - "127.0.0.1:9100:9000"
+      - "127.0.0.1:9101:9101"
+  # Azurite's blob service for the Azure adapter (crates/itzma-store-azure).
+  # In a profile, like gcs, so the MinIO jobs leave it out; `make azure-up`
+  # starts it and creates the container.
+  azure:
+    profiles: ["azure"]
+    image: mcr.microsoft.com/azure-storage/azurite:3.37.0
+    command: ["azurite-blob", "--blobHost", "0.0.0.0", "--location", "/data"]
+    ports:
+      - "127.0.0.1:10000:10000"

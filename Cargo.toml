@@ -2,13 +2,20 @@
 resolver = "3"
 members = [
     "crates/itzma-core",
+    "crates/itzma-store",
     "crates/itzma-python",
+    "crates/itzma-store-gcs",
+    "crates/itzma-store-azure",
+    "crates/itzma-store-aws",
 ]
 # itzma-python's test binary links libpython, so a plain `cargo test` or
 # `cargo clippy` leaves it out. The py-* Makefile targets and CI's python job
-# build it with PYO3_PYTHON pointing at py-itzma/.venv.
+# build it with PYO3_PYTHON pointing at py-itzma/.venv. The store adapters
+# need newer Rust than the 1.87 floor, so they are left out too and have
+# their own Make targets and CI jobs.
 default-members = [
     "crates/itzma-core",
+    "crates/itzma-store",
 ]
 
 [workspace.package]

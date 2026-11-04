@@ -73,6 +73,11 @@ class Store:
         session_token: str | None = None,
         allow_http: bool | None = None,
         env: bool = True,
+        control_endpoint: str | None = None,
+        anonymous: bool | None = None,
+        account: str | None = None,
+        credential: str | None = None,
+        sas_token: str | None = None,
     ) -> Store: ...
 
 @final

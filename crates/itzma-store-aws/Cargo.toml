@@ -1,0 +1,31 @@
+[package]
+name = "itzma-store-aws"
+version.workspace = true
+edition.workspace = true
+# aws-sdk-s3 and aws-config need 1.94.1. itzma-core stays on the workspace
+# floor (1.87) and never depends on this crate.
+rust-version = "1.94.1"
+description = "An object_store::ObjectStore over Amazon's official S3 SDK"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["object-storage", "s3", "aws", "object-store", "itzma"]
+categories = ["database", "api-bindings"]
+
+[dependencies]
+async-trait = "0.1"
+# Without the SDK's `rustls` default feature, which brings the legacy
+# hyper 0.14 client (rustls 0.21, h2 0.3) and its open advisories; the
+# default https client is hyper 1 with current rustls.
+aws-config = "1.13"
+aws-sdk-s3 = { version = "1.157", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+futures = "0.3"
+md5 = { package = "md-5", version = "0.11" }
+object_store = "0.14"
+percent-encoding = "2"
+
+[dev-dependencies]
+itzma-store = { path = "../itzma-store", version = "=0.1.0", features = ["conformance"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

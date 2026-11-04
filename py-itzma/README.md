@@ -1,6 +1,6 @@
 # itzma for Python
 
-Python bindings for [Itzma](https://github.com/sergiommarcial/itzma#readme): vector retrieval with an object store as the only durable state. The package embeds Itzma in your process. You open a namespace once, keep it warm in memory, and S3 (or a local directory) holds the data.
+Python bindings for [Itzma](https://github.com/sergiommarcial/itzma#readme), vector search with an object store as the only durable state. Itzma runs inside your process: open a namespace once and keep the handle warm in memory, while S3, GCS, Azure or a local directory holds the data.
 
 ## Install
 
@@ -29,7 +29,8 @@ import numpy as np
 import itzma
 from itzma import attr
 
-store = itzma.Store("memory://")  # or "file:///var/lib/itzma", "s3://bucket/prefix"
+# or "file:///var/lib/itzma", "s3://bucket/prefix", "gs://bucket/prefix", "az://container/prefix"
+store = itzma.Store("memory://")
 schema = itzma.Schema(
     dim=4,
     metric=itzma.Metric.COSINE,
@@ -77,7 +78,7 @@ Wrap each comparison in parentheses: `&` and `|` bind tighter than `==` and `>=`
 
 ## Keeping it compacted and indexed
 
-Writes land in a log that queries also read. Something has to fold it into segments and build indexes. You can call `ns.maintain()`, `ns.compact()`, `ns.index()` and `ns.gc()` yourself, or start a background loop:
+Writes land in a log that queries also read. Nothing folds that log into segments or builds indexes on its own, so either call `ns.maintain()`, `ns.compact()`, `ns.index()` and `ns.gc()` yourself or start a background loop:
 
 ```python
 m = ns.start_maintenance(timedelta(seconds=60))  # maintain + index every minute
@@ -136,7 +137,10 @@ A handle opened before a fork refuses to work in the child and says so. Itzma ke
 
 ## Settings
 
-- **S3.** Region and credentials come from the usual `AWS_*` environment variables. Keywords override them: `region`, `endpoint`, `access_key_id`, `secret_access_key`, `session_token`, `allow_http` (for a local MinIO). `env=False` ignores the environment entirely.
+- **S3.** Region and credentials come from the AWS SDK's usual chain: `AWS_*` environment variables, `~/.aws` profiles, web identity, then the container or instance role. The region falls back to `us-east-1`. Keywords override them: `region`, `endpoint`, `access_key_id`, `secret_access_key`, `session_token`, `allow_http` (for a local MinIO). `env=False` ignores the environment and profiles; with no keys it then uses the instance role. Reading a missing object needs `s3:ListBucket`, or S3 answers 403 instead of 404.
+- **GCS.** `gs://bucket/prefix` uses Google's default credentials (Workload Identity on GKE and Cloud Run, or `gcloud auth application-default login`). For an emulator, pass `endpoint` and `control_endpoint` (the gRPC one) together, and `anonymous=True` to send no credentials.
+- **Azure.** `az://container/prefix` with `account`. `credential` picks how to sign in: `"managed_identity"` (the default), `"workload_identity"`, `"developer_tools"` (`az login`) or `"anonymous"`; or pass `sas_token` instead. `endpoint` overrides `https://<account>.blob.core.windows.net`; token credentials need `https`, so an emulator such as Azurite takes a SAS token.
+- Each keyword is refused on a URL whose scheme does not use it.
 - **Cache.** `itzma.Cache(ram_bytes=..., nvme_dir=..., nvme_bytes=...)` keeps segment and index bytes in RAM and optionally on a local disk. The manifest is never cached, so a write is visible to the next query either way.
 - **Large loads.** An Arrow table or stream (pyarrow, Polars, DuckDB, anything with `__arrow_c_stream__`) is read one record batch at a time and written in chunks of about `target_bytes` (32 MiB by default), with `depth` (2) encoded chunks waiting at most, so a load of any size runs in bounded memory. If it fails part way, the error carries `first_seq`, `last_seq` and `rows_written`; resume an unkeyed load from `rows_written`. With `key=`, chunk `n` is written under `"<key>#<n>"`, so the key can be at most 107 bytes, and a retry with `retry_from=e.first_seq` writes only the missing chunks. Don't give a plain keyed write a key of the form `<load key>#<number>`: chunk keys share that space. A NaN in an Arrow number column raises `InvalidAttrs`. `target_bytes` and `depth` are checked for every input (0 is refused) but only Arrow input uses them.
 - **Read budget.** `read_budget=` caps the bytes one query or compaction may read (1 GiB by default). Going over raises `ReadBudgetExceeded`.

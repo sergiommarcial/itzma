@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import random_rows, schema
+from conftest import make_azure_store, make_gcs_store, random_rows, schema
 
 import itzma
 
@@ -40,6 +40,56 @@ def test_a_forked_child_must_open_again(tmp_path: Path, ns_id: str) -> None:
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 0
     assert ns.query(Q, 5).ids == expected  # the parent is unaffected
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="no fork on Windows")
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_a_gcs_store_is_refused_after_fork_and_rebuilt_in_the_child(ns_id: str) -> None:
+    store = make_gcs_store()
+    ns = itzma.Namespace.create(store, ns_id, schema())
+    ns.upsert(random_rows(20))
+    expected = ns.query(Q, 5).ids
+
+    pid = os.fork()
+    if pid == 0:  # child: the SDK clients belong to the parent's runtime
+        code = 1
+        try:
+            try:
+                itzma.Namespace.open(store, ns_id)
+            except itzma.ItzmaError as e:
+                if "fork" in str(e):
+                    fresh = itzma.Namespace.open(make_gcs_store(url=store.url), ns_id)
+                    if fresh.query(Q, 5).ids == expected:
+                        code = 0
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="no fork on Windows")
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_an_azure_store_is_refused_after_fork_and_rebuilt_in_the_child(ns_id: str) -> None:
+    store = make_azure_store()
+    ns = itzma.Namespace.create(store, ns_id, schema())
+    ns.upsert(random_rows(20))
+    expected = ns.query(Q, 5).ids
+
+    pid = os.fork()
+    if pid == 0:  # child: the SDK client belongs to the parent's runtime
+        code = 1
+        try:
+            try:
+                itzma.Namespace.open(store, ns_id)
+            except itzma.ItzmaError as e:
+                if "fork" in str(e):
+                    fresh = itzma.Namespace.open(make_azure_store(url=store.url), ns_id)
+                    if fresh.query(Q, 5).ids == expected:
+                        code = 0
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="no fork on Windows")

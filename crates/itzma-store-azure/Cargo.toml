@@ -1,0 +1,29 @@
+[package]
+name = "itzma-store-azure"
+version.workspace = true
+edition.workspace = true
+# azure_storage_blob needs 1.88. itzma-core stays on the workspace floor
+# (1.87) and never depends on this crate.
+rust-version = "1.88"
+description = "An object_store::ObjectStore over Microsoft's official Azure Blob Storage SDK"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["object-storage", "azure", "blob-storage", "object-store", "itzma"]
+categories = ["database", "api-bindings"]
+
+[dependencies]
+async-trait = "0.1"
+azure_core = "1.1"
+azure_identity = "1.0"
+azure_storage_blob = "1.1"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+futures = "0.3"
+object_store = "0.14"
+
+[dev-dependencies]
+# Signs the test SAS with Azurite's development key (tests/common).
+azure_core = { version = "1.1", features = ["hmac_rust"] }
+itzma-store = { path = "../itzma-store", version = "=0.1.0", features = ["conformance"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,31 @@
+[package]
+name = "itzma-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Conformance checks for an object_store::ObjectStore that itzma runs on"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["object-storage", "object-store", "testing", "conformance"]
+categories = ["development-tools::testing"]
+
+[dependencies]
+object_store = "0.14"
+futures = { version = "0.3", optional = true }
+
+[features]
+# The conformance suite: one check per item of the storage contract, and the
+# macro that turns them into tests. Adapters take it as a dev-dependency.
+conformance = ["dep:futures"]
+
+[dev-dependencies]
+# tests/catches.rs implements `ObjectStore` for its fault-injecting store.
+async-trait = "0.1"
+futures = "0.3"
+# Turns the feature on for this crate's own tests, so a plain `cargo test`
+# (what `make test-s3` and CI run) builds the suite.
+itzma-store = { path = ".", features = ["conformance"] }
+# `aws` is only for the MinIO run in tests/conformance.rs.
+object_store = { version = "0.14", features = ["aws"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

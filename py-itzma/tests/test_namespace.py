@@ -51,7 +51,7 @@ def test_no_attrs_means_typed_and_empty(store: itzma.Store, ns_id: str) -> None:
 
 @pytest.mark.parametrize(
     "url",
-    ["memory", "file://relative/path", "s3://", "gs://bucket", ""],
+    ["memory", "file://relative/path", "s3://", "gs://", "http://bucket", ""],
 )
 def test_bad_urls(url: str) -> None:
     with pytest.raises(itzma.InvalidInput):
