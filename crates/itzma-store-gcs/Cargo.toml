@@ -29,5 +29,5 @@ object_store = "0.14"
 # The testbench retry test's header (tests/gcs.rs).
 http = "1"
 futures = "0.3"
-itzma-store = { path = "../itzma-store", version = "=0.1.0", features = ["conformance"] }
+itzma-store = { path = "../itzma-store", version = "=0.2.0", features = ["conformance"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
