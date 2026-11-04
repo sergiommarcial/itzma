@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/itzma-core",
+    "crates/itzma-store",
     "crates/itzma-python",
 ]
 # itzma-python's test binary links libpython, so a plain `cargo test` or
@@ -9,6 +10,7 @@ members = [
 # build it with PYO3_PYTHON pointing at py-itzma/.venv.
 default-members = [
     "crates/itzma-core",
+    "crates/itzma-store",
 ]
 
 [workspace.package]
