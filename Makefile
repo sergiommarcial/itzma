@@ -28,7 +28,7 @@ PY_BASE_PYTHON = $(shell $(PY_VENV_PYTHON) -c 'import os, sys; print(os.path.rea
 	test test-fast test-msrv test-s3 s3-up s3-down test-aws test-gcs gcs-up gcs-down test-azure azure-up azure-down bench \
 	lint fmt-check clippy doc deny machete \
 	format doc-open \
-	py-env py-dev py-rust py-rust-one py-lint py-test py \
+	py-env py-dev py-rust py-rust-one py-lint py-format py-test py \
 	release-test package \
 	ci clean
 
@@ -192,6 +192,9 @@ py-lint: py-dev ## ruff, mypy --strict and stubtest on the Python package
 	cd $(PY_DIR) && uv run --no-sync ruff check . && uv run --no-sync ruff format --check .
 	cd $(PY_DIR) && uv run --no-sync mypy
 	cd $(PY_DIR) && uv run --no-sync python -m mypy.stubtest itzma._itzma --allowlist stubtest-allowlist.txt
+
+py-format: py-env ## Reformat the Python package with ruff and apply its safe fixes, writing changes
+	cd $(PY_DIR) && uv run --no-sync ruff format . && uv run --no-sync ruff check --fix .
 
 py-test: py-dev ## Run the Python tests (MinIO, storage-testbench and Azurite too when their ITZMA_TEST_*_ENDPOINT is set)
 	cd $(PY_DIR) && uv run --no-sync pytest

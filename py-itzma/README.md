@@ -29,7 +29,8 @@ import numpy as np
 import itzma
 from itzma import attr
 
-store = itzma.Store("memory://")  # or "file:///var/lib/itzma", "s3://bucket/prefix", "gs://bucket/prefix", "az://container/prefix"
+# or "file:///var/lib/itzma", "s3://bucket/prefix", "gs://bucket/prefix", "az://container/prefix"
+store = itzma.Store("memory://")
 schema = itzma.Schema(
     dim=4,
     metric=itzma.Metric.COSINE,
