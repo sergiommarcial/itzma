@@ -10,10 +10,33 @@ from itzma.exceptions import InvalidInput
 
 
 class Store:
-    """An object store: ``s3://bucket[/prefix]``, ``file:///abs/path`` or ``memory://``.
+    """An object store: ``s3://bucket[/prefix]``, ``gs://bucket[/prefix]``,
+    ``az://container[/prefix]``, ``file:///abs/path`` or ``memory://``.
 
-    For S3, credentials and region come from the usual ``AWS_*`` environment
-    variables unless ``env=False``, and the keywords override them. A
+    For S3, credentials and region come from the AWS SDK's usual chain
+    (``AWS_*`` environment variables, ``~/.aws`` profiles, web identity, then
+    the container or instance role) unless ``env=False``, and the keywords
+    override them; an endpoint may also come from ``AWS_ENDPOINT_URL`` or
+    ``AWS_ENDPOINT`` (with ``AWS_ALLOW_HTTP``). The region defaults to
+    ``us-east-1`` when neither the keywords, the environment nor a profile
+    give one. With ``env=False`` only the keywords count, and with no keys the
+    instance role. An ``http://`` endpoint needs ``allow_http=True``. For GCS,
+    credentials come from Google's default credentials (Workload Identity on
+    GKE and Cloud Run, or ``gcloud auth application-default login``);
+    ``endpoint`` and ``control_endpoint`` (the gRPC one) point at an emulator
+    and go together, and ``anonymous=True`` sends no credentials. Building a
+    ``gs://`` store looks the credentials up, which off Google Cloud can wait
+    on the metadata server; a store that cannot be built raises
+    ``StoreError``. For Azure, ``account`` names the storage account and
+    ``credential`` picks how to sign in: ``"managed_identity"`` (the default),
+    ``"workload_identity"``, ``"developer_tools"`` (``az login``) or
+    ``"anonymous"``; ``sas_token`` is a credential of its own and goes
+    without ``credential``. ``account`` builds the default endpoint
+    (``https://<account>.blob.core.windows.net``); with ``endpoint`` set it
+    only names the store. Token
+    credentials need an ``https`` endpoint, so an emulator such as Azurite
+    takes a SAS token. Each keyword is refused on a URL whose scheme doesn't
+    use it. A
     ``file://`` store has no conditional update, so ``compact``, ``index`` and
     ``maintain`` fail on it with ``StoreError``. A ``memory://`` store lives in
     this object: namespaces opened through the same ``Store`` share it.
@@ -30,6 +53,11 @@ class Store:
         session_token: str | None = None,
         allow_http: bool | None = None,
         env: bool = True,
+        control_endpoint: str | None = None,
+        anonymous: bool | None = None,
+        account: str | None = None,
+        credential: str | None = None,
+        sas_token: str | None = None,
     ) -> None:
         self.url = url
         self._store = _itzma.Store(
@@ -41,6 +69,11 @@ class Store:
             session_token=session_token,
             allow_http=allow_http,
             env=env,
+            control_endpoint=control_endpoint,
+            anonymous=anonymous,
+            account=account,
+            credential=credential,
+            sas_token=sas_token,
         )
 
     def __repr__(self) -> str:

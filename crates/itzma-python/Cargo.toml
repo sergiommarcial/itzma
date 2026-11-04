@@ -2,7 +2,8 @@
 name = "itzma-python"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Links itzma-store-aws, whose SDK needs 1.94.1; itzma-core stays on 1.87.
+rust-version = "1.94.1"
 license.workspace = true
 repository.workspace = true
 description = "Python bindings for itzma-core, built by maturin as itzma._itzma"
@@ -26,12 +27,14 @@ arrow-schema = "59"
 # Exact pin: the wheel and the crate are released together, and
 # scripts/release.py moves this with the workspace version.
 itzma-core = { path = "../itzma-core", version = "=0.1.0" }
+itzma-store-aws = { path = "../itzma-store-aws", version = "=0.1.0" }
+itzma-store-azure = { path = "../itzma-store-azure", version = "=0.1.0" }
+itzma-store-gcs = { path = "../itzma-store-gcs", version = "=0.1.0" }
 # The Arrow reader becomes a `Stream` of batches for `upsert_stream`. Already
 # in the tree through itzma-core and pyo3-async-runtimes.
 futures = "0.3"
-# The S3 backend is a real dependency here, unlike in itzma-core.
 numpy = "0.29"
-object_store = { version = "0.14", features = ["aws"] }
+object_store = "0.14"
 pyo3 = { version = "0.29", features = ["abi3-py310"] }
 # No default features: its buffer protocol needs the Python 3.11 limited API, and
 # the extension is abi3-py310.

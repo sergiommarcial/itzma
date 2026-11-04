@@ -6,6 +6,11 @@ RUST_MIN := $(shell sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
 
 # Where compose.yaml publishes its MinIO container.
 S3_ENDPOINT := http://127.0.0.1:9000
+# storage-testbench (compose profile gcs): the JSON API and the gRPC server.
+GCS_ENDPOINT := http://127.0.0.1:9100
+GCS_CONTROL_ENDPOINT := http://127.0.0.1:9101
+# Azurite (compose profile azure): the development account's blob endpoint.
+AZURE_ENDPOINT := http://127.0.0.1:10000/devstoreaccount1
 
 # The Python package and its virtualenv (uv).
 PY_DIR := py-itzma
@@ -20,7 +25,7 @@ PY_BASE_PYTHON = $(shell $(PY_VENV_PYTHON) -c 'import os, sys; print(os.path.rea
 .PHONY: help check-tools check-cargo check-cargo-deny check-cargo-machete check-docker check-uv \
 	install install-tools \
 	build build-release \
-	test test-fast test-msrv test-s3 s3-up s3-down bench \
+	test test-fast test-msrv test-s3 s3-up s3-down test-aws test-gcs gcs-up gcs-down test-azure azure-up azure-down bench \
 	lint fmt-check clippy doc deny machete \
 	format doc-open \
 	py-env py-dev py-rust py-rust-one py-lint py-test py \
@@ -108,6 +113,38 @@ s3-up: check-docker ## Start MinIO and create the test bucket (compose.yaml)
 s3-down: check-docker ## Stop MinIO and delete its data
 	docker compose down -v
 
+test-aws: check-cargo s3-up ## Run the AWS adapter's tests against MinIO (not a default member: Rust 1.94.1)
+	ITZMA_TEST_S3_ENDPOINT=$(S3_ENDPOINT) cargo test --locked -p itzma-store-aws
+
+##@ GCS test server
+
+gcs-up: check-docker ## Start storage-testbench, its gRPC server and the test bucket (compose profile gcs)
+	docker compose --profile gcs up -d gcs
+	curl -sf --retry 60 --retry-all-errors --retry-delay 1 -o /dev/null $(GCS_ENDPOINT)/storage/v1/b?project=test
+	curl -sf --retry 5 -o /dev/null "$(GCS_ENDPOINT)/start_grpc?port=9101"
+	@code=$$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"name":"itzma-test"}' "$(GCS_ENDPOINT)/storage/v1/b?project=test"); \
+		case $$code in 200|409) ;; *) echo "creating the itzma-test bucket failed: HTTP $$code"; exit 1;; esac
+
+gcs-down: check-docker ## Stop storage-testbench and drop its data
+	docker compose --profile gcs rm -sf gcs
+
+test-gcs: check-cargo gcs-up ## Run the GCS adapter's tests against storage-testbench (not a default member: Rust 1.91)
+	ITZMA_TEST_GCS_ENDPOINT=$(GCS_ENDPOINT) ITZMA_TEST_GCS_CONTROL_ENDPOINT=$(GCS_CONTROL_ENDPOINT) cargo test --locked -p itzma-store-gcs
+
+##@ Azure test server
+
+azure-up: check-docker ## Start Azurite's blob service and create the test container (compose profile azure)
+	docker compose --profile azure up -d azure
+	curl -s --retry 30 --retry-all-errors --retry-delay 1 -o /dev/null $(AZURE_ENDPOINT)
+	@code=$$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Length: 0' "$(AZURE_ENDPOINT)/itzma-test?restype=container&$$(python3 scripts/azurite_sas.py)"); \
+		case $$code in 201|409) ;; *) echo "creating the itzma-test container failed: HTTP $$code"; exit 1;; esac
+
+azure-down: check-docker ## Stop Azurite and drop its data
+	docker compose --profile azure rm -sf azure
+
+test-azure: check-cargo azure-up ## Run the Azure adapter's tests against Azurite (not a default member: Rust 1.88)
+	ITZMA_TEST_AZURE_ENDPOINT=$(AZURE_ENDPOINT) cargo test --locked -p itzma-store-azure
+
 ##@ Linting & formatting
 
 lint: fmt-check clippy doc deny machete ## Run all static analysis (no files written)
@@ -117,6 +154,7 @@ fmt-check: check-cargo ## Check formatting with rustfmt
 
 clippy: check-cargo ## Lint with clippy, warnings are errors
 	cargo clippy --locked --all-targets -- -D warnings
+	cargo clippy --locked -p itzma-store-gcs -p itzma-store-azure -p itzma-store-aws --all-targets -- -D warnings
 
 doc: check-cargo ## Build rustdoc; broken links and missing docs are errors
 	RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p itzma-core
@@ -155,7 +193,7 @@ py-lint: py-dev ## ruff, mypy --strict and stubtest on the Python package
 	cd $(PY_DIR) && uv run --no-sync mypy
 	cd $(PY_DIR) && uv run --no-sync python -m mypy.stubtest itzma._itzma --allowlist stubtest-allowlist.txt
 
-py-test: py-dev ## Run the Python tests (MinIO too when ITZMA_TEST_S3_ENDPOINT is set)
+py-test: py-dev ## Run the Python tests (MinIO, storage-testbench and Azurite too when their ITZMA_TEST_*_ENDPOINT is set)
 	cd $(PY_DIR) && uv run --no-sync pytest
 
 py: py-rust py-lint py-test ## Everything CI's python job runs
@@ -165,8 +203,8 @@ py: py-rust py-lint py-test ## Everything CI's python job runs
 release-test: check-uv ## Test scripts/release.py (version bumps, changelog, tag checks)
 	uv run --no-project --with pytest pytest -q scripts
 
-package: check-cargo check-uv ## Build what a release publishes, without publishing: the crate (cargo publish --dry-run) and the Python sdist
-	cargo publish --locked --dry-run --allow-dirty -p itzma-core
+package: check-cargo check-uv ## Build what a release publishes, without publishing: the crates (cargo publish --dry-run) and the Python sdist
+	cargo publish --locked --dry-run --allow-dirty -p itzma-core -p itzma-store -p itzma-store-gcs -p itzma-store-azure -p itzma-store-aws
 	cd py-itzma && uvx --from 'maturin>=1.9,<2' maturin sdist --out ../target/dist
 
 ##@ CI

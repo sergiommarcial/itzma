@@ -1,8 +1,9 @@
 """Version bumps, changelog sections and tag checks for a release.
 
-The version lives in the workspace `Cargo.toml` (both crates inherit it, and
-maturin reads it for the Python package), in `itzma-python`'s exact pin on
-`itzma-core`, and in `Cargo.lock`. This script keeps them in step.
+The version lives in the workspace `Cargo.toml` (every crate inherits it, and
+maturin reads it for the Python package), in the exact pin each crate puts on
+another (`itzma-python` on `itzma-core`, the adapters on `itzma-store`), and
+in `Cargo.lock`. This script keeps them in step.
 
     release.py prepare <patch|minor|major|X.Y.Z>   bump, cut CHANGELOG, print version
     release.py check vX.Y.Z                         fail unless every version matches
@@ -55,11 +56,42 @@ def current_version(root: Path) -> str:
     return _workspace_version((root / "Cargo.toml").read_text()).group(1)
 
 
-def _core_pin(text: str) -> re.Match[str]:
-    match = re.search(r'itzma-core = \{[^}]*version = "=([^"]*)"', text)
+# A dependency of one workspace crate on another: a path plus an exact pin.
+PIN = re.compile(r'^(itzma-[a-z-]+) = \{([^}\n]*)\}', re.MULTILINE)
+EXACT = re.compile(r'version = "=([^"]*)"')
+
+
+def _manifests(root: Path) -> list[Path]:
+    return sorted(root.glob("crates/*/Cargo.toml"))
+
+
+def _crate_name(manifest: Path) -> str:
+    match = re.search(r'^\[package\]\nname = "([^"]*)"', manifest.read_text(), re.MULTILINE)
     if not match:
-        raise ReleaseError("itzma-python does not pin itzma-core with version = \"=X.Y.Z\"")
-    return match
+        raise ReleaseError(f"{manifest}: no package name")
+    return match.group(1)
+
+
+def _is_pinned(dep: re.Match[str], own: str) -> bool:
+    # A crate's dev-dependency on itself (to turn on a feature for its own
+    # tests) carries no version; cargo drops it when publishing.
+    return "path = " in dep.group(2) and dep.group(1) != own
+
+
+def _pins(manifest: Path) -> list[tuple[str, re.Match[str]]]:
+    """Each workspace dependency in `manifest`, with the match of its exact pin."""
+    own = _crate_name(manifest)
+    pins = []
+    for dep in PIN.finditer(manifest.read_text()):
+        if not _is_pinned(dep, own):
+            continue
+        exact = EXACT.search(dep.group(2))
+        if not exact:
+            raise ReleaseError(
+                f"{manifest.parent.name} does not pin {dep.group(1)} with version = \"=X.Y.Z\""
+            )
+        pins.append((dep.group(1), exact))
+    return pins
 
 
 def _lock_pattern(name: str) -> re.Pattern[str]:
@@ -67,20 +99,27 @@ def _lock_pattern(name: str) -> re.Pattern[str]:
 
 
 def set_version(root: Path, version: str) -> None:
+    for manifest in _manifests(root):
+        _pins(manifest)  # refuse a path dependency without an exact pin, before any write
     cargo = root / "Cargo.toml"
     text = cargo.read_text()
     match = _workspace_version(text)
     cargo.write_text(text[: match.start(1)] + version + text[match.end(1) :])
 
-    python_cargo = root / "crates/itzma-python/Cargo.toml"
-    text = python_cargo.read_text()
-    match = _core_pin(text)
-    python_cargo.write_text(text[: match.start(1)] + version + text[match.end(1) :])
+    for manifest in _manifests(root):
+        own = _crate_name(manifest)
+        text = PIN.sub(
+            lambda dep: EXACT.sub(f'version = "={version}"', dep.group(0))
+            if _is_pinned(dep, own)
+            else dep.group(0),
+            manifest.read_text(),
+        )
+        manifest.write_text(text)
 
     # uv.lock records no version for itzma: pyproject takes it from Cargo.
     lock = root / "Cargo.lock"
     text = lock.read_text()
-    for name in ["itzma-core", "itzma-python"]:
+    for name in [_crate_name(m) for m in _manifests(root)]:
         text, count = _lock_pattern(name).subn(rf"\g<1>{version}\g<3>", text)
         if count != 1:
             raise ReleaseError(f"Cargo.lock: expected one {name} entry, found {count}")
@@ -89,14 +128,12 @@ def set_version(root: Path, version: str) -> None:
 
 def check(root: Path, tag: str) -> None:
     want = tag.removeprefix("v")
-    found = {
-        "Cargo.toml": current_version(root),
-        "itzma-python's itzma-core pin": _core_pin(
-            (root / "crates/itzma-python/Cargo.toml").read_text()
-        ).group(1),
-    }
+    found = {"Cargo.toml": current_version(root)}
+    for manifest in _manifests(root):
+        for dep, exact in _pins(manifest):
+            found[f"{manifest.parent.name}'s {dep} pin"] = exact.group(1)
     lock = (root / "Cargo.lock").read_text()
-    for name in ["itzma-core", "itzma-python"]:
+    for name in [_crate_name(m) for m in _manifests(root)]:
         match = _lock_pattern(name).search(lock)
         found[f"Cargo.lock {name}"] = match.group(2) if match else "missing"
     wrong = {where: v for where, v in found.items() if v != want}

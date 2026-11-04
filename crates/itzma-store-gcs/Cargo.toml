@@ -1,0 +1,33 @@
+[package]
+name = "itzma-store-gcs"
+version.workspace = true
+edition.workspace = true
+# google-cloud-storage needs 1.91. itzma-core stays on the workspace floor
+# (1.87) and never depends on this crate.
+rust-version = "1.91"
+description = "An object_store::ObjectStore over Google's official Cloud Storage SDK"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["object-storage", "gcs", "google-cloud", "object-store", "itzma"]
+categories = ["database", "api-bindings"]
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+futures = "0.3"
+# Anonymous credentials for the emulator; production uses the SDK's default
+# credentials (Workload Identity on GKE and Cloud Run).
+google-cloud-auth = "1.18"
+# The SDK error's gRPC status codes (errors.rs).
+google-cloud-gax = "1.15"
+google-cloud-storage = "1.21"
+object_store = "0.14"
+
+[dev-dependencies]
+# The testbench retry test's header (tests/gcs.rs).
+http = "1"
+futures = "0.3"
+itzma-store = { path = "../itzma-store", version = "=0.1.0", features = ["conformance"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

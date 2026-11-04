@@ -293,6 +293,24 @@ Anything that implements `object_store::ObjectStore` works: S3, GCS, Azure, loca
 
 The tests run against MinIO as well (`make test-s3`), which checks that conditional writes really are atomic under concurrent writers.
 
+### Cloud adapters on the official SDKs
+
+Three crates in this repository wrap the vendors' own Rust SDKs as an `ObjectStore`, for when you want the SDK's credentials, retries, timeouts and endpoints rather than `object_store`'s clients:
+
+| Crate | Store | Build it from your client | Or from settings | Rust |
+|---|---|---|---|---|
+| `itzma-store-gcs` | Google Cloud Storage | `GcsStore::new(storage, control, bucket)` | `GcsStore::connect(bucket, GcsOptions)` | 1.91 |
+| `itzma-store-azure` | Azure Blob Storage | `AzureStore::new(container_client)` | `AzureStore::connect(account, container, AzureOptions)` | 1.88 |
+| `itzma-store-aws` | Amazon S3 and compatibles | `S3Store::new(client, bucket)` | `S3Store::connect(bucket, S3Options)` | 1.94.1 |
+
+Without options, GCS uses Google's default credentials (Workload Identity on GKE and Cloud Run), Azure a managed identity, and S3 the AWS SDK's default chain. Put-if-absent and the manifest's conditional update map to each service's own condition (GCS generations, Azure and S3 ETags), so a lost race is always reported as one. They are released with `itzma-core`, at the same version:
+
+```toml
+itzma-store-gcs = "0.2"
+```
+
+A store counts as supported when it passes the conformance suite in `crates/itzma-store` (`itzma_store::conformance_tests!`). Each adapter runs it in CI against an emulator: storage-testbench for GCS, Azurite for Azure, MinIO for S3 (`make test-gcs`, `make test-azure`, `make test-aws`). The Python package builds on these adapters for `gs://`, `az://` and `s3://`.
+
 ## Limits
 
 - A query without an index, or with `exact: true`, reads every live vector of the unindexed segments, bounded by the read budget.
@@ -323,7 +341,7 @@ Requires Rust 1.87 or newer (edition 2024).
 
 ## Releases
 
-The crate and the Python package share one version and are released together. Changes go under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md) as they land. To release, run the **Release** workflow from the Actions tab with `patch`, `minor`, `major` or an exact version (the first release is `0.1.0`, the version already in the manifests). It bumps the version, turns `[Unreleased]` into that version's notes, commits, tags `vX.Y.Z`, and starts **Publish**, which runs the full CI on the tag, builds the wheels and the sdist, publishes `itzma-core` to crates.io and `itzma` to PyPI, and creates the GitHub Release. A failed Publish can be run again for the same tag; steps already done are skipped. `make package` builds the crate and the sdist locally without publishing.
+The crate and the Python package share one version and are released together. Changes go under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md) as they land. To release, run the **Release** workflow from the Actions tab with `patch`, `minor`, `major` or an exact version (the first release is `0.1.0`, the version already in the manifests). It bumps the version, turns `[Unreleased]` into that version's notes, commits, tags `vX.Y.Z`, and starts **Publish**, which runs the full CI on the tag, builds the wheels and the sdist, publishes `itzma-core`, `itzma-store` and the three store adapters to crates.io and `itzma` to PyPI, and creates the GitHub Release. A failed Publish can be run again for the same tag; steps already done are skipped. `make package` builds the crate and the sdist locally without publishing.
 
 ## Contributing
 

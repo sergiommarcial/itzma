@@ -45,6 +45,11 @@ jobs:
       - name: release script tests
         run: make release-test
       - run: cargo clippy --locked --all-targets -- -D warnings
+      # The store adapters are not default members (their SDKs need newer
+      # Rust than the 1.87 floor), so each is named on its own.
+      - run: cargo clippy --locked -p itzma-store-gcs --all-targets -- -D warnings
+      - run: cargo clippy --locked -p itzma-store-azure --all-targets -- -D warnings
+      - run: cargo clippy --locked -p itzma-store-aws --all-targets -- -D warnings
       - name: rustdoc
         run: cargo doc --locked --no-deps -p itzma-core
         env:
@@ -88,6 +93,57 @@ jobs:
         run: cargo test --locked
         env:
           ITZMA_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      - name: MinIO logs
+        if: failure()
+        run: docker compose logs minio
+
+  test-gcs:
+    name: test (GCS, storage-testbench)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: GCS adapter tests against storage-testbench
+        run: make test-gcs
+      - name: storage-testbench logs
+        if: failure()
+        run: docker compose --profile gcs logs gcs
+
+  test-azure:
+    name: test (Azure, Azurite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Azure adapter tests against Azurite
+        run: make test-azure
+      - name: Azurite logs
+        if: failure()
+        run: docker compose --profile azure logs azure
+
+  test-aws:
+    name: test (AWS, MinIO)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: AWS adapter tests against MinIO
+        run: make test-aws
       - name: MinIO logs
         if: failure()
         run: docker compose logs minio
@@ -140,10 +196,17 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: start MinIO and create the bucket
         run: docker compose up -d --wait
-      - name: bridge crate tests, lint, Python tests (memory, file, MinIO)
+      - name: start storage-testbench and create the bucket
+        run: make gcs-up
+      - name: start Azurite and create the container
+        run: make azure-up
+      - name: bridge crate tests, lint, Python tests (memory, file, MinIO, GCS, Azure)
         run: make py
         env:
           ITZMA_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          ITZMA_TEST_GCS_ENDPOINT: http://127.0.0.1:9100
+          ITZMA_TEST_GCS_CONTROL_ENDPOINT: http://127.0.0.1:9101
+          ITZMA_TEST_AZURE_ENDPOINT: http://127.0.0.1:10000/devstoreaccount1
       - name: MinIO logs
         if: failure()
         run: docker compose logs minio

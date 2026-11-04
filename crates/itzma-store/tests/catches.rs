@@ -6,9 +6,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use itzma_store::conformance;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
+use itzma_store::conformance;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{

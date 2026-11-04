@@ -1,7 +1,7 @@
 name: Publish
 
-# Builds and publishes one tagged version: itzma-core to crates.io, itzma to
-# PyPI, then a GitHub Release with the wheels. The Release workflow starts
+# Builds and publishes one tagged version: the Rust crates (itzma-core,
+# itzma-store and the three store adapters) to crates.io, itzma to PyPI, then a GitHub Release with the wheels. The Release workflow starts
 # this after it tags; a tag pushed by hand starts it too. Every publishing
 # step skips what is already out, so a failed run can simply be run again
 # with the same tag.
@@ -25,6 +25,8 @@ concurrency:
 env:
   TAG: ${{ inputs.tag || github.ref_name }}
   CARGO_TERM_COLOR: always
+  # Every crate published to crates.io, all at the workspace version.
+  CRATES: -p itzma-core -p itzma-store -p itzma-store-gcs -p itzma-store-azure -p itzma-store-aws
 
 jobs:
   verify:
@@ -44,8 +46,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - name: the crate packages and builds on its own
-        run: cargo publish --locked --dry-run -p itzma-core
+      # One multi-package dry run, so the adapters resolve itzma-store from
+      # this tree before it is on crates.io.
+      - name: the crates package and build on their own
+        run: cargo publish --locked --dry-run ${{ env.CRATES }}
 
   ci:
     needs: verify
@@ -121,8 +125,8 @@ jobs:
       id-token: write
     env:
       VERSION: ${{ needs.verify.outputs.version }}
-      # Only for the very first publish: crates.io's trusted publishing can
-      # only be set up once the crate exists. Delete the secret afterwards.
+      # Only for a crate's very first publish: crates.io's trusted publishing
+      # can only be set up once the crate exists. Delete the secret afterwards.
       HAS_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -132,17 +136,24 @@ jobs:
         with:
           toolchain: stable
       - id: published
-        name: already on crates.io?
+        name: which crates are not on crates.io yet
         run: |
-          code=$(curl -s -o /dev/null -w '%{http_code}' \
-            -A 'itzma release (https://github.com/sergiommarcial/itzma)' \
-            "https://crates.io/api/v1/crates/itzma-core/$VERSION")
-          echo "done=$([ "$code" = 200 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          todo=""
+          for flag in $CRATES; do
+            [ "$flag" = -p ] && continue
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              -A 'itzma release (https://github.com/sergiommarcial/itzma)' \
+              "https://crates.io/api/v1/crates/$flag/$VERSION")
+            [ "$code" = 200 ] || todo="$todo -p $flag"
+          done
+          echo "todo=$todo" >> "$GITHUB_OUTPUT"
       - id: auth
-        if: steps.published.outputs.done == 'false' && env.HAS_TOKEN != 'true'
+        if: steps.published.outputs.todo != '' && env.HAS_TOKEN != 'true'
         uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
-      - if: steps.published.outputs.done == 'false'
-        run: cargo publish --locked -p itzma-core
+      # One command, so cargo publishes itzma-store before the adapters that
+      # depend on it.
+      - if: steps.published.outputs.todo != ''
+        run: cargo publish --locked ${{ steps.published.outputs.todo }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
 
