@@ -1453,8 +1453,8 @@ mod tests {
             // approximate distance, then split at an arbitrary point: the rows
             // "not yet returned" are everything past it.
             let mut all: Vec<Candidate> = Vec::new();
-            for i in 0..decoded.head.nlist() {
-                all.extend(decoded.partitions[i].scan(&prepared, decoded.partitions[i].len()));
+            for partition in &decoded.partitions {
+                all.extend(partition.scan(&prepared, partition.len()));
             }
             all.sort_by(|a, b| a.distance.total_cmp(&b.distance));
             let split = all.len() / 2;

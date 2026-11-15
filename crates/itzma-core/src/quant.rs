@@ -280,9 +280,9 @@ impl Sq8Query {
                 .sum::<f64>() as f32,
             Metric::Cosine => {
                 let (mut dot, mut norm, mut qnorm) = (0f64, 0f64, 0f64);
-                for d in 0..n {
+                for (d, &q) in self.query[..n].iter().enumerate() {
                     let x = value(d);
-                    let q = f64::from(self.query[d]);
+                    let q = f64::from(q);
                     dot += q * x;
                     norm += x * x;
                     qnorm += q * q;

@@ -26,7 +26,7 @@ PY_BASE_PYTHON = $(shell $(PY_VENV_PYTHON) -c 'import os, sys; print(os.path.rea
 	install install-tools \
 	build build-release \
 	test test-fast test-msrv test-s3 s3-up s3-down test-aws test-gcs gcs-up gcs-down test-azure azure-up azure-down bench \
-	lint fmt-check clippy doc deny machete \
+	lint lint-latest fmt-check clippy doc deny machete \
 	format doc-open \
 	py-env py-dev py-rust py-rust-one py-lint py-format py-test py \
 	release-test package \
@@ -148,6 +148,12 @@ test-azure: check-cargo azure-up ## Run the Azure adapter's tests against Azurit
 ##@ Linting & formatting
 
 lint: fmt-check clippy doc deny machete ## Run all static analysis (no files written)
+
+# CI's lint job installs the newest stable on every run, so new clippy and
+# rustdoc lints can fail there before a local toolchain has them.
+lint-latest: ## Update the stable toolchain to what CI uses, then run CI's lint steps
+	rustup update stable --no-self-update
+	$(MAKE) fmt-check clippy doc
 
 fmt-check: check-cargo ## Check formatting with rustfmt
 	cargo fmt --check
