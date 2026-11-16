@@ -10,6 +10,12 @@ that section into the version's notes.
 
 ## [Unreleased]
 
+### Security
+
+- The lockfile now pins `serde_with` 3.21.0, which the Google Cloud SDK pulls
+  in for `itzma-store-gcs` and the Python wheels. Older versions panic when
+  serializing an empty entry through `KeyValueMap` (GHSA-7gcf-g7xr-8hxj).
+
 ## [0.2.0] - 2026-11-04
 
 ### Added
