@@ -102,6 +102,7 @@ class Namespace:
         fetch_split_above: int | None = None,
         fetch_part_size: int | None = None,
         fetch_align: int | None = None,
+        staleness_secs: float | None = None,
     ) -> Namespace: ...
     @staticmethod
     def create_async(
@@ -121,6 +122,7 @@ class Namespace:
         fetch_split_above: int | None = None,
         fetch_part_size: int | None = None,
         fetch_align: int | None = None,
+        staleness_secs: float | None = None,
     ) -> Awaitable[Namespace]: ...
     @staticmethod
     def open(
@@ -137,6 +139,7 @@ class Namespace:
         fetch_split_above: int | None = None,
         fetch_part_size: int | None = None,
         fetch_align: int | None = None,
+        staleness_secs: float | None = None,
     ) -> Namespace: ...
     @staticmethod
     def open_async(
@@ -153,6 +156,7 @@ class Namespace:
         fetch_split_above: int | None = None,
         fetch_part_size: int | None = None,
         fetch_align: int | None = None,
+        staleness_secs: float | None = None,
     ) -> Awaitable[Namespace]: ...
     @property
     def id(self) -> str: ...

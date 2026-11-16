@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from conftest import ATTRS, schema
+from conftest import ATTRS, random_rows, schema
 
 import itzma
 
@@ -155,3 +156,31 @@ def test_configure_cpu_threads_after_the_pools_start_is_refused() -> None:
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert out.stdout.strip() == "refused"
+
+
+def test_staleness_hides_another_writer_until_refresh(store: itzma.Store, ns_id: str) -> None:
+    writer = itzma.Namespace.create(store, ns_id, schema())
+    reader = itzma.Namespace.open(store, ns_id, staleness=timedelta(hours=1))
+    probe = [0.0] * 4
+    assert len(reader.query(probe, 10)) == 0
+    writer.upsert(random_rows(3, prefix="theirs"))
+    assert len(reader.query(probe, 10)) == 0
+    own = itzma.Namespace.open(store, ns_id, staleness=3600.0)
+    own.upsert(random_rows(2, prefix="mine", seed=1))
+    assert len(own.query(probe, 10)) == 5
+
+
+async def test_async_staleness_sees_its_own_writes(store: itzma.Store, ns_id: str) -> None:
+    ns = await itzma.AsyncNamespace.create(store, ns_id, schema(), staleness=1.5)
+    assert len(await ns.query([0.0] * 4, 10)) == 0
+    await ns.upsert(random_rows(4))
+    assert len(await ns.query([0.0] * 4, 10)) == 4
+    again = await itzma.AsyncNamespace.open(store, ns_id, staleness=timedelta(seconds=2))
+    assert len(await again.query([0.0] * 4, 10)) == 4
+
+
+@pytest.mark.parametrize("bad", [-1.0, float("nan"), float("inf")])
+def test_bad_staleness_is_refused(store: itzma.Store, ns_id: str, bad: float) -> None:
+    itzma.Namespace.create(store, ns_id, schema())
+    with pytest.raises(itzma.InvalidInput):
+        itzma.Namespace.open(store, ns_id, staleness=bad)

@@ -33,8 +33,13 @@ def _open_kwargs(
     cache: Cache | None,
     read_budget: int | None,
     fetch: FetchPolicy | None,
+    staleness: float | timedelta | None,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {"read_budget": read_budget}
+    if staleness is not None:
+        kwargs["staleness_secs"] = (
+            staleness.total_seconds() if isinstance(staleness, timedelta) else float(staleness)
+        )
     if cache is not None:
         kwargs["cache_ram_bytes"] = cache.ram_bytes
         kwargs["cache_nvme_dir"] = None if cache.nvme_dir is None else str(cache.nvme_dir)
@@ -259,9 +264,14 @@ class Namespace(_Handle):
         cache: Cache | None = None,
         read_budget: int | None = None,
         fetch: FetchPolicy | None = None,
+        staleness: float | timedelta | None = None,
         maintenance: Maintenance | None = _AUTO,
     ) -> Namespace:
         """Create a namespace. Raises ``NamespaceExists`` if one is there.
+
+        ``staleness`` lets queries use a view of the namespace up to this old
+        (seconds or a ``timedelta``); the handle's own writes are always
+        visible. ``None``, the default, loads the manifest on every query.
 
         ``maintenance`` starts a background loop that keeps the namespace
         compacted, indexed and collected, with one process at a time doing
@@ -274,7 +284,7 @@ class Namespace(_Handle):
                 schema.dim,
                 Metric(schema.metric).value,
                 schema._attr_names(),
-                **_open_kwargs(cache, read_budget, fetch),
+                **_open_kwargs(cache, read_budget, fetch, staleness),
             )
         )
         ns._start_auto(maintenance)
@@ -289,15 +299,24 @@ class Namespace(_Handle):
         cache: Cache | None = None,
         read_budget: int | None = None,
         fetch: FetchPolicy | None = None,
+        staleness: float | timedelta | None = None,
         maintenance: Maintenance | None = _AUTO,
     ) -> Namespace:
         """Open an existing namespace. Raises ``NamespaceNotFound`` if there is none.
+
+        ``staleness`` lets queries use a view of the namespace up to this old
+        (seconds or a ``timedelta``); the handle's own writes are always
+        visible. ``None``, the default, loads the manifest on every query.
 
         ``maintenance`` starts a background loop that keeps the namespace
         compacted, indexed and collected, with one process at a time doing
         the work (see ``Maintenance``). Pass ``None`` to start none.
         """
-        ns = cls(_itzma.Namespace.open(store._store, id, **_open_kwargs(cache, read_budget, fetch)))
+        ns = cls(
+            _itzma.Namespace.open(
+                store._store, id, **_open_kwargs(cache, read_budget, fetch, staleness)
+            )
+        )
         ns._start_auto(maintenance)
         return ns
 
@@ -472,9 +491,14 @@ class AsyncNamespace(_Handle):
         cache: Cache | None = None,
         read_budget: int | None = None,
         fetch: FetchPolicy | None = None,
+        staleness: float | timedelta | None = None,
         maintenance: Maintenance | None = _AUTO,
     ) -> AsyncNamespace:
         """Create a namespace. Raises ``NamespaceExists`` if one is there.
+
+        ``staleness`` lets queries use a view of the namespace up to this old
+        (seconds or a ``timedelta``); the handle's own writes are always
+        visible. ``None``, the default, loads the manifest on every query.
 
         ``maintenance`` starts a background loop that keeps the namespace
         compacted, indexed and collected, with one process at a time doing
@@ -486,7 +510,7 @@ class AsyncNamespace(_Handle):
             schema.dim,
             Metric(schema.metric).value,
             schema._attr_names(),
-            **_open_kwargs(cache, read_budget, fetch),
+            **_open_kwargs(cache, read_budget, fetch, staleness),
         )
         handle = cls(ns)
         handle._start_auto(maintenance)
@@ -501,16 +525,21 @@ class AsyncNamespace(_Handle):
         cache: Cache | None = None,
         read_budget: int | None = None,
         fetch: FetchPolicy | None = None,
+        staleness: float | timedelta | None = None,
         maintenance: Maintenance | None = _AUTO,
     ) -> AsyncNamespace:
         """Open an existing namespace. Raises ``NamespaceNotFound`` if there is none.
+
+        ``staleness`` lets queries use a view of the namespace up to this old
+        (seconds or a ``timedelta``); the handle's own writes are always
+        visible. ``None``, the default, loads the manifest on every query.
 
         ``maintenance`` starts a background loop that keeps the namespace
         compacted, indexed and collected, with one process at a time doing
         the work (see ``Maintenance``). Pass ``None`` to start none.
         """
         ns = await _itzma.Namespace.open_async(
-            store._store, id, **_open_kwargs(cache, read_budget, fetch)
+            store._store, id, **_open_kwargs(cache, read_budget, fetch, staleness)
         )
         handle = cls(ns)
         handle._start_auto(maintenance)

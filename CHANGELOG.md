@@ -20,6 +20,12 @@ that section into the version's notes.
   always safe. `examples/maintenance_loop.rs` shows a Rust loop on it.
 - `itzma.Maintenance`, the settings for the Python loop, and
   `ns.maintainer`, with a `role` of `"leader"` or `"follower"`.
+- `Namespace::with_staleness(max_age)`, and `staleness=` on `open` and
+  `create` in Python: queries on the handle reuse its last view of the
+  manifest and the WAL tail for up to `max_age`, so a warm query sends no
+  request for either, and queries waiting on a refresh share one. The
+  handle's own writes are always visible. Off by default; queries stay
+  strict unless a handle opts in.
 
 ### Changed
 
@@ -30,6 +36,8 @@ that section into the version's notes.
   `maintenance=None` to turn it off, for instance when `maintain` already
   runs from cron. On a `file://` store the loop logs one warning and stops.
   `start_maintenance` still takes no lease and replaces the automatic loop.
+
+## [0.2.1] - 2026-11-15
 
 ### Security
 

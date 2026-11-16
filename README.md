@@ -210,6 +210,8 @@ A batch with a sparse vector is written as WAL version 4 (5 with a key), which n
 
 **Read cache.** `CacheStore` wraps any store with a RAM tier and an optional NVMe tier, keyed by object and byte range. Give it to a handle with `Namespace::with_cache`; only queries read through it. The manifest is never cached, so a query always sees the latest writes. Objects are immutable once written, so there is no invalidation, only eviction.
 
+**Staleness.** By default every query loads the manifest and lists the WAL, so it sees every write that landed before it. `Namespace::with_staleness(max_age)` lets a handle reuse its last view for up to `max_age`: a young view costs no request at all, and queries that arrive while it refreshes share one refresh. The handle's own writes are always visible; other writers' show up within `max_age`. Keep it far below `gc`'s `min_age`. In Python, `staleness=` on `open` and `create`.
+
 **Decoded cache.** `DecodedCache` keeps parsed structures (segment directories, blocks, index heads and partitions, whole small segments) so a warm query skips decoding. Share one between handles with `Namespace::with_decoded_cache`. Default 256 MiB.
 
 **Read budget.** Every query attempt, and each unit of a compaction, may read at most a byte budget (`DEFAULT_READ_BUDGET`, 1 GiB, or `Namespace::with_read_budget`). Past it the call fails with `ReadBudgetExceeded` before anything is written. An indexed segment is charged only for what it fetches, so a namespace bigger than the budget can still be queried once its large segments are indexed.

@@ -154,6 +154,7 @@ struct Opening {
     read_budget: Option<u64>,
     cache: Option<CacheOptions>,
     fetch: Option<FetchPolicy>,
+    staleness: Option<Duration>,
 }
 
 impl Opening {
@@ -169,6 +170,10 @@ impl Opening {
         };
         let ns = match self.fetch {
             Some(policy) => ns.with_fetch_policy(policy),
+            None => ns,
+        };
+        let ns = match self.staleness {
+            Some(max_age) => ns.with_staleness(max_age),
             None => ns,
         };
         let ns = match self.cache {
@@ -195,6 +200,17 @@ struct Settings {
     fetch_split_above: Option<u64>,
     fetch_part_size: Option<u64>,
     fetch_align: Option<u64>,
+    staleness_secs: Option<f64>,
+}
+
+/// A staleness bound in seconds as a `Duration`: finite and zero or more.
+fn staleness(secs: Option<f64>) -> Result<Option<Duration>, String> {
+    secs.map(|s| {
+        Duration::try_from_secs_f64(s).map_err(|_| {
+            format!("staleness must be a finite number of seconds, zero or more, not {s}")
+        })
+    })
+    .transpose()
 }
 
 fn opening(
@@ -209,6 +225,7 @@ fn opening(
         settings.cache_nvme_bytes,
     )
     .map_err(error::input)?;
+    let staleness = staleness(settings.staleness_secs).map_err(error::input)?;
     let fetch = fetch_policy_options(
         settings.fetch_min_gap,
         settings.fetch_max_gap,
@@ -224,6 +241,7 @@ fn opening(
         read_budget: settings.read_budget,
         cache,
         fetch,
+        staleness,
     })
 }
 
@@ -296,7 +314,8 @@ impl PyNamespace {
     #[pyo3(signature = (store, id, dim, metric, attrs, *, read_budget=None,
                         cache_ram_bytes=None, cache_nvme_dir=None, cache_nvme_bytes=None,
                         fetch_min_gap=None, fetch_max_gap=None, fetch_gap_divisor=None,
-                        fetch_split_above=None, fetch_part_size=None, fetch_align=None))]
+                        fetch_split_above=None, fetch_part_size=None, fetch_align=None,
+                        staleness_secs=None))]
     #[allow(clippy::too_many_arguments)]
     fn create(
         py: Python<'_>,
@@ -315,6 +334,7 @@ impl PyNamespace {
         fetch_split_above: Option<u64>,
         fetch_part_size: Option<u64>,
         fetch_align: Option<u64>,
+        staleness_secs: Option<f64>,
     ) -> PyResult<Self> {
         let schema = schema::from_args(dim, metric, &attrs).map_err(error::input)?;
         let settings = Settings {
@@ -328,6 +348,7 @@ impl PyNamespace {
             fetch_split_above,
             fetch_part_size,
             fetch_align,
+            staleness_secs,
         };
         let open = opening(store, id, Some(schema), settings)?;
         runtime::block_on(py, open.run())
@@ -337,7 +358,8 @@ impl PyNamespace {
     #[pyo3(signature = (store, id, dim, metric, attrs, *, read_budget=None,
                         cache_ram_bytes=None, cache_nvme_dir=None, cache_nvme_bytes=None,
                         fetch_min_gap=None, fetch_max_gap=None, fetch_gap_divisor=None,
-                        fetch_split_above=None, fetch_part_size=None, fetch_align=None))]
+                        fetch_split_above=None, fetch_part_size=None, fetch_align=None,
+                        staleness_secs=None))]
     #[allow(clippy::too_many_arguments)]
     fn create_async<'py>(
         py: Python<'py>,
@@ -356,6 +378,7 @@ impl PyNamespace {
         fetch_split_above: Option<u64>,
         fetch_part_size: Option<u64>,
         fetch_align: Option<u64>,
+        staleness_secs: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let schema = schema::from_args(dim, metric, &attrs).map_err(error::input)?;
         let settings = Settings {
@@ -369,6 +392,7 @@ impl PyNamespace {
             fetch_split_above,
             fetch_part_size,
             fetch_align,
+            staleness_secs,
         };
         let open = opening(store, id, Some(schema), settings)?;
         runtime::spawn(py, open.run())
@@ -378,7 +402,8 @@ impl PyNamespace {
     #[pyo3(signature = (store, id, *, read_budget=None,
                         cache_ram_bytes=None, cache_nvme_dir=None, cache_nvme_bytes=None,
                         fetch_min_gap=None, fetch_max_gap=None, fetch_gap_divisor=None,
-                        fetch_split_above=None, fetch_part_size=None, fetch_align=None))]
+                        fetch_split_above=None, fetch_part_size=None, fetch_align=None,
+                        staleness_secs=None))]
     #[allow(clippy::too_many_arguments)]
     fn open(
         py: Python<'_>,
@@ -394,6 +419,7 @@ impl PyNamespace {
         fetch_split_above: Option<u64>,
         fetch_part_size: Option<u64>,
         fetch_align: Option<u64>,
+        staleness_secs: Option<f64>,
     ) -> PyResult<Self> {
         let settings = Settings {
             read_budget,
@@ -406,6 +432,7 @@ impl PyNamespace {
             fetch_split_above,
             fetch_part_size,
             fetch_align,
+            staleness_secs,
         };
         let open = opening(store, id, None, settings)?;
         runtime::block_on(py, open.run())
@@ -415,7 +442,8 @@ impl PyNamespace {
     #[pyo3(signature = (store, id, *, read_budget=None,
                         cache_ram_bytes=None, cache_nvme_dir=None, cache_nvme_bytes=None,
                         fetch_min_gap=None, fetch_max_gap=None, fetch_gap_divisor=None,
-                        fetch_split_above=None, fetch_part_size=None, fetch_align=None))]
+                        fetch_split_above=None, fetch_part_size=None, fetch_align=None,
+                        staleness_secs=None))]
     #[allow(clippy::too_many_arguments)]
     fn open_async<'py>(
         py: Python<'py>,
@@ -431,6 +459,7 @@ impl PyNamespace {
         fetch_split_above: Option<u64>,
         fetch_part_size: Option<u64>,
         fetch_align: Option<u64>,
+        staleness_secs: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let settings = Settings {
             read_budget,
@@ -443,6 +472,7 @@ impl PyNamespace {
             fetch_split_above,
             fetch_part_size,
             fetch_align,
+            staleness_secs,
         };
         let open = opening(store, id, None, settings)?;
         runtime::spawn(py, open.run())
@@ -753,6 +783,17 @@ async fn filter_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staleness_cases() {
+        assert_eq!(staleness(None), Ok(None));
+        assert_eq!(staleness(Some(0.0)), Ok(Some(Duration::ZERO)));
+        assert_eq!(staleness(Some(1.5)), Ok(Some(Duration::from_millis(1500))));
+        for bad in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e30] {
+            let err = staleness(Some(bad)).expect_err("refused");
+            assert!(err.contains("staleness"), "{err}");
+        }
+    }
 
     #[test]
     fn cache_options_cases() {
