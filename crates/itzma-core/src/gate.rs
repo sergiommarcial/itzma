@@ -534,14 +534,28 @@ mod tests {
                 tokio::spawn(async move { gate.get(&obj()).await?.bytes().await })
             })
             .collect();
-        for _ in 0..10_000 {
-            if inner.in_flight.load(Ordering::SeqCst) == 5 {
-                break;
-            }
+        // A deadline, not a count of yields: on a loaded runner the spawned
+        // reads can take longer to start than any fixed number of yields.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while inner.in_flight.load(Ordering::SeqCst) < 5 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reads never ran together"
+            );
             tokio::task::yield_now().await;
         }
         assert_eq!(inner.in_flight.load(Ordering::SeqCst), 5);
-        inner.parked.notify_waiters();
+        // A read counts itself in flight before it waits on `parked`, and
+        // `notify_waiters` wakes only those already waiting, so keep waking
+        // until every read is done.
+        while !reads.iter().all(|r| r.is_finished()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a parked read never woke"
+            );
+            inner.parked.notify_waiters();
+            tokio::task::yield_now().await;
+        }
         for read in reads {
             assert_eq!(read.await.expect("join").expect("read").len(), 100);
         }

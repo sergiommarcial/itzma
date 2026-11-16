@@ -16,7 +16,7 @@ use itzma_core::{
 use pyo3::prelude::*;
 use serde_json::Value;
 use tokio::sync::Notify;
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tokio::time::MissedTickBehavior;
 
 use crate::{reports, runtime};
@@ -48,6 +48,18 @@ impl State {
             set(&self.last_error, message);
         }
     }
+}
+
+/// What a run task ended with. A panic counts as a failed run; an abort
+/// (the loop stopping) is not a run at all.
+fn finished(state: &State, done: Result<(Option<String>, Option<String>), JoinError>) {
+    let outcome = match done {
+        Ok(outcome) => outcome,
+        Err(e) if e.is_panic() => (None, Some(format!("maintenance run panicked: {e}"))),
+        Err(_) => return,
+    };
+    state.record(outcome);
+    state.runs.fetch_add(1, Ordering::SeqCst);
 }
 
 fn set(slot: &Mutex<Option<String>>, value: String) {
@@ -147,10 +159,7 @@ async fn run_leased(
             () = stop.notified() => break,
             done = async { run.as_mut().expect("guarded").await }, if run.is_some() => {
                 run = None;
-                if let Ok(outcome) = done {
-                    state.record(outcome);
-                    state.runs.fetch_add(1, Ordering::SeqCst);
-                }
+                finished(&state, done);
             }
             _ = ticks.tick() => {
                 let Some(ns) = handle.upgrade() else { break };
@@ -185,6 +194,7 @@ async fn run_leased(
     if let Some(run) = run {
         run.abort();
     }
+    state.leader.store(false, Ordering::SeqCst);
     let _ = lease.release().await;
 }
 
@@ -504,6 +514,51 @@ mod tests {
         );
         wait_for("the stopped loop to end", || !a.running());
         b.stop();
+    }
+
+    #[test]
+    fn a_panicked_run_counts_as_a_failed_run() {
+        let runtime = runtime::current().expect("runtime");
+        let done = runtime.block_on(async {
+            tokio::spawn(async {
+                if std::hint::black_box(true) {
+                    panic!("boom");
+                }
+                (None::<String>, None::<String>)
+            })
+            .await
+        });
+        let state = State::default();
+        finished(&state, done);
+        assert_eq!(state.errors.load(Ordering::SeqCst), 1);
+        assert_eq!(state.runs.load(Ordering::SeqCst), 1);
+        let error = get(&state.last_error).expect("an error");
+        assert!(error.contains("panicked"), "{error}");
+    }
+
+    #[test]
+    fn an_aborted_run_is_not_counted() {
+        let runtime = runtime::current().expect("runtime");
+        let done = runtime.block_on(async {
+            let task = tokio::spawn(std::future::pending::<(Option<String>, Option<String>)>());
+            task.abort();
+            task.await
+        });
+        let state = State::default();
+        finished(&state, done);
+        assert_eq!(state.errors.load(Ordering::SeqCst), 0);
+        assert_eq!(state.runs.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_stopped_loop_is_no_longer_the_leader() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        create(&store);
+        let (_ns, m) = leased(&store);
+        wait_for("the claim", || m.role() == "leader");
+        m.stop();
+        wait_for("the loop to end", || !m.running());
+        assert_eq!(m.role(), "follower");
     }
 
     #[test]
