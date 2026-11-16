@@ -642,13 +642,15 @@ impl PyNamespace {
         self.report_async(py, |ns| maintain_call(ns, o))
     }
 
-    #[pyo3(signature = (every_secs, maintain, index=None, index_sparse=None))]
+    #[pyo3(signature = (every_secs, maintain, index=None, index_sparse=None, lease_renew_secs=None, lease_ttl_secs=None))]
     fn start_maintenance(
         &self,
         every_secs: f64,
         maintain: &str,
         index: Option<&str>,
         index_sparse: Option<&str>,
+        lease_renew_secs: Option<f64>,
+        lease_ttl_secs: Option<f64>,
     ) -> PyResult<maintainer::PyMaintainer> {
         self.handle()?;
         let every = Duration::try_from_secs_f64(every_secs)
@@ -664,12 +666,17 @@ impl PyNamespace {
             (None, None) => None,
             _ => return Err(error::input("index and index_sparse go together".into())),
         };
+        let lease = options::lease(lease_renew_secs, lease_ttl_secs)
+            .map_err(error::input)?
+            .map(|o| self.inner.maintenance_lease(o))
+            .transpose()
+            .map_err(error::to_py)?;
         let plan = maintainer::Plan {
             every,
             maintain,
             index,
         };
-        maintainer::start(Arc::downgrade(&self.inner), plan).map_err(error::itzma_error)
+        maintainer::start(Arc::downgrade(&self.inner), plan, lease).map_err(error::itzma_error)
     }
 }
 
