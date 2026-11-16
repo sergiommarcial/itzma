@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use itzma_core::{
-    ItzmaError, IndexOptions, IndexSparseOptions, MaintenanceLease, MaintenanceOptions, Namespace,
+    IndexOptions, IndexSparseOptions, ItzmaError, MaintenanceLease, MaintenanceOptions, Namespace,
     Role,
 };
 use pyo3::prelude::*;

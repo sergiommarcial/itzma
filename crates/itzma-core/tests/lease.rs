@@ -7,11 +7,11 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use itzma_core::{
-    ItzmaError, GcOptions, LeaseOptions, MaintenanceLease, Metric, Namespace, Role, inspect,
-};
 use common::faulty::{Fault, FaultyStore, PutKind};
 use common::{cas_backends, doc, memory, schema};
+use itzma_core::{
+    GcOptions, ItzmaError, LeaseOptions, MaintenanceLease, Metric, Namespace, Role, inspect,
+};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 
