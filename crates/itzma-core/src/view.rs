@@ -1,9 +1,11 @@
 //! The handle's view of a namespace between queries: the manifest
 //! it last loaded and the WAL tail it folded on top of it, so a query lists
-//! and folds only what is new.
+//! and folds only what is new, and a handle that opted in to a staleness
+//! bound skips the manifest GET and the LIST altogether while the view is
+//! young.
 
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use object_store::ObjectStore;
 
@@ -69,21 +71,24 @@ pub(crate) async fn load_checked(store: &dyn ObjectStore, namespace: &str) -> Re
     Ok(manifest)
 }
 
-/// A snapshot the handle keeps between queries: the tail it last folded, and
-/// when the manifest under it was loaded.
+/// A snapshot the handle keeps between queries: a manifest and the tail it
+/// folded on top of it.
 #[derive(Debug)]
 struct Snapshot {
+    manifest: Arc<Manifest>,
     tail: Arc<TailView>,
     loaded_at: Instant,
 }
 
-/// What one query attempt starts from: the manifest it plans against. The
-/// tail is read by [`Views::tail`], which the engines run alongside their
-/// segment reads.
+/// What one query attempt starts from: the manifest it plans against, and
+/// in bounded mode the tail it may use as it is. Without one, the tail is
+/// read by [`Views::tail`], which the engines run alongside their segment
+/// reads.
 #[derive(Debug)]
 pub(crate) struct Plan {
     pub(crate) manifest: Arc<Manifest>,
     loaded_at: Instant,
+    ready: Option<Arc<TailView>>,
 }
 
 /// Where a view is read from, and for whom.
@@ -93,14 +98,21 @@ pub(crate) struct Reader<'a> {
     /// WAL objects go through the query store, like every query read.
     pub(crate) query_store: &'a dyn ObjectStore,
     pub(crate) namespace: &'a str,
+    /// The highest seq this handle's own writes landed at, or anything at or
+    /// below the view's `folded_through` when it has written nothing.
+    pub(crate) own_last: u64,
     /// The query attempt's budget: the tail shares it with the segments.
     pub(crate) budget: &'a ReadBudget,
 }
 
-/// A handle's last snapshot.
+/// A handle's last snapshot, and the staleness it may be used at.
 #[derive(Debug, Default)]
 pub(crate) struct Views {
+    staleness: Option<Duration>,
     current: Mutex<Option<Arc<Snapshot>>>,
+    /// Held while a bounded refresh runs, so concurrent queries past the bound
+    /// wait for one refresh instead of each sending their own.
+    refreshing: tokio::sync::Mutex<()>,
 }
 
 impl Views {
@@ -108,10 +120,46 @@ impl Views {
         Self::default()
     }
 
-    /// The plan a query starts from: a fresh manifest, with the tail left to
-    /// [`tail`](Self::tail), which lists the WAL now.
+    /// A bound of zero is strict: a snapshot that is never young would only
+    /// make every query wait its turn on the refresh lock.
+    pub(crate) fn set_staleness(&mut self, staleness: Option<Duration>) {
+        self.staleness = staleness.filter(|bound| !bound.is_zero());
+    }
+
+    /// The plan a query starts from. Strict (no staleness): a fresh manifest,
+    /// and the tail left to [`tail`](Self::tail), which lists the WAL now.
+    /// Bounded: the cached snapshot while it is younger than the bound; past
+    /// it, one refresh (manifest and tail) shared by every query waiting on
+    /// it.
     pub(crate) async fn plan(&self, r: &Reader<'_>) -> Result<Plan> {
-        fresh_plan(r).await
+        let Some(max_age) = self.staleness else {
+            return fresh_plan(r).await;
+        };
+        if let Some(snap) = self.young(max_age) {
+            return Ok(snap.plan());
+        }
+        let _turn = self.refreshing.lock().await;
+        if let Some(snap) = self.young(max_age) {
+            return Ok(snap.plan());
+        }
+        let plan = fresh_plan(r).await?;
+        let base = self.current().map(|snap| snap.tail.clone());
+        let folded_through = plan.manifest.wal_folded_through;
+        match extend(
+            r.query_store,
+            r.namespace,
+            base.as_ref(),
+            folded_through,
+            r.budget,
+        )
+        .await
+        {
+            Ok(tail) => Ok(self.publish(&plan, tail).plan()),
+            // A fence under the manifest just loaded: let the attempt meet it
+            // in `tail`, where it reloads like any stale read.
+            Err(err) if is_stale_read(&err) => Ok(plan),
+            Err(err) => Err(err),
+        }
     }
 
     /// `err` came from an attempt on `stale`. If the manifest moved, the
@@ -134,10 +182,18 @@ impl Views {
         Ok(plan)
     }
 
-    /// The tail on `plan`'s manifest: the handle's last tail extended with
-    /// only what is new, which becomes its snapshot.
+    /// The tail on `plan`'s manifest. A tail the plan already holds is used
+    /// as it is, unless this handle wrote past it (read your own writes);
+    /// otherwise the handle's last tail is extended with only what is new,
+    /// and the result becomes its snapshot.
     pub(crate) async fn tail(&self, r: &Reader<'_>, plan: &Plan) -> Result<Arc<Layer>> {
-        let base = self.current().map(|snap| snap.tail.clone());
+        if let Some(ready) = plan.ready.as_ref().filter(|t| r.own_last <= t.last_seq) {
+            return Ok(ready.layer.clone());
+        }
+        let base = match &plan.ready {
+            Some(ready) => Some(ready.clone()),
+            None => self.current().map(|snap| snap.tail.clone()),
+        };
         let folded_through = plan.manifest.wal_folded_through;
         let tail = extend(
             r.query_store,
@@ -148,6 +204,11 @@ impl Views {
         )
         .await?;
         Ok(self.publish(plan, tail).tail.layer.clone())
+    }
+
+    fn young(&self, max_age: Duration) -> Option<Arc<Snapshot>> {
+        self.current()
+            .filter(|snap| snap.loaded_at.elapsed() < max_age)
     }
 
     fn current(&self) -> Option<Arc<Snapshot>> {
@@ -165,6 +226,7 @@ impl Views {
     /// queries racing both produce correct views, and the newer one is kept.
     fn publish(&self, plan: &Plan, tail: Arc<TailView>) -> Arc<Snapshot> {
         let snap = Arc::new(Snapshot {
+            manifest: plan.manifest.clone(),
             tail,
             loaded_at: plan.loaded_at,
         });
@@ -181,6 +243,14 @@ impl Snapshot {
     fn rank(&self) -> (u64, Instant, u64) {
         (self.tail.folded_through, self.loaded_at, self.tail.last_seq)
     }
+
+    fn plan(&self) -> Plan {
+        Plan {
+            manifest: self.manifest.clone(),
+            loaded_at: self.loaded_at,
+            ready: Some(self.tail.clone()),
+        }
+    }
 }
 
 /// A plan on a manifest loaded now, with the tail still to read.
@@ -190,6 +260,7 @@ async fn fresh_plan(r: &Reader<'_>) -> Result<Plan> {
     Ok(Plan {
         manifest: Arc::new(manifest),
         loaded_at,
+        ready: None,
     })
 }
 
@@ -298,11 +369,12 @@ mod tests {
         assert_eq!(first.used() + second.used(), both.used());
     }
 
-    fn reader<'a>(store: &'a InMemory, budget: &'a ReadBudget) -> Reader<'a> {
+    fn reader<'a>(store: &'a InMemory, own_last: u64, budget: &'a ReadBudget) -> Reader<'a> {
         Reader {
             store,
             query_store: store,
             namespace: "ns",
+            own_last,
             budget,
         }
     }
@@ -327,11 +399,46 @@ mod tests {
         create(&store).await;
         let views = Views::new();
         let budget = ReadBudget::unlimited();
-        let (_, first) = view(&views, &reader(&store, &budget)).await;
+        let (_, first) = view(&views, &reader(&store, 0, &budget)).await;
         assert!(first.is_empty());
         write(&store, vec![up("a", 1.0)]).await;
-        let (_, second) = view(&views, &reader(&store, &budget)).await;
+        let (plan, second) = view(&views, &reader(&store, 0, &budget)).await;
+        assert!(plan.ready.is_none());
         assert!(second.holds("a"));
+    }
+
+    #[tokio::test]
+    async fn a_young_bounded_view_is_reused_and_an_own_write_extends_it() {
+        let store = InMemory::new();
+        create(&store).await;
+        let mut views = Views::new();
+        views.set_staleness(Some(Duration::from_secs(3600)));
+        let budget = ReadBudget::unlimited();
+        let (first, _) = view(&views, &reader(&store, 0, &budget)).await;
+        let seq = write(&store, vec![up("a", 1.0)]).await;
+        // Someone else's write: invisible while the view is young.
+        let (same, tail) = view(&views, &reader(&store, 0, &budget)).await;
+        assert!(Arc::ptr_eq(&first.manifest, &same.manifest));
+        assert!(tail.is_empty());
+        // The same seq as this handle's own write: visible at once, on the
+        // same manifest.
+        let (own, tail) = view(&views, &reader(&store, seq, &budget)).await;
+        assert!(tail.holds("a"));
+        assert!(Arc::ptr_eq(&own.manifest, &first.manifest));
+    }
+
+    #[tokio::test]
+    async fn an_old_bounded_view_is_refreshed() {
+        let store = InMemory::new();
+        create(&store).await;
+        let mut views = Views::new();
+        views.set_staleness(Some(Duration::from_millis(20)));
+        let budget = ReadBudget::unlimited();
+        view(&views, &reader(&store, 0, &budget)).await;
+        write(&store, vec![up("a", 1.0)]).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let (_, fresh) = view(&views, &reader(&store, 0, &budget)).await;
+        assert!(fresh.holds("a"));
     }
 
     #[tokio::test]
@@ -340,13 +447,27 @@ mod tests {
         create(&store).await;
         let views = Views::new();
         let budget = ReadBudget::unlimited();
-        let plan = views.plan(&reader(&store, &budget)).await.unwrap();
+        let plan = views.plan(&reader(&store, 0, &budget)).await.unwrap();
         let err = crate::segment::missing(&Path::from("ns/segments/x/data.bin"));
         let back = views
-            .replan(&reader(&store, &budget), &plan, err)
+            .replan(&reader(&store, 0, &budget), &plan, err)
             .await
             .unwrap_err();
         assert!(crate::segment::is_missing(&back));
+    }
+
+    #[tokio::test]
+    async fn a_zero_bound_is_strict() {
+        let store = InMemory::new();
+        create(&store).await;
+        let mut views = Views::new();
+        views.set_staleness(Some(Duration::ZERO));
+        let budget = ReadBudget::unlimited();
+        view(&views, &reader(&store, 0, &budget)).await;
+        // Strict plans never carry a ready tail and never wait on the
+        // bounded refresh lock.
+        let plan = views.plan(&reader(&store, 0, &budget)).await.unwrap();
+        assert!(plan.ready.is_none());
     }
 
     #[test]
@@ -355,12 +476,14 @@ mod tests {
         let older = Plan {
             manifest: Arc::new(Manifest::new(Schema::new(1, Metric::L2))),
             loaded_at: Instant::now(),
+            ready: None,
         };
         let mut newer_manifest = Manifest::new(Schema::new(1, Metric::L2));
         newer_manifest.wal_format = 1;
         let newer = Plan {
             manifest: Arc::new(newer_manifest),
             loaded_at: older.loaded_at + Duration::from_millis(1),
+            ready: None,
         };
         let tail = |last| {
             Arc::new(TailView {
@@ -369,17 +492,21 @@ mod tests {
                 layer: Arc::default(),
             })
         };
-        // A query on the older manifest folded further than one that loaded
-        // later: the later load is kept, so the snapshot never goes back to
-        // an older manifest's tail.
+        // An own-write fold on the older manifest reached further than a
+        // refresh that loaded later: the refresh's manifest is kept, so the
+        // snapshot never goes back to an older manifest.
         views.publish(&older, tail(5));
         views.publish(&newer, tail(3));
-        assert_eq!(views.current().unwrap().tail.last_seq, 3);
+        let kept = views.current().unwrap();
+        assert!(Arc::ptr_eq(&kept.manifest, &newer.manifest));
         // The reverse order keeps it too.
         let views = Views::new();
         views.publish(&newer, tail(3));
         views.publish(&older, tail(5));
-        assert_eq!(views.current().unwrap().tail.last_seq, 3);
+        assert!(Arc::ptr_eq(
+            &views.current().unwrap().manifest,
+            &newer.manifest
+        ));
     }
 
     #[test]
@@ -388,6 +515,7 @@ mod tests {
         let plan = Plan {
             manifest: Arc::new(Manifest::new(Schema::new(1, Metric::L2))),
             loaded_at: Instant::now(),
+            ready: None,
         };
         let tail = |folded, last| {
             Arc::new(TailView {

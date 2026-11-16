@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use object_store::ObjectStore;
 
@@ -378,6 +379,61 @@ impl Namespace {
     #[must_use]
     pub fn with_decoded_cache(mut self, cache: Arc<DecodedCache>) -> Self {
         self.decoded_cache = Some(cache);
+        self
+    }
+
+    /// Let queries on this handle use a manifest and a WAL tail up to
+    /// `max_age` old, and return the handle.
+    ///
+    /// Within `max_age` of the last refresh a query sends no request for
+    /// either; with a [`DecodedCache`] warm too, it can run with no store call
+    /// at all. The first query after `max_age` refreshes both (one manifest
+    /// GET, then a listing of the WAL past what the handle already folded),
+    /// and queries that arrive meanwhile wait for that one refresh.
+    ///
+    /// What a query sees: every write this handle made, whatever `max_age` is
+    /// (upserts, deletes and keyed writes alike), and every write another
+    /// writer made before the last refresh, which is at most `max_age` before
+    /// the query began. Without this call a handle is strict: every query
+    /// loads the manifest and lists the WAL, and sees every write that landed
+    /// before it did. A `max_age` of zero is the same as strict. A very small
+    /// one makes queries take turns on the refresh, which is slower than
+    /// strict, so pick one well above a manifest round trip.
+    ///
+    /// Keep `max_age` far below the `min_age` of any [`gc`](Self::gc) run on
+    /// this namespace (24 hours by default). A longer bound is still correct,
+    /// since a query that meets a segment `gc` removed reloads the manifest
+    /// and tries again, but it pays for that miss. The handle cannot check
+    /// this, since `min_age` belongs to each `gc` call.
+    ///
+    /// Only [`query`](Self::query), [`query_with`](Self::query_with),
+    /// [`query_sparse`](Self::query_sparse) and [`filter`](Self::filter) use
+    /// the cached view. Writes, [`compact`](Self::compact), the index builds,
+    /// `gc` and [`maintain`](Self::maintain) always load the manifest.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use itzma_core::{Document, Metric, Namespace, Schema};
+    /// use object_store::memory::InMemory;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> itzma_core::Result<()> {
+    /// let ns = Namespace::create(Arc::new(InMemory::new()), "docs", Schema::new(1, Metric::L2))
+    ///     .await?
+    ///     .with_staleness(Duration::from_secs(1));
+    /// ns.upsert(vec![Document { id: "a".into(), vector: vec![0.0], attrs: None, sparse: None }])
+    ///     .await?;
+    /// // The handle's own write is visible at once.
+    /// assert_eq!(ns.query(&[0.0], 1).await?[0].id, "a");
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_staleness(mut self, max_age: Duration) -> Self {
+        self.views.set_staleness(Some(max_age));
         self
     }
 
@@ -1871,6 +1927,7 @@ impl Namespace {
             store: &*self.store,
             query_store: &*self.query_store,
             namespace: &self.id,
+            own_last: self.next_seq.load(Ordering::Relaxed).saturating_sub(1),
             budget,
         }
     }
