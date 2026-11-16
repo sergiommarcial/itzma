@@ -10,6 +10,8 @@ that section into the version's notes.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-15
+
 ### Security
 
 - The lockfile now pins `serde_with` 3.21.0, which the Google Cloud SDK pulls
