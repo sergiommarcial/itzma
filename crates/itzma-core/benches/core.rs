@@ -31,9 +31,9 @@ use itzma_core::quant::Sq8Codec;
 use itzma_core::search::distance;
 use itzma_core::{
     AttrColumn, AttrSchema, AttrType, CompactionOptions, Compare, DEFAULT_STREAM_TARGET_BYTES,
-    DecodedCache, DecodedCacheOptions, DocColumns, Document, FilterOptions, GateOptions, GatedStore,
-    IndexKind, IndexOptions, IndexSparseOptions, Metric, Namespace, Predicate, QueryOptions, Schema,
-    SparseQueryOptions, SparseVector, StreamOptions,
+    DecodedCache, DecodedCacheOptions, DocColumns, Document, FilterOptions, GateOptions,
+    GatedStore, IndexKind, IndexOptions, IndexSparseOptions, Metric, Namespace, Predicate,
+    QueryOptions, Schema, SparseQueryOptions, SparseVector, StreamOptions,
 };
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
