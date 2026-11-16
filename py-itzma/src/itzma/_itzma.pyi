@@ -80,6 +80,10 @@ class Store:
         account: str | None = None,
         credential: str | None = None,
         sas_token: str | None = None,
+        gate_max_bytes: int | None = None,
+        gate_max_requests: int | None = None,
+        gate_maintenance_max_bytes: int | None = None,
+        gate_maintenance_max_requests: int | None = None,
     ) -> Store: ...
 
 @final

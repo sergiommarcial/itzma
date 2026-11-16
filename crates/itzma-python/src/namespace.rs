@@ -149,6 +149,9 @@ fn fetch_policy_options(
 /// Everything `create` and `open` need, gathered while the GIL is held.
 struct Opening {
     store: Arc<dyn ObjectStore>,
+    /// The store query reads go through: the query gate when the `Store` has
+    /// one, else `store`.
+    query_store: Arc<dyn ObjectStore>,
     id: String,
     schema: Option<Schema>,
     read_budget: Option<u64>,
@@ -173,11 +176,11 @@ impl Opening {
         };
         let ns = match self.cache {
             Some(options) => {
-                let cached = CacheStore::new(self.store, options)
+                let cached = CacheStore::new(self.query_store, options)
                     .map_err(|e| error::to_py(itzma_core::ItzmaError::Storage(e)))?;
                 ns.with_cache(Arc::new(cached))
             }
-            None => ns,
+            None => ns.with_cache(self.query_store),
         };
         Ok(PyNamespace::new(ns))
     }
@@ -219,6 +222,7 @@ fn opening(
     );
     Ok(Opening {
         store: store.handle()?,
+        query_store: store.query_handle()?,
         id,
         schema,
         read_budget: settings.read_budget,
