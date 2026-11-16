@@ -56,6 +56,7 @@
 //! | [`sparse_indexer`] | [`IndexSparseOptions`], [`IndexSparseReport`] and the run behind [`Namespace::index_sparse`] |
 //! | [`maintain`] | [`MaintenanceOptions`] and the run behind [`Namespace::maintain`] |
 //! | [`columns`] | [`DocColumns`]: a batch of upserts held as columns, for Arrow input |
+//! | [`lease`] | [`MaintenanceLease`]: which process maintains a namespace |
 //! | [`inspect`] | [`inspect::report`]: a read-only look at what a namespace holds and what looks wrong |
 //! | [`search`] | Distance metrics and the flat top-k scan |
 //! | [`error`] | [`ItzmaError`] and [`Result`] |
@@ -73,6 +74,7 @@
 //! ```text
 //! <namespace>/
 //!   schema.json                    dimension, metric and attribute types, written once, never changed
+//!   maintenance/lease.json         which process maintains the namespace, written by a loop's lease
 //!   gc/fenced-through              how far the WAL fences reach, a hint for `gc` (only with fence_wal)
 //!   manifest/current.json          schema, live segments, WAL fold point
 //!   wal/00000000000000000001.json  one object per write batch (binary, see below)
@@ -142,6 +144,7 @@ pub mod indexer;
 pub mod inspect;
 mod kernels;
 pub mod layer;
+pub mod lease;
 pub mod maintain;
 pub mod manifest;
 pub mod namespace;
@@ -175,6 +178,7 @@ pub use fetch::FetchPolicy;
 pub use filter::{FilterOptions, FilterPage, Row};
 pub use gc::{GcOptions, GcReport};
 pub use indexer::{IndexKind, IndexOptions, IndexReport};
+pub use lease::{DEFAULT_LEASE_RENEW, DEFAULT_LEASE_TTL, LeaseOptions, MaintenanceLease, Role};
 pub use maintain::{CompactTrigger, MaintenanceOptions, MaintenanceReport};
 pub use manifest::{IndexEntry, Manifest, SparseIndexEntry};
 pub use namespace::Namespace;
