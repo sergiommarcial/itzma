@@ -6,9 +6,9 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use itzma_core::{CompactionOptions, GcOptions, Metric, Namespace, WriteKey};
 use common::counting::CountingStore;
 use common::{backends, cas_backends, doc, schema};
+use itzma_core::{CompactionOptions, GcOptions, Metric, Namespace, WriteKey};
 use object_store::ObjectStore;
 
 const DIM: usize = 2;
