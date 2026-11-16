@@ -309,6 +309,22 @@ fn query(c: &mut Criterion, rt: &Runtime) {
         b.to_async(rt)
             .iter(|| async { black_box(ns.query(&probe, 10).await.expect("query")) });
     });
+    // The same tail on a handle with a staleness bound: no manifest GET and
+    // no listing within the hour.
+    let bounded = OnceCell::new();
+    group.bench_function("wal_tail/32_objects_bounded", |b| {
+        let ns = bounded.get_or_init(|| {
+            rt.block_on(async {
+                let (store, _) = small_tail(32).await;
+                Namespace::open(store, "bench")
+                    .await
+                    .expect("open")
+                    .with_staleness(Duration::from_secs(3600))
+            })
+        });
+        b.to_async(rt)
+            .iter(|| async { black_box(ns.query(&probe, 10).await.expect("query")) });
+    });
 
     // The same 100k-vector segment as above, indexed with one SQ8 partition
     // (no clustering) and with 64, beside the flat one:
