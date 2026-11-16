@@ -31,9 +31,9 @@ use itzma_core::quant::Sq8Codec;
 use itzma_core::search::distance;
 use itzma_core::{
     AttrColumn, AttrSchema, AttrType, CompactionOptions, Compare, DEFAULT_STREAM_TARGET_BYTES,
-    DecodedCache, DecodedCacheOptions, DocColumns, Document, FilterOptions, IndexKind,
-    IndexOptions, IndexSparseOptions, Metric, Namespace, Predicate, QueryOptions, Schema,
-    SparseQueryOptions, SparseVector, StreamOptions,
+    DecodedCache, DecodedCacheOptions, DocColumns, Document, FilterOptions, GateOptions,
+    GatedStore, IndexKind, IndexOptions, IndexSparseOptions, Metric, Namespace, Predicate,
+    QueryOptions, Schema, SparseQueryOptions, SparseVector, StreamOptions,
 };
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
@@ -1108,6 +1108,56 @@ async fn columnar_input(level: u32, parts: usize, fold: bool) -> Namespace {
     ns
 }
 
+/// The IO gate's own cost: one indexed 100k segment queried with
+/// no gate and through a default query gate. On `InMemory` the gate never
+/// waits, so the difference is two uncontended semaphore acquires and one
+/// body copy per read.
+fn gate(c: &mut Criterion, rt: &Runtime) {
+    let mut group = c.benchmark_group("gate");
+    group.throughput(Throughput::Elements(100 * BATCH as u64));
+    let probe = Rng(7).vector();
+    let built: OnceCell<(Namespace, Namespace)> = OnceCell::new();
+    let handles = || {
+        built.get_or_init(|| {
+            rt.block_on(async {
+                let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+                let ns = Namespace::create(store.clone(), "bench", SCHEMA)
+                    .await
+                    .expect("create");
+                let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+                for b in 0..100 {
+                    ns.upsert(documents(&mut rng, b * BATCH, BATCH))
+                        .await
+                        .expect("upsert");
+                }
+                ns.compact(&CompactionOptions::default())
+                    .await
+                    .expect("compact");
+                ns.index(&IndexOptions::default().kind(IndexKind::Sq8).nlist(Some(1)))
+                    .await
+                    .expect("index");
+                let gated = GatedStore::new(store.clone(), GateOptions::default()).expect("gate");
+                let through_gate = Namespace::open(store, "bench")
+                    .await
+                    .expect("open")
+                    .with_cache(Arc::new(gated));
+                (ns, through_gate)
+            })
+        })
+    };
+    group.bench_function("query_indexed_100k/ungated", |b| {
+        let (ungated, _) = handles();
+        b.to_async(rt)
+            .iter(|| async { black_box(ungated.query(&probe, 10).await.expect("query")) });
+    });
+    group.bench_function("query_indexed_100k/gated", |b| {
+        let (_, gated) = handles();
+        b.to_async(rt)
+            .iter(|| async { black_box(gated.query(&probe, 10).await.expect("query")) });
+    });
+    group.finish();
+}
+
 fn benches(c: &mut Criterion) {
     kernels(c);
     cpu(c);
@@ -1120,6 +1170,7 @@ fn benches(c: &mut Criterion) {
     filtered(c, &rt);
     columnar(c, &rt);
     decoded(c, &rt);
+    gate(c, &rt);
 }
 
 criterion_group!(core, benches);

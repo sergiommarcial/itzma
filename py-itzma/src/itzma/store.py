@@ -9,6 +9,38 @@ from itzma import _itzma
 from itzma.exceptions import InvalidInput
 
 
+@dataclass(frozen=True)
+class Gate:
+    """Bound the reads in flight through a :class:`Store`.
+
+    Queries share one gate and maintenance (compaction, index builds, GC and
+    the manifest read every call makes) another, smaller one, so a merge
+    cannot take the reads queries need. Every namespace opened from the same
+    ``Store`` shares both. A read larger than a gate's bytes is let through
+    alone. The defaults are starting points, not measurements; a ``Store``
+    has no gate unless it is given one.
+    """
+
+    max_bytes: int = 64 << 20
+    max_requests: int = 256
+    maintenance_max_bytes: int = 16 << 20
+    maintenance_max_requests: int = 256
+
+    def __post_init__(self) -> None:
+        # The core refuses what it cannot use (bytes above 4 GiB, say); this
+        # only keeps a value the bridge cannot even pass from surfacing as
+        # PyO3's OverflowError instead of InvalidInput.
+        for name in (
+            "max_bytes",
+            "max_requests",
+            "maintenance_max_bytes",
+            "maintenance_max_requests",
+        ):
+            value = getattr(self, name)
+            if not 1 <= value < 2**64:
+                raise InvalidInput(f"Gate.{name} must be at least 1, got {value}")
+
+
 class Store:
     """An object store: ``s3://bucket[/prefix]``, ``gs://bucket[/prefix]``,
     ``az://container[/prefix]``, ``file:///abs/path`` or ``memory://``.
@@ -40,6 +72,8 @@ class Store:
     ``file://`` store has no conditional update, so ``compact``, ``index`` and
     ``maintain`` fail on it with ``StoreError``. A ``memory://`` store lives in
     this object: namespaces opened through the same ``Store`` share it.
+    ``gate`` bounds the reads in flight through this store (see :class:`Gate`);
+    there is none by default.
     """
 
     def __init__(
@@ -58,6 +92,7 @@ class Store:
         account: str | None = None,
         credential: str | None = None,
         sas_token: str | None = None,
+        gate: Gate | None = None,
     ) -> None:
         self.url = url
         self._store = _itzma.Store(
@@ -74,6 +109,10 @@ class Store:
             account=account,
             credential=credential,
             sas_token=sas_token,
+            gate_max_bytes=gate.max_bytes if gate else None,
+            gate_max_requests=gate.max_requests if gate else None,
+            gate_maintenance_max_bytes=gate.maintenance_max_bytes if gate else None,
+            gate_maintenance_max_requests=gate.maintenance_max_requests if gate else None,
         )
 
     def __repr__(self) -> str:

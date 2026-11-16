@@ -26,6 +26,14 @@ that section into the version's notes.
   request for either, and queries waiting on a refresh share one. The
   handle's own writes are always visible. Off by default; queries stay
   strict unless a handle opts in.
+- `GatedStore` and `GateOptions`, an opt-in store wrapper that admits reads
+  only while the requests and bytes in flight stay under its limits, with a
+  smaller `GateOptions::maintenance()` for compaction and index builds.
+  Writes, deletes and listings are not gated. In Python,
+  `Store(url, gate=itzma.Gate())` builds a query gate and a maintenance gate
+  shared by every namespace opened from that store. The default limits are
+  starting points, not measurements. `make test-gated` runs the read-path
+  tests under a one-request, one-byte gate, and CI runs it on stable.
 
 ### Changed
 

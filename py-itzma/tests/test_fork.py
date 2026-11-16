@@ -114,6 +114,27 @@ def test_a_store_from_before_the_fork_is_refused(tmp_path: Path, ns_id: str) -> 
     assert os.waitstatus_to_exitcode(status) == 0
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="no fork on Windows")
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_gated_store_refused_after_fork(tmp_path: Path, ns_id: str) -> None:
+    store = itzma.Store(f"file://{tmp_path}", gate=itzma.Gate())
+    itzma.Namespace.create(store, ns_id, schema()).upsert(random_rows(5))
+
+    pid = os.fork()
+    if pid == 0:  # child: the gate may hold permits of the parent's reads
+        code = 1
+        try:
+            try:
+                itzma.Namespace.open(store, ns_id)
+            except itzma.ItzmaError as e:
+                if "fork" in str(e):
+                    code = 0
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+
+
 def _big_namespace(ns_id: str) -> itzma.Namespace:
     """20,000 rows at dimension 64: big enough to reach the compute pools."""
     rng = random.Random(1)

@@ -1602,3 +1602,17 @@ async fn a_query_across_versions_2_and_3_matches_the_flat_scan_with_attributes()
         }
     }
 }
+
+/// `make test-gated` is only worth running if the stores really are gated.
+#[test]
+fn test_stores_sit_under_the_gate_when_asked() {
+    let gated = std::env::var("ITZMA_TEST_GATE").as_deref() == Ok("smallest");
+    for backend in common::backends() {
+        assert_eq!(
+            backend.store.to_string().starts_with("GatedStore"),
+            gated,
+            "{}",
+            backend.name
+        );
+    }
+}

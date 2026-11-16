@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use itzma_core::{GateOptions, GatedStore};
 use itzma_store_aws::{S3Options, S3Store};
 use itzma_store_azure::{AzureCredential, AzureOptions, AzureStore};
 use itzma_store_gcs::{GcsOptions, GcsStore};
@@ -245,9 +246,37 @@ pub(crate) async fn build(
     }
 }
 
+/// A `Store`'s maintenance store, then its query store.
+pub(crate) type Stores = (Arc<dyn ObjectStore>, Arc<dyn ObjectStore>);
+
+/// The maintenance store and the query store for `raw`: both `raw` when no
+/// limit is given, else a maintenance gate and a query gate over it
+///. `limits` is the query gate's bytes and requests, then the
+/// maintenance gate's; all four or none.
+pub(crate) fn gates(raw: Arc<dyn ObjectStore>, limits: [Option<u64>; 4]) -> Result<Stores, String> {
+    let gate = |bytes: u64, requests: u64| -> Result<Arc<dyn ObjectStore>, String> {
+        let requests = usize::try_from(requests).map_err(|e| e.to_string())?;
+        let options = GateOptions::default()
+            .max_bytes(bytes)
+            .max_requests(requests);
+        let gated = GatedStore::new(raw.clone(), options).map_err(|e| e.to_string())?;
+        Ok(Arc::new(gated))
+    };
+    match limits {
+        [None, None, None, None] => Ok((raw.clone(), raw)),
+        [Some(qb), Some(qr), Some(mb), Some(mr)] => Ok((gate(mb, mr)?, gate(qb, qr)?)),
+        _ => Err("give all four gate limits or none".into()),
+    }
+}
+
 #[pyclass(frozen, name = "Store", module = "itzma._itzma")]
 pub(crate) struct PyStore {
+    /// What writes, manifest loads, compaction, index builds and GC read
+    /// through: the maintenance gate when the store has one.
     inner: Arc<dyn ObjectStore>,
+    /// What query reads go through, under any cache: the query gate when the
+    /// store has one, else the same store as `inner`.
+    query: Arc<dyn ObjectStore>,
     pid: u32,
 }
 
@@ -260,6 +289,13 @@ impl PyStore {
             None => Ok(self.inner.clone()),
         }
     }
+
+    /// The store query reads go through, refused after a fork like
+    /// [`handle`](Self::handle).
+    pub(crate) fn query_handle(&self) -> PyResult<Arc<dyn ObjectStore>> {
+        self.handle()?;
+        Ok(self.query.clone())
+    }
 }
 
 #[pymethods]
@@ -268,7 +304,9 @@ impl PyStore {
     #[pyo3(signature = (url, *, region=None, endpoint=None, access_key_id=None,
                         secret_access_key=None, session_token=None, allow_http=None, env=true,
                         control_endpoint=None, anonymous=None,
-                        account=None, credential=None, sas_token=None))]
+                        account=None, credential=None, sas_token=None,
+                        gate_max_bytes=None, gate_max_requests=None,
+                        gate_maintenance_max_bytes=None, gate_maintenance_max_requests=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -285,6 +323,10 @@ impl PyStore {
         account: Option<String>,
         credential: Option<String>,
         sas_token: Option<String>,
+        gate_max_bytes: Option<u64>,
+        gate_max_requests: Option<u64>,
+        gate_maintenance_max_bytes: Option<u64>,
+        gate_maintenance_max_requests: Option<u64>,
     ) -> PyResult<Self> {
         let location = parse(url).map_err(error::input)?;
         let options = StoreOptions {
@@ -304,13 +346,24 @@ impl PyStore {
         check(&location, &options).map_err(error::input)?;
         // Past `check`, a failure is the store's (no credentials, a bad
         // endpoint), not the caller's input.
-        let inner = runtime::block_on(py, async move {
+        let raw = runtime::block_on(py, async move {
             build(location, &options)
                 .await
                 .map_err(|e| error::raise("StoreError", e))
         })?;
+        let (inner, query) = gates(
+            raw,
+            [
+                gate_max_bytes,
+                gate_max_requests,
+                gate_maintenance_max_bytes,
+                gate_maintenance_max_requests,
+            ],
+        )
+        .map_err(error::input)?;
         Ok(Self {
             inner,
+            query,
             pid: std::process::id(),
         })
     }
@@ -319,6 +372,24 @@ impl PyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_gate_limits_mean_one_ungated_store() {
+        let raw: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (inner, query) = gates(raw.clone(), [None; 4]).unwrap();
+        assert!(Arc::ptr_eq(&inner, &raw) && Arc::ptr_eq(&query, &raw));
+    }
+
+    #[test]
+    fn gate_limits_build_two_gates_or_are_refused() {
+        let raw: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (inner, query) = gates(raw.clone(), [Some(64), Some(2), Some(16), Some(1)]).unwrap();
+        assert!(!Arc::ptr_eq(&inner, &query));
+        assert!(inner.to_string().starts_with("GatedStore"));
+        assert!(query.to_string().starts_with("GatedStore"));
+        assert!(gates(raw.clone(), [Some(64), None, None, None]).is_err());
+        assert!(gates(raw, [Some(0), Some(1), Some(1), Some(1)]).is_err());
+    }
 
     #[test]
     fn parses_each_scheme() {

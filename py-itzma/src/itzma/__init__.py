@@ -30,7 +30,7 @@ from itzma.reports import (
 )
 from itzma.results import FilterPage, Hit, Hits, Row
 from itzma.schema import AttrType, Metric, Schema
-from itzma.store import Cache, FetchPolicy, Store
+from itzma.store import Cache, FetchPolicy, Gate, Store
 
 __all__ = [
     "AsyncNamespace",
@@ -41,6 +41,7 @@ __all__ = [
     "Expr",
     "FetchPolicy",
     "FilterPage",
+    "Gate",
     "GcReport",
     "Hit",
     "Hits",

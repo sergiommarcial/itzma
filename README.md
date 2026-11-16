@@ -216,6 +216,20 @@ A batch with a sparse vector is written as WAL version 4 (5 with a key), which n
 
 **Read budget.** Every query attempt, and each unit of a compaction, may read at most a byte budget (`DEFAULT_READ_BUDGET`, 1 GiB, or `Namespace::with_read_budget`). Past it the call fails with `ReadBudgetExceeded` before anything is written. An indexed segment is charged only for what it fetches, so a namespace bigger than the budget can still be queried once its large segments are indexed.
 
+**IO gate.** `GatedStore` wraps a store and admits reads only while the requests and bytes in flight stay under its limits, so nested fan-outs and several queries in one process cannot open an unbounded number of GETs, and maintenance gets its own, smaller gate. It is off unless you build one. Put it under the cache, so a hit takes no permit:
+
+```rust
+use std::sync::Arc;
+use itzma_core::{CacheOptions, CacheStore, GateOptions, GatedStore, Namespace};
+
+let queries = Arc::new(GatedStore::new(s3.clone(), GateOptions::default())?);
+let maintenance = Arc::new(GatedStore::new(s3, GateOptions::maintenance())?);
+let cache = CacheStore::new(queries, CacheOptions::default())?;
+let ns = Namespace::open(maintenance, "docs").await?.with_cache(Arc::new(cache));
+```
+
+Only reads are gated; writes, deletes and listings are not. The defaults (64 MiB and 256 requests for queries, 16 MiB for maintenance) are starting points, not measurements under real latency. In Python, `itzma.Store(url, gate=itzma.Gate())`.
+
 `configure_cpu` sizes the two thread pools CPU work runs on (queries on every core, maintenance on a quarter), once, before the first call that uses them.
 
 ## Looking inside a namespace

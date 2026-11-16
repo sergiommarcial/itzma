@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use itzma_core::{
     CompactionOptions, DEFAULT_LEASE_RENEW, DEFAULT_LEASE_TTL, DEFAULT_RAM_MAX_BYTES,
-    DEFAULT_READ_BUDGET, FetchPolicy, FilterOptions, GcOptions, IndexOptions, IndexSparseOptions,
-    LeaseOptions, MaintenanceOptions, QueryOptions, StreamOptions,
+    DEFAULT_READ_BUDGET, FetchPolicy, FilterOptions, GateOptions, GcOptions, IndexOptions,
+    IndexSparseOptions, LeaseOptions, MaintenanceOptions, QueryOptions, StreamOptions,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -212,7 +212,13 @@ pub(crate) fn defaults() -> Value {
         },
         "fetch": fetch_json(&FetchPolicy::object_store()),
         "fetch_local": fetch_json(&FetchPolicy::local()),
+        "gate": gate_json(&GateOptions::default()),
+        "gate_maintenance": gate_json(&GateOptions::maintenance()),
     })
+}
+
+fn gate_json(g: &GateOptions) -> serde_json::Value {
+    serde_json::json!({"max_bytes": g.max_bytes, "max_requests": g.max_requests})
 }
 
 /// The core's defaults as JSON; the Python tests compare signatures to them.
