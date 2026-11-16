@@ -10,6 +10,27 @@ that section into the version's notes.
 
 ## [Unreleased]
 
+### Added
+
+- `Namespace::maintenance_lease` and `MaintenanceLease`, so the processes
+  sharing a namespace can agree on one maintainer. The lease is one object,
+  `<namespace>/maintenance/lease.json`, renewed every 15 seconds by default
+  and taken over by another process after 60 seconds of silence. It saves
+  work and decides nothing about correctness: two maintainers at once were
+  always safe. `examples/maintenance_loop.rs` shows a Rust loop on it.
+- `itzma.Maintenance`, the settings for the Python loop, and
+  `ns.maintainer`, with a `role` of `"leader"` or `"follower"`.
+
+### Changed
+
+- `Namespace.open` and `create` in Python (sync and async) now start a leased
+  maintenance loop by default, which compacts, indexes and collects every
+  minute while it holds the lease. The first run comes a minute after it
+  takes the lease, so a short script never pays for one. Pass
+  `maintenance=None` to turn it off, for instance when `maintain` already
+  runs from cron. On a `file://` store the loop logs one warning and stops.
+  `start_maintenance` still takes no lease and replaces the automatic loop.
+
 ### Security
 
 - The lockfile now pins `serde_with` 3.21.0, which the Google Cloud SDK pulls

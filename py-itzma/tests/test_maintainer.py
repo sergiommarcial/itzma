@@ -4,24 +4,15 @@ import asyncio
 import gc
 import logging
 import time
-from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from conftest import random_rows, schema
+from conftest import random_rows, schema, wait_for
 
 import itzma
 
 FAST = timedelta(milliseconds=50)
-
-
-def wait_for(condition: Callable[[], bool], timeout: float = 10.0) -> None:
-    deadline = time.monotonic() + timeout
-    while not condition():
-        if time.monotonic() > deadline:
-            raise AssertionError("timed out")
-        time.sleep(0.02)
 
 
 def test_it_compacts_and_indexes(ns_id: str) -> None:

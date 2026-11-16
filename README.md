@@ -315,7 +315,7 @@ A store counts as supported when it passes the conformance suite in `crates/itzm
 
 - A query without an index, or with `exact: true`, reads every live vector of the unindexed segments, bounded by the read budget.
 - A clustered index is approximate unless `nprobe` reaches its partition count; recall is measured on SIFT1M and GloVe-25 only.
-- Compaction and indexing are explicit; nothing runs them for you.
+- In Rust, compaction and indexing are explicit and the library starts no task. `Namespace::maintenance_lease` lets the processes sharing a namespace agree on one maintainer; `crates/itzma-core/examples/maintenance_loop.rs` is a loop built on it. In Python, `open` and `create` start that loop unless you pass `maintenance=None`.
 - Filtering without a vector scans ids and attributes until a page is full.
 - Vector queries do not paginate.
 - One batch is one object, at most 64 MiB.

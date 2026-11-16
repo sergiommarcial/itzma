@@ -78,17 +78,36 @@ Wrap each comparison in parentheses: `&` and `|` bind tighter than `==` and `>=`
 
 ## Keeping it compacted and indexed
 
-Writes land in a log that queries also read. Nothing folds that log into segments or builds indexes on its own, so either call `ns.maintain()`, `ns.compact()`, `ns.index()` and `ns.gc()` yourself or start a background loop:
+Writes land in a log that queries also read. Something has to fold it into segments and build indexes, and by default the handle does it for you: `open` and `create` start a background loop that runs `maintain` and the index builds every minute.
+
+If several processes open the same namespace, only one of them does the work. A small lease object in the namespace says which; the others check it every 15 seconds, and if the one working goes away, another takes over within about a minute. The first run comes a full minute after a loop takes the lease, so a short script that opens, writes and exits never pays for a compaction.
+
+To change the settings, pass your own:
 
 ```python
-m = ns.start_maintenance(timedelta(seconds=60))  # maintain + index every minute
+from datetime import timedelta
+
+ns = itzma.Namespace.open(
+    store,
+    "docs",
+    maintenance=itzma.Maintenance(every=timedelta(minutes=5), tail_objects=128),
+)
+ns.maintainer.role  # "leader" or "follower"
+```
+
+To turn it off, pass `maintenance=None`. Do that if you already run `maintain` from cron or a job of your own: two maintainers waste work, though they never damage anything.
+
+You can still call `ns.maintain()`, `ns.compact()`, `ns.index()` and `ns.gc()` yourself, or start a loop by hand, which takes no lease and runs its first pass at once:
+
+```python
+m = ns.start_maintenance(timedelta(seconds=60))  # replaces the automatic loop
 ...
 m.stop()  # or ns.close()
 ```
 
 `ns.index()` builds HNSW by default; pass `kind="sq8"` for SQ8, which reads only the partitions a query probes and suits uncached reads. `ns.index_sparse()` builds the sparse inverted index.
 
-Errors are logged to the `itzma.maintenance` logger and kept in `m.last_error`; the loop keeps going. A `file://` store has no conditional update, so compaction and indexing fail there with `StoreError`; use S3 or `memory://` for those.
+Errors are logged to the `itzma.maintenance` logger and kept in `last_error`; the loop keeps going. A `file://` store has no conditional update, so compaction and indexing fail there with `StoreError`, and the automatic loop logs that once and stops. Use S3, GCS, Azure or `memory://` for maintenance.
 
 ## In a web server
 
@@ -98,7 +117,6 @@ FastAPI:
 
 ```python
 from contextlib import asynccontextmanager
-from datetime import timedelta
 from fastapi import FastAPI
 import itzma
 
@@ -106,10 +124,10 @@ import itzma
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store = itzma.Store("s3://my-bucket/itzma", region="us-east-1")
+    # Maintenance starts on its own; see "Keeping it compacted and indexed".
     app.state.ns = await itzma.AsyncNamespace.open(
         store, "docs", cache=itzma.Cache(ram_bytes=2 << 30)
     )
-    app.state.ns.start_maintenance(timedelta(seconds=60))
     yield
     app.state.ns.close()
 

@@ -14,7 +14,7 @@ from typing import Any, Literal
 
 from itzma import _input, _itzma
 from itzma.exceptions import InvalidInput, InvalidQuery, ItzmaError
-from itzma.maintenance import Maintainer
+from itzma.maintenance import Maintainer, Maintenance
 from itzma.predicate import Expr
 from itzma.reports import (
     Compaction,
@@ -125,6 +125,10 @@ def _maintain_options(
     )
 
 
+# Frozen, so one shared default is safe.
+_AUTO = Maintenance()
+
+
 class _Handle:
     """What the sync and async classes share: the Rust object and its lifecycle."""
 
@@ -132,6 +136,45 @@ class _Handle:
         self._ns = ns
         self._closed = False
         self._maintainers: list[Maintainer] = []
+        self._auto: Maintainer | None = None
+
+    def _start_auto(self, maintenance: Maintenance | None) -> None:
+        if maintenance is None:
+            return
+        m = maintenance
+        try:
+            inner = self._handle().start_maintenance(
+                m.every.total_seconds(),
+                _maintain_options(
+                    m.tail_objects,
+                    m.tail_bytes,
+                    m.tail_age,
+                    m.max_segments,
+                    m.max_segment_bytes,
+                    m.gc,
+                    m.gc_min_age,
+                    m.gc_dry_run,
+                    m.fence_wal,
+                ),
+                "{}" if m.index else None,
+                "{}" if m.index else None,
+                lease_renew_secs=m.renew.total_seconds(),
+                lease_ttl_secs=m.ttl.total_seconds(),
+            )
+        except BaseException:
+            self.close()
+            raise
+        self._auto = Maintainer(inner)
+
+    def _stop_auto(self) -> None:
+        if self._auto is not None:
+            self._auto.stop()
+            self._auto = None
+
+    @property
+    def maintainer(self) -> Maintainer | None:
+        """The loop ``open`` or ``create`` started, or ``None`` when off or replaced."""
+        return self._auto
 
     def _handle(self) -> _itzma.Namespace:
         if self._closed:
@@ -148,6 +191,7 @@ class _Handle:
 
     def close(self) -> None:
         """Stop any background maintenance and refuse further calls."""
+        self._stop_auto()
         for m in self._maintainers:
             m.stop()
         self._maintainers.clear()
@@ -171,7 +215,9 @@ class _Handle:
         """Start a background loop running ``maintain`` every ``every``.
 
         With ``index=True`` each run also builds indexes for new segments.
-        The first run starts right away. Nothing runs unless you call this.
+        The first run starts right away, and the loop takes no lease. It
+        replaces the loop ``open`` or ``create`` started, which stops and
+        gives up its lease.
         """
         options = _maintain_options(
             tail_objects,
@@ -184,7 +230,9 @@ class _Handle:
             gc_dry_run,
             fence_wal,
         )
-        inner = self._handle().start_maintenance(
+        handle = self._handle()
+        self._stop_auto()
+        inner = handle.start_maintenance(
             every.total_seconds(),
             options,
             "{}" if index else None,
@@ -211,9 +259,15 @@ class Namespace(_Handle):
         cache: Cache | None = None,
         read_budget: int | None = None,
         fetch: FetchPolicy | None = None,
+        maintenance: Maintenance | None = _AUTO,
     ) -> Namespace:
-        """Create a namespace. Raises ``NamespaceExists`` if one is there."""
-        return cls(
+        """Create a namespace. Raises ``NamespaceExists`` if one is there.
+
+        ``maintenance`` starts a background loop that keeps the namespace
+        compacted, indexed and collected, with one process at a time doing
+        the work (see ``Maintenance``). Pass ``None`` to start none.
+        """
+        ns = cls(
             _itzma.Namespace.create(
                 store._store,
                 id,
@@ -223,6 +277,8 @@ class Namespace(_Handle):
                 **_open_kwargs(cache, read_budget, fetch),
             )
         )
+        ns._start_auto(maintenance)
+        return ns
 
     @classmethod
     def open(
@@ -233,11 +289,17 @@ class Namespace(_Handle):
         cache: Cache | None = None,
         read_budget: int | None = None,
         fetch: FetchPolicy | None = None,
+        maintenance: Maintenance | None = _AUTO,
     ) -> Namespace:
-        """Open an existing namespace. Raises ``NamespaceNotFound`` if there is none."""
-        return cls(
-            _itzma.Namespace.open(store._store, id, **_open_kwargs(cache, read_budget, fetch))
-        )
+        """Open an existing namespace. Raises ``NamespaceNotFound`` if there is none.
+
+        ``maintenance`` starts a background loop that keeps the namespace
+        compacted, indexed and collected, with one process at a time doing
+        the work (see ``Maintenance``). Pass ``None`` to start none.
+        """
+        ns = cls(_itzma.Namespace.open(store._store, id, **_open_kwargs(cache, read_budget, fetch)))
+        ns._start_auto(maintenance)
+        return ns
 
     def upsert(
         self,
@@ -410,8 +472,14 @@ class AsyncNamespace(_Handle):
         cache: Cache | None = None,
         read_budget: int | None = None,
         fetch: FetchPolicy | None = None,
+        maintenance: Maintenance | None = _AUTO,
     ) -> AsyncNamespace:
-        """Create a namespace. Raises ``NamespaceExists`` if one is there."""
+        """Create a namespace. Raises ``NamespaceExists`` if one is there.
+
+        ``maintenance`` starts a background loop that keeps the namespace
+        compacted, indexed and collected, with one process at a time doing
+        the work (see ``Maintenance``). Pass ``None`` to start none.
+        """
         ns = await _itzma.Namespace.create_async(
             store._store,
             id,
@@ -420,7 +488,9 @@ class AsyncNamespace(_Handle):
             schema._attr_names(),
             **_open_kwargs(cache, read_budget, fetch),
         )
-        return cls(ns)
+        handle = cls(ns)
+        handle._start_auto(maintenance)
+        return handle
 
     @classmethod
     async def open(
@@ -431,12 +501,20 @@ class AsyncNamespace(_Handle):
         cache: Cache | None = None,
         read_budget: int | None = None,
         fetch: FetchPolicy | None = None,
+        maintenance: Maintenance | None = _AUTO,
     ) -> AsyncNamespace:
-        """Open an existing namespace. Raises ``NamespaceNotFound`` if there is none."""
+        """Open an existing namespace. Raises ``NamespaceNotFound`` if there is none.
+
+        ``maintenance`` starts a background loop that keeps the namespace
+        compacted, indexed and collected, with one process at a time doing
+        the work (see ``Maintenance``). Pass ``None`` to start none.
+        """
         ns = await _itzma.Namespace.open_async(
             store._store, id, **_open_kwargs(cache, read_budget, fetch)
         )
-        return cls(ns)
+        handle = cls(ns)
+        handle._start_auto(maintenance)
+        return handle
 
     async def upsert(
         self,
