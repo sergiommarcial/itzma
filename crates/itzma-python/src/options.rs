@@ -4,8 +4,9 @@
 use std::time::Duration;
 
 use itzma_core::{
-    CompactionOptions, DEFAULT_RAM_MAX_BYTES, DEFAULT_READ_BUDGET, FetchPolicy, FilterOptions,
-    GcOptions, IndexOptions, IndexSparseOptions, MaintenanceOptions, QueryOptions, StreamOptions,
+    CompactionOptions, DEFAULT_LEASE_RENEW, DEFAULT_LEASE_TTL, DEFAULT_RAM_MAX_BYTES,
+    DEFAULT_READ_BUDGET, FetchPolicy, FilterOptions, GcOptions, IndexOptions, IndexSparseOptions,
+    LeaseOptions, MaintenanceOptions, QueryOptions, StreamOptions,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -69,6 +70,23 @@ fn seconds(v: &Value, key: &str) -> Result<Duration, String> {
         .ok_or_else(|| format!("option {key:?} must be a number of seconds"))?;
     Duration::try_from_secs_f64(secs)
         .map_err(|_| format!("option {key:?} must be 0 or more seconds"))
+}
+
+/// The lease for a leased maintenance loop: both values, or neither
+/// for a loop without one. The core checks how they relate when it builds the
+/// lease.
+pub(crate) fn lease(
+    renew_secs: Option<f64>,
+    ttl_secs: Option<f64>,
+) -> Result<Option<LeaseOptions>, String> {
+    match (renew_secs, ttl_secs) {
+        (Some(renew), Some(ttl)) => Ok(Some(LeaseOptions {
+            renew: seconds(&json!(renew), "lease_renew_secs")?,
+            ttl: seconds(&json!(ttl), "lease_ttl_secs")?,
+        })),
+        (None, None) => Ok(None),
+        _ => Err("lease_renew_secs and lease_ttl_secs go together".into()),
+    }
 }
 
 fn compaction_from(map: &Map<String, Value>) -> Result<CompactionOptions, String> {
@@ -182,6 +200,10 @@ pub(crate) fn defaults() -> Value {
             "max_segment_bytes": m.compaction.max_segment_bytes,
             "gc": m.gc.as_ref().map(gc_json),
         },
+        "lease": {
+            "renew_secs": DEFAULT_LEASE_RENEW.as_secs_f64(),
+            "ttl_secs": DEFAULT_LEASE_TTL.as_secs_f64(),
+        },
         "cache": {"ram_bytes": DEFAULT_RAM_MAX_BYTES},
         "read_budget": DEFAULT_READ_BUDGET,
         "stream": {
@@ -264,6 +286,35 @@ mod tests {
         assert!(gc(r#"{"min_age_secs": -1}"#).is_err());
         assert!(gc(r#"{"dry_run": 1}"#).is_err());
         assert!(maintenance(r#"{"gc": 3}"#).is_err());
+    }
+
+    #[test]
+    fn half_a_lease_is_refused() {
+        assert!(lease(Some(15.0), None).unwrap_err().contains("go together"));
+        assert!(lease(None, Some(60.0)).unwrap_err().contains("go together"));
+        assert_eq!(lease(None, None), Ok(None));
+        assert_eq!(
+            lease(Some(15.0), Some(60.0)),
+            Ok(Some(itzma_core::LeaseOptions::default()))
+        );
+        assert!(lease(Some(-1.0), Some(60.0)).is_err());
+    }
+
+    #[test]
+    fn lease_defaults() {
+        let d = defaults();
+        assert_eq!(d["lease"]["renew_secs"], 15.0);
+        assert_eq!(d["lease"]["ttl_secs"], 60.0);
+        assert_eq!(
+            lease(
+                d["lease"]["renew_secs"].as_f64(),
+                d["lease"]["ttl_secs"].as_f64()
+            ),
+            Ok(Some(itzma_core::LeaseOptions {
+                renew: itzma_core::DEFAULT_LEASE_RENEW,
+                ttl: itzma_core::DEFAULT_LEASE_TTL,
+            }))
+        );
     }
 
     #[test]

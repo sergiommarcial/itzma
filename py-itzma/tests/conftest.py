@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -163,3 +164,11 @@ def random_rows(n: int, dim: int = 4, seed: int = 0, prefix: str = "d") -> list[
 def assert_hits(hits: itzma.Hits, expected: list[tuple[str, float]]) -> None:
     assert hits.ids == [i for i, _ in expected]
     np.testing.assert_allclose(hits.distances, [d for _, d in expected], rtol=1e-4, atol=1e-5)
+
+
+def wait_for(condition: Callable[[], bool], timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("timed out")
+        time.sleep(0.02)

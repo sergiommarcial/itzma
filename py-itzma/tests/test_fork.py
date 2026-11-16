@@ -6,10 +6,11 @@ import signal
 import sys
 import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from conftest import make_azure_store, make_gcs_store, random_rows, schema
+from conftest import make_azure_store, make_gcs_store, random_rows, schema, wait_for
 
 import itzma
 
@@ -181,3 +182,32 @@ def test_a_fork_while_a_scan_runs_on_the_pools_leaves_the_child_working(ns_id: s
         worker.join()
     assert os.waitstatus_to_exitcode(status) == 0
     assert set(ran) == {5}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="no fork on Windows")
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_a_forked_child_closing_the_handle_leaves_the_parents_loop(ns_id: str) -> None:
+    fast = itzma.Maintenance(
+        every=timedelta(milliseconds=200),
+        renew=timedelta(milliseconds=50),
+        ttl=timedelta(milliseconds=200),
+    )
+    ns = itzma.Namespace.create(itzma.Store("memory://"), ns_id, schema(), maintenance=fast)
+    m = ns.maintainer
+    assert m is not None
+    wait_for(lambda: m.role == "leader")
+
+    pid = os.fork()
+    if pid == 0:  # child
+        code = 1
+        try:
+            ns.close()
+            code = 0
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    time.sleep(0.3)
+    assert m.running
+    assert m.role == "leader"
+    ns.close()

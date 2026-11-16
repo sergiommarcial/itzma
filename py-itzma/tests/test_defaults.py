@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import json
 from datetime import timedelta
@@ -89,3 +90,25 @@ def test_fetch_policy_local_matches_the_core() -> None:
         part_size=D["fetch_local"]["part_size"],
         align=D["fetch_local"]["align"],
     )
+
+
+def test_maintenance_defaults_match_start_maintenance() -> None:
+    params = inspect.signature(itzma.Namespace.start_maintenance).parameters
+    m = itzma.Maintenance()
+    for field in dataclasses.fields(m):
+        if field.name in ("renew", "ttl"):
+            continue
+        assert getattr(m, field.name) == params[field.name].default, field.name
+
+
+def test_maintenance_lease_defaults_match_the_core() -> None:
+    m = itzma.Maintenance()
+    assert m.renew.total_seconds() == D["lease"]["renew_secs"]
+    assert m.ttl.total_seconds() == D["lease"]["ttl_secs"]
+
+
+@pytest.mark.parametrize("cls", [itzma.Namespace, itzma.AsyncNamespace])
+@pytest.mark.parametrize("method", ["create", "open"])
+def test_maintenance_is_on_by_default(cls: type, method: str) -> None:
+    default = inspect.signature(getattr(cls, method)).parameters["maintenance"].default
+    assert default == itzma.Maintenance()

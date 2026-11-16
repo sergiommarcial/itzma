@@ -27,6 +27,7 @@ use crate::filter::{self, FilterOptions, FilterPage};
 use crate::gc::{self, GcOptions, GcReport};
 use crate::index;
 use crate::indexer::{self, IndexOptions, IndexReport, MIN_SEGMENT_FORMAT, Outcome};
+use crate::lease::{LeaseOptions, MaintenanceLease};
 use crate::maintain::{self, MaintenanceOptions, MaintenanceReport};
 use crate::manifest::{self, Manifest};
 use crate::predicate::Predicate;
@@ -1330,6 +1331,19 @@ impl Namespace {
             compaction,
             gc,
         })
+    }
+
+    /// A maintenance lease on this namespace, for a loop that should maintain
+    /// only while no other process does. Nothing is read or written
+    /// until the first [`tick`](MaintenanceLease::tick). Each call gives a new
+    /// holder, so two leases from one handle compete like two processes.
+    ///
+    /// # Errors
+    ///
+    /// [`ItzmaError::InvalidConfig`] if `renew` is zero or `ttl` is less than
+    /// twice `renew`.
+    pub fn maintenance_lease(&self, options: LeaseOptions) -> Result<MaintenanceLease> {
+        MaintenanceLease::new(Arc::clone(&self.store), &self.id, options)
     }
 
     /// Commit ops through [`wal::append`], then advance the hint past the seq

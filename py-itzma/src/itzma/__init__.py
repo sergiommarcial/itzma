@@ -18,7 +18,7 @@ from itzma.exceptions import (
     ReadBudgetExceeded,
     StoreError,
 )
-from itzma.maintenance import Maintainer
+from itzma.maintenance import Maintainer, Maintenance
 from itzma.namespace import AsyncNamespace, Namespace
 from itzma.predicate import Attr, Expr, attr
 from itzma.reports import (
@@ -47,6 +47,7 @@ __all__ = [
     "IndexReport",
     "IndexSparseReport",
     "Maintainer",
+    "Maintenance",
     "MaintenanceReport",
     "Metric",
     "Namespace",
