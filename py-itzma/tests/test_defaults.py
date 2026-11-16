@@ -92,6 +92,12 @@ def test_fetch_policy_local_matches_the_core() -> None:
     )
 
 
+@pytest.mark.parametrize("cls", [itzma.Namespace, itzma.AsyncNamespace])
+@pytest.mark.parametrize("method", ["create", "open"])
+def test_staleness_defaults_to_strict(cls: type, method: str) -> None:
+    assert inspect.signature(getattr(cls, method)).parameters["staleness"].default is None
+
+
 def test_maintenance_defaults_match_start_maintenance() -> None:
     params = inspect.signature(itzma.Namespace.start_maintenance).parameters
     m = itzma.Maintenance()
