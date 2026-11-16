@@ -34,7 +34,20 @@ pub struct Backend {
 }
 
 pub fn memory() -> Arc<dyn ObjectStore> {
-    Arc::new(InMemory::new())
+    gated(Arc::new(InMemory::new()))
+}
+
+/// With `ITZMA_TEST_GATE=smallest`, every test store sits under a gate of one
+/// request and one byte, the smallest there is, so a read path that
+/// waits on a permit it cannot get hangs the test instead of shipping.
+pub fn gated(store: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+    if std::env::var("ITZMA_TEST_GATE").as_deref() != Ok("smallest") {
+        return store;
+    }
+    let smallest = itzma_core::GateOptions::default()
+        .max_requests(1)
+        .max_bytes(1);
+    Arc::new(itzma_core::GatedStore::new(store, smallest).expect("smallest gate"))
 }
 
 /// A key prefix no other test, and no other process, has used. It carries the
@@ -71,7 +84,7 @@ pub fn s3_at(prefix: &str) -> Option<Arc<dyn ObjectStore>> {
         .with_allow_http(true)
         .build()
         .expect("s3 store");
-    Some(Arc::new(PrefixStore::new(store, prefix)))
+    Some(gated(Arc::new(PrefixStore::new(store, prefix))))
 }
 
 /// An S3 store isolated under a fresh key prefix, so tests that share the
@@ -96,7 +109,7 @@ pub fn backends() -> Vec<Backend> {
         },
         Backend {
             name: "local",
-            store: Arc::new(local),
+            store: gated(Arc::new(local)),
             _dir: Some(dir),
         },
     ];

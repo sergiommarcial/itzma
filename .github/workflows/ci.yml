@@ -75,6 +75,9 @@ jobs:
         run: cargo test --locked
       - name: benchmarks, run once each
         run: cargo test --locked --bench core
+      - name: read paths under the smallest gate
+        if: matrix.toolchain == 'stable'
+        run: make test-gated
 
   test-s3:
     name: test (S3, MinIO)

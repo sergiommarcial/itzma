@@ -25,7 +25,7 @@ PY_BASE_PYTHON = $(shell $(PY_VENV_PYTHON) -c 'import os, sys; print(os.path.rea
 .PHONY: help check-tools check-cargo check-cargo-deny check-cargo-machete check-docker check-uv \
 	install install-tools \
 	build build-release \
-	test test-fast test-msrv test-s3 s3-up s3-down test-aws test-gcs gcs-up gcs-down test-azure azure-up azure-down bench \
+	test test-fast test-gated test-msrv test-s3 s3-up s3-down test-aws test-gcs gcs-up gcs-down test-azure azure-up azure-down bench \
 	lint lint-latest fmt-check clippy doc deny machete \
 	format doc-open \
 	py-env py-dev py-rust py-rust-one py-lint py-format py-test py \
@@ -98,6 +98,9 @@ test-msrv: ## Run the tests on the rust-version floor (needs rustup; the second 
 
 test-fast: check-cargo ## Per-task check: the library's unit tests plus the named integration test files only, no doctests or benches. Example: make test-fast TESTS="query filter"
 	cargo test --locked -p itzma-core --lib $(foreach t,$(TESTS),--test $(t))
+
+test-gated: check-cargo ## Run the read-path integration tests with every test store under a one-request, one-byte gate
+	ITZMA_TEST_GATE=smallest cargo test --locked -p itzma-core --test query --test filter --test filtered_query --test sparse_query --test compaction --test index --test decoded --test gc --test recovery
 
 test-s3: check-cargo s3-up ## Run the tests against a real S3-compatible store (MinIO via docker compose)
 	ITZMA_TEST_S3_ENDPOINT=$(S3_ENDPOINT) cargo test --locked
