@@ -10,6 +10,12 @@ that section into the version's notes.
 
 ## [Unreleased]
 
+### Security
+
+- The lockfile now pins `url` 2.5.9, which fixes a stack overflow in
+  `Url::origin()` on deeply nested `blob:` URLs (RUSTSEC-2026-0592). `url`
+  comes in through `object_store`.
+
 ### Added
 
 - `Namespace::maintenance_lease` and `MaintenanceLease`, so the processes
