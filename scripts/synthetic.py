@@ -86,12 +86,40 @@ def build_filters(directory: Path, size: str, rng: random.Random) -> Built:
     return Built(files=("docs.jsonl",), rows=len(rows))
 
 
+BATCH_DIM = 4
+BATCHES = {"small": (20, 10), "full": (400, 50)}
+
+
+def build_small_batches(directory: Path, size: str, rng: random.Random) -> Built:
+    """Many small writes, one WAL object each: `batch` says which write a row belongs to."""
+    batches, per_batch = BATCHES[size]
+    rows = []
+    for batch in range(batches):
+        for item in range(per_batch):
+            rows.append(
+                {
+                    "id": f"b{batch:04d}-{item:03d}",
+                    "batch": batch,
+                    "vector": [round(rng.gauss(0.0, 1.0), 6) for _ in range(BATCH_DIM)],
+                    "attrs": {"tag": ["a", "b", "c"][(batch + item) % 3]},
+                }
+            )
+    write_jsonl(directory / "rows.jsonl", rows)
+    return Built(files=("rows.jsonl",), rows=len(rows))
+
+
 REGISTRY: tuple[Dataset, ...] = (
     Dataset(
         name="filters",
         since="0.1.0",
         summary="Typed attributes with skewed values for filters: a rare tag, a common tag, a price range",
         build=build_filters,
+    ),
+    Dataset(
+        name="small-batches",
+        since="0.3.0",
+        summary="Many small writes, one WAL object each, for the maintenance lease, bounded staleness and the IO gate",
+        build=build_small_batches,
     ),
 )
 
