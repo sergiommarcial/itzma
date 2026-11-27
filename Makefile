@@ -29,7 +29,7 @@ PY_BASE_PYTHON = $(shell $(PY_VENV_PYTHON) -c 'import os, sys; print(os.path.rea
 	lint lint-latest fmt-check clippy doc deny machete \
 	format doc-open \
 	py-env py-dev py-rust py-rust-one py-lint py-format py-test py \
-	release-test package \
+	release-test synthetic package \
 	ci clean
 
 ##@ General
@@ -212,8 +212,11 @@ py: py-rust py-lint py-test ## Everything CI's python job runs
 
 ##@ Release
 
-release-test: check-uv ## Test scripts/release.py (version bumps, changelog, tag checks)
+release-test: check-uv ## Test scripts/release.py and scripts/synthetic.py (version bumps, changelog, tag checks, deterministic data)
 	uv run --no-project --with pytest pytest -q scripts
+
+synthetic: ## Generate the synthetic test and demo data into synthetic/ (gitignored); SIZE=small|full, ONLY="name ..." for some
+	python3 scripts/synthetic.py build $(if $(ONLY),--only $(ONLY),--all) --size $(or $(SIZE),small)
 
 package: check-cargo check-uv ## Build what a release publishes, without publishing: the crates (cargo publish --dry-run) and the Python sdist
 	cargo publish --locked --dry-run --allow-dirty -p itzma-core -p itzma-store -p itzma-store-gcs -p itzma-store-azure -p itzma-store-aws

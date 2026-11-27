@@ -51,6 +51,13 @@ that section into the version's notes.
   runs from cron. On a `file://` store the loop logs one warning and stops.
   `start_maintenance` still takes no lease and replaces the automatic loop.
 
+### Fixed
+
+- The Python maintenance loop now counts a panicked run as a failed one and
+  ignores a run that was aborted by stopping the loop. A leased loop also
+  clears its leader role when it ends, so `ns.maintainer.role` no longer
+  reports a stopped loop as the leader.
+
 ## [0.2.1] - 2026-11-15
 
 ### Security
