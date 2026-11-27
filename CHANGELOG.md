@@ -10,6 +10,8 @@ that section into the version's notes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-27
+
 ### Security
 
 - The lockfile now pins `url` 2.5.9, which fixes a stack overflow in
