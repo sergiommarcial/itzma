@@ -3,7 +3,11 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore: ["**.md", "LICENSE-*", ".github/CODEOWNERS", ".github/ISSUE_TEMPLATE/**"]
+  # Markdown-only changes skip the suite. If branch protection ever requires
+  # these checks, drop the filter: a skipped workflow leaves them pending.
   pull_request:
+    paths-ignore: ["**.md", "LICENSE-*", ".github/CODEOWNERS", ".github/ISSUE_TEMPLATE/**"]
   schedule:
     # New advisories land without any code change, so re-check weekly.
     - cron: "0 6 * * 1"
@@ -26,6 +30,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Test builds do not need debuginfo; leaving it out shrinks target/ (and so
+  # the caches) and speeds up compiling and linking.
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   lint:
@@ -40,8 +47,10 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --check
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
       - name: release script tests
         run: make release-test
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -71,9 +80,15 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: unit, integration, and doctests
         run: cargo test --locked
+      # Stable only: criterion is a dev-dependency, so the test build above
+      # already proves it compiles on the 1.87 floor.
       - name: benchmarks, run once each
+        if: matrix.toolchain == 'stable'
         run: cargo test --locked --bench core
       - name: read paths under the smallest gate
         if: matrix.toolchain == 'stable'
@@ -90,6 +105,9 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: start MinIO and create the bucket
         run: docker compose up -d --wait
       - name: storage tests against S3
@@ -111,6 +129,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: GCS adapter tests against storage-testbench
         run: make test-gcs
       - name: storage-testbench logs
@@ -128,6 +148,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Azure adapter tests against Azurite
         run: make test-azure
       - name: Azurite logs
@@ -145,6 +167,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: AWS adapter tests against MinIO
         run: make test-aws
       - name: MinIO logs
@@ -158,7 +182,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
         with:
           arguments: --locked
           command: check --hide-inclusion-graph
@@ -170,7 +194,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-machete
       - run: cargo machete
@@ -181,7 +205,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.13"]
+        include:
+          - python: "3.10"
+            emulators: false
+          - python: "3.13"
+            emulators: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -194,22 +222,34 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: python-${{ matrix.python }}
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           python-version: ${{ matrix.python }}
+      # The backends do not depend on the interpreter, so the emulators run
+      # once, on the newest Python. The oldest still runs lint and the memory
+      # and file tests.
       - name: start MinIO and create the bucket
+        if: matrix.emulators
         run: docker compose up -d --wait
       - name: start storage-testbench and create the bucket
+        if: matrix.emulators
         run: make gcs-up
       - name: start Azurite and create the container
+        if: matrix.emulators
         run: make azure-up
       - name: bridge crate tests, lint, Python tests (memory, file, MinIO, GCS, Azure)
+        if: matrix.emulators
         run: make py
         env:
           ITZMA_TEST_S3_ENDPOINT: http://127.0.0.1:9000
           ITZMA_TEST_GCS_ENDPOINT: http://127.0.0.1:9100
           ITZMA_TEST_GCS_CONTROL_ENDPOINT: http://127.0.0.1:9101
           ITZMA_TEST_AZURE_ENDPOINT: http://127.0.0.1:10000/devstoreaccount1
+      # No endpoints are set here, so the emulator tests skip themselves.
+      - name: bridge crate tests, lint, Python tests (memory, file)
+        if: ${{ !matrix.emulators }}
+        run: make py
       - name: MinIO logs
-        if: failure()
+        if: failure() && matrix.emulators
         run: docker compose logs minio

@@ -7,6 +7,16 @@ all-features = true
 # Cargo.lock is checked against the RustSec advisory database. Known
 # vulnerabilities always fail; yanked releases are set to fail here too.
 yanked = "deny"
+# Unmaintained crates that only object_store (and arrow-cast, in the Python
+# bridge) pull in. There is no patched release and nothing here can drop
+# them, so each is ignored by id. Remove an entry when object_store or arrow
+# stops depending on the crate; cargo-deny warns about an ignore that no
+# longer matches anything.
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono, unmaintained, via object_store and arrow-cast" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz, unmaintained, via arrow-cast (Python bridge)" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime, unmaintained, via object_store" },
+]
 
 [licenses]
 allow = [

@@ -1372,7 +1372,18 @@ mod tests {
 
     #[test]
     fn a_zstd_frame_without_a_recorded_size_is_refused() {
-        let frame = zstd::encode_all(sample_body().as_slice(), 3).unwrap();
+        use std::io::Write;
+        // The streaming encoder never pledges a size, so its frame records
+        // none, at any length. `encode_all` does record one for short input
+        // since zstd 0.14.4.
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        encoder.write_all(&sample_body()).unwrap();
+        let frame = encoder.finish().unwrap();
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&frame).unwrap(),
+            None,
+            "the test needs a frame without a recorded size"
+        );
         let object = header(1, sample_body().len() as u32, &frame);
         let why = reason(decode("wal/test", &object).unwrap_err());
         assert!(why.contains("does not record its size"), "{why}");
