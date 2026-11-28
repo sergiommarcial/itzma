@@ -29,7 +29,9 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 
-use super::{Algorithm, Candidate, Kind, PREFIX_LEN, Prefix, Probe, Reader, corrupt, open};
+use super::{
+    Algorithm, Batch, Candidate, Cursor, Kind, PREFIX_LEN, Prefix, Probe, Reader, corrupt, open,
+};
 use crate::cpu::{self, Cost, Lane};
 use crate::document::Metric;
 use crate::error::Result;
@@ -745,6 +747,278 @@ impl Algorithm for Hnsw {
     fn search<'a>(&'a self, probe: &'a Probe<'_>) -> BoxFuture<'a, Result<Vec<Candidate>>> {
         Box::pin(scan_object(probe))
     }
+
+    fn cursor<'a>(&'a self, probe: Probe<'a>) -> BoxFuture<'a, Result<Box<dyn Cursor + 'a>>> {
+        Box::pin(async move { Ok(Box::new(HnswCursor::open(&probe).await?) as Box<dyn Cursor>) })
+    }
+}
+
+/// HNSW's own cursor: the graph is fetched and the
+/// upper layers descended once, and the layer-0 walk keeps its state between
+/// batches, so a widening round continues the search instead of starting a
+/// fresh one with a bigger `ef`.
+struct HnswCursor {
+    name: String,
+    nprobe: usize,
+    dim: usize,
+    /// `None` only while a batch runs on the pool, or after one failed.
+    walk: Option<Walk>,
+}
+
+/// A layer-0 best-first walk that can be resumed with a bigger `ef`. Every
+/// node scored goes on the frontier, not only those better than the current
+/// worst: a beam search never expands a node worse than its worst (which only
+/// falls), so for one `ef` the nodes expanded are the beam search's, and a
+/// later, bigger `ef` finds the ones a beam would have dropped still there.
+/// So the rows returned after any number of batches are what a fresh search
+/// for that many returns, apart from ties: a node at exactly the worst
+/// distance may be expanded where a beam search, comparing strictly, would
+/// not have kept it.
+struct Walk {
+    name: String,
+    body: Bytes,
+    header: Header,
+    prepared: Sq8Query,
+    dim: usize,
+    rows: u32,
+    cache: HashMap<u32, DecodedNode>,
+    visited: HashSet<u32>,
+    /// Scored, not yet expanded, closest first.
+    frontier: BinaryHeap<std::cmp::Reverse<Scored>>,
+    /// The closest `ef` nodes scored, farthest on top: the stopping rule's
+    /// beam. Kept between batches, so widening never rebuilds it.
+    beam: BinaryHeap<Scored>,
+    /// Every other node scored, closest first, from which a bigger `ef`
+    /// fills the beam. Each node crosses between the two a bounded number
+    /// of times over the cursor's life, never per batch.
+    outside: BinaryHeap<std::cmp::Reverse<Scored>>,
+    /// Scored and not yet returned, closest first.
+    pool: BinaryHeap<std::cmp::Reverse<Scored>>,
+    returned: usize,
+    /// The graph is walked out and every row it never reached was added at
+    /// infinite distance, as [`with_every_row`](super::with_every_row) does.
+    filled: bool,
+}
+
+impl HnswCursor {
+    async fn open(probe: &Probe<'_>) -> Result<Self> {
+        let name = probe.path.to_string();
+        let opened = open(probe, Kind::Hnsw).await?;
+        let rows = opened.prefix.rows;
+        let header = Header::parse(&name, &opened.prefix, &opened.body)?;
+        let prepared = header.codec.prepare(probe.metric, probe.query);
+        let dim = probe.dim;
+        let body = opened.body.clone();
+        let walk_name = name.clone();
+        let cost = Cost::Distances {
+            rows: (header.max_layer as usize).saturating_mul(M),
+            dim,
+        };
+        let walk = cpu::run(Lane::Query, cost, move || {
+            Walk::start(walk_name, body, header, prepared, dim, rows)
+        })
+        .await?;
+        Ok(Self {
+            name,
+            nprobe: probe.nprobe.unwrap_or(1).max(1),
+            dim,
+            walk: Some(walk),
+        })
+    }
+}
+
+impl Cursor for HnswCursor {
+    fn next<'a>(&'a mut self, n: usize) -> BoxFuture<'a, Result<Batch>> {
+        Box::pin(async move {
+            let walk = self.walk.take().ok_or_else(|| {
+                corrupt(&self.name, "the cursor's walk failed in an earlier batch")
+            })?;
+            let nprobe = self.nprobe;
+            let cost = Cost::Distances {
+                rows: n
+                    .min(walk.rows as usize)
+                    .saturating_mul(nprobe)
+                    .saturating_mul(M0),
+                dim: self.dim,
+            };
+            let (walk, batch) = cpu::run(Lane::Query, cost, move || {
+                let mut walk = walk;
+                walk.next_batch(n, nprobe).map(|batch| (walk, batch))
+            })
+            .await?;
+            self.walk = Some(walk);
+            Ok(batch)
+        })
+    }
+}
+
+impl Walk {
+    /// Descend the upper layers greedily, as [`traverse`] does, and start
+    /// layer 0 at the node found.
+    fn start(
+        name: String,
+        body: Bytes,
+        header: Header,
+        prepared: Sq8Query,
+        dim: usize,
+        rows: u32,
+    ) -> Result<Self> {
+        let mut walk = Self {
+            name,
+            body,
+            header,
+            prepared,
+            dim,
+            rows,
+            cache: HashMap::new(),
+            visited: HashSet::new(),
+            frontier: BinaryHeap::new(),
+            beam: BinaryHeap::new(),
+            outside: BinaryHeap::new(),
+            pool: BinaryHeap::new(),
+            returned: 0,
+            filled: rows == 0,
+        };
+        if rows == 0 {
+            return Ok(walk);
+        }
+        let mut ep = walk.header.entry_point;
+        for layer in (1..=walk.header.max_layer).rev() {
+            let found = search_layer(
+                &walk.name,
+                &walk.body,
+                &walk.header,
+                dim,
+                &walk.prepared,
+                &[ep],
+                1,
+                layer as u8,
+                &mut walk.cache,
+            )?;
+            if let Some(nearest) = found.first() {
+                ep = nearest.row;
+            }
+        }
+        let distance = walk.score(ep)?;
+        walk.visited.insert(ep);
+        let scored = Scored { distance, row: ep };
+        walk.frontier.push(std::cmp::Reverse(scored));
+        walk.outside.push(std::cmp::Reverse(scored));
+        walk.pool.push(std::cmp::Reverse(scored));
+        Ok(walk)
+    }
+
+    fn score(&mut self, row: u32) -> Result<f32> {
+        cache_node(
+            &mut self.cache,
+            &self.name,
+            &self.body,
+            self.dim,
+            &self.header,
+            row,
+        )?;
+        Ok(self.prepared.distance(&self.cache[&row].code))
+    }
+
+    /// Expand the closest frontier node while a beam search of `ef` would:
+    /// until `ef` nodes are scored and the next is farther than the
+    /// `ef`-th closest. A node is kept in the beam on the same strict
+    /// comparison the beam search makes.
+    fn expand(&mut self, ef: usize) -> Result<()> {
+        while self.beam.len() < ef {
+            let Some(std::cmp::Reverse(next)) = self.outside.pop() else {
+                break;
+            };
+            self.beam.push(next);
+        }
+        while let Some(&std::cmp::Reverse(current)) = self.frontier.peek() {
+            if self.beam.len() >= ef
+                && self
+                    .beam
+                    .peek()
+                    .is_some_and(|f| current.distance > f.distance)
+            {
+                break;
+            }
+            self.frontier.pop();
+            cache_node(
+                &mut self.cache,
+                &self.name,
+                &self.body,
+                self.dim,
+                &self.header,
+                current.row,
+            )?;
+            let neighbors = match self.cache[&current.row].neighbors.first() {
+                Some(n) => n.clone(),
+                None => continue,
+            };
+            for n in neighbors {
+                if !self.visited.insert(n) {
+                    continue;
+                }
+                let scored = Scored {
+                    distance: self.score(n)?,
+                    row: n,
+                };
+                self.frontier.push(std::cmp::Reverse(scored));
+                self.pool.push(std::cmp::Reverse(scored));
+                if self.beam.len() < ef {
+                    self.beam.push(scored);
+                } else if self
+                    .beam
+                    .peek()
+                    .is_some_and(|f| scored.distance < f.distance)
+                {
+                    self.beam.push(scored);
+                    if let Some(evicted) = self.beam.pop() {
+                        self.outside.push(std::cmp::Reverse(evicted));
+                    }
+                } else {
+                    self.outside.push(std::cmp::Reverse(scored));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The `n` closest rows not yet returned, after walking as far as a
+    /// search for every row returned so far plus `n` would.
+    fn next_batch(&mut self, n: usize, nprobe: usize) -> Result<Batch> {
+        let target = self.returned.saturating_add(n);
+        self.expand(target.saturating_mul(nprobe).max(1))?;
+        if self.pool.len() < n && self.frontier.is_empty() && !self.filled {
+            // The walk reached everything it can: the rest of the segment
+            // goes last, so a filter can never be starved of a row.
+            for row in 0..self.rows {
+                if self.visited.insert(row) {
+                    self.pool.push(std::cmp::Reverse(Scored {
+                        distance: f32::INFINITY,
+                        row,
+                    }));
+                }
+            }
+            self.filled = true;
+        }
+        let take = n.min(self.pool.len());
+        let mut candidates = Vec::with_capacity(take);
+        for _ in 0..take {
+            let Some(std::cmp::Reverse(s)) = self.pool.pop() else {
+                break;
+            };
+            candidates.push(Candidate {
+                row: s.row,
+                distance: s.distance,
+            });
+        }
+        self.returned += candidates.len();
+        let exhausted = self.filled && self.returned >= self.rows as usize;
+        Ok(Batch {
+            candidates,
+            rest_lower_bound: exhausted.then_some(f32::INFINITY),
+            exhausted,
+        })
+    }
 }
 
 /// Fetch the whole object (one GET cold, cached bytes warm — see the module
@@ -948,6 +1222,137 @@ mod tests {
         let direct = traverse("idx", &body, &header, dim, &prepared, 10, 4_000).expect("traverse");
         assert_eq!(searched, direct);
         assert_eq!(direct.len(), 10);
+    }
+
+    /// A 2,000-row graph of seeded random rows in a store, for the cursor
+    /// tests: random, so distances almost never tie (a tie may be expanded
+    /// in another order than a fresh search's, see `Walk`).
+    async fn stored_graph() -> (object_store::memory::InMemory, Vec<f32>, usize, usize) {
+        let (rows, dim) = (2_000usize, 16usize);
+        let mut state: u64 = 0x5eed_1234;
+        let matrix: Vec<f32> = (0..rows * dim)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (state >> 40) as f32 / (1u64 << 24) as f32
+            })
+            .collect();
+        let bytes = build(&matrix, dim, rows, 999, Metric::L2).expect("build");
+        let store = object_store::memory::InMemory::new();
+        {
+            use object_store::ObjectStoreExt as _;
+            store
+                .put(&object_store::path::Path::from("idx.bin"), bytes.into())
+                .await
+                .unwrap();
+        }
+        (store, matrix, rows, dim)
+    }
+
+    /// The cursor's batches against fresh searches: its first
+    /// batch is what `search` returns, and after widening, the rows it has
+    /// returned are exactly what a fresh search for that many returns,
+    /// since resuming expands the same nodes in the same order.
+    #[tokio::test]
+    async fn a_resumed_cursor_returns_what_a_fresh_search_for_that_many_does() {
+        let (store, matrix, rows, dim) = stored_graph().await;
+        let path = object_store::path::Path::from("idx.bin");
+        let budget = crate::budget::ReadBudget::unlimited();
+        let policy = crate::fetch::FetchPolicy::local();
+        for (q, nprobe) in [(0usize, 1usize), (77, 1), (500, 4)] {
+            let query = &matrix[q * dim..(q + 1) * dim];
+            let probe = |want: usize| Probe {
+                store: &store,
+                budget: &budget,
+                policy: &policy,
+                path: &path,
+                dim,
+                rows: rows as u64,
+                data_size: 999,
+                metric: Metric::L2,
+                query,
+                want,
+                nprobe: Some(nprobe),
+                decoded: None,
+            };
+            let mut cursor = Hnsw.cursor(probe(10)).await.expect("cursor");
+            let mut so_far: Vec<Candidate> = Vec::new();
+            for (step, n) in [10usize, 70, 560].into_iter().enumerate() {
+                let batch = cursor.next(n).await.expect("next");
+                assert_eq!(batch.candidates.len(), n, "q {q} step {step}");
+                assert!(
+                    batch
+                        .candidates
+                        .windows(2)
+                        .all(|w| (w[0].distance, w[0].row) <= (w[1].distance, w[1].row))
+                );
+                so_far.extend(batch.candidates);
+                let mut fresh = Hnsw.search(&probe(so_far.len())).await.expect("search");
+                let mut ours = so_far.clone();
+                ours.sort_by_key(|c| c.row);
+                fresh.sort_by_key(|c| c.row);
+                assert_eq!(
+                    ours,
+                    fresh,
+                    "q {q} nprobe {nprobe} after {} rows",
+                    so_far.len()
+                );
+            }
+        }
+    }
+
+    /// Every row comes back exactly once, rows no search reaches last, and
+    /// the cursor says so once it has handed out the whole segment.
+    #[tokio::test]
+    async fn a_cursor_returns_every_row_once_unreachable_ones_last() {
+        let mut built = tiny();
+        built.nodes[2].neighbors[0] = vec![1];
+        built.nodes[3].neighbors[0] = Vec::new();
+        let bytes = encode(&built, 2, 4, 999).expect("encode");
+        let store = object_store::memory::InMemory::new();
+        let path = object_store::path::Path::from("idx.bin");
+        {
+            use object_store::ObjectStoreExt as _;
+            store.put(&path, bytes.into()).await.unwrap();
+        }
+        let budget = crate::budget::ReadBudget::unlimited();
+        let policy = crate::fetch::FetchPolicy::local();
+        let probe = Probe {
+            store: &store,
+            budget: &budget,
+            policy: &policy,
+            path: &path,
+            dim: 2,
+            rows: 4,
+            data_size: 999,
+            metric: Metric::L2,
+            query: &[3.0, 0.0],
+            want: 1,
+            nprobe: Some(1),
+            decoded: None,
+        };
+        let mut cursor = Hnsw.cursor(probe).await.expect("cursor");
+        let first = cursor.next(2).await.expect("next");
+        assert_eq!(
+            first.candidates.iter().map(|c| c.row).collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert!(!first.exhausted);
+        let rest = cursor.next(usize::MAX).await.expect("next");
+        assert_eq!(
+            rest.candidates.iter().map(|c| c.row).collect::<Vec<_>>(),
+            [0, 3]
+        );
+        assert_eq!(
+            rest.candidates[1].distance,
+            f32::INFINITY,
+            "row 3 is unreachable"
+        );
+        assert!(rest.exhausted);
+        assert_eq!(rest.rest_lower_bound, Some(f32::INFINITY));
+        let after = cursor.next(5).await.expect("next");
+        assert!(after.candidates.is_empty() && after.exhausted);
     }
 
     #[tokio::test]

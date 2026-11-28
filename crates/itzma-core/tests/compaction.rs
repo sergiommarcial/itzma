@@ -1021,6 +1021,98 @@ async fn a_merge_keeps_the_sparse_vectors_of_the_segments_it_retires() {
     }
 }
 
+/// A merge group is charged its `sparse.bin` as well as its `data.bin`, so
+/// a budget that `validate` accepts (the cap) must still fit every group a
+/// merge plans, even when the sparse vectors dwarf the dense ones (issue
+/// #49).
+#[tokio::test]
+async fn every_merge_group_fits_a_budget_validate_accepts() {
+    let heavy = |id: String| Document {
+        id,
+        vector: vec![1.0, 0.0],
+        attrs: None,
+        sparse: Some((0..500).map(|t| (t, 1.0)).collect()),
+    };
+    const BUDGET: u64 = 100 * 1024;
+    let opts = CompactionOptions {
+        max_segments: 1,
+        max_segment_bytes: BUDGET,
+    };
+    for b in cas_backends() {
+        eprintln!("backend: {}", b.name);
+        let ns = Namespace::create(b.store.clone(), "docs", schema(2, Metric::L2))
+            .await
+            .unwrap()
+            .with_read_budget(BUDGET);
+        for n in 0..2 {
+            ns.upsert((0..20).map(|i| heavy(format!("d{n}-{i:02}"))).collect())
+                .await
+                .unwrap();
+            ns.compact(&CompactionOptions {
+                max_segments: 8,
+                ..opts
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(live(&*b.store, "docs").await.0.len(), 2);
+        let merged = ns.compact(&opts).await;
+        assert!(
+            matches!(
+                merged,
+                Ok(Compaction::Published {
+                    merged_segments: 2,
+                    ..
+                })
+            ),
+            "{merged:?} on {}",
+            b.name
+        );
+        // Read back through a handle with the default budget: a sparse query
+        // reads each unindexed sparse.bin whole, which the small one refuses.
+        let reader = Namespace::open(b.store.clone(), "docs").await.unwrap();
+        let hits = reader
+            .query_sparse(
+                &vec![(7, 1.0)],
+                100,
+                &itzma_core::SparseQueryOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 40, "{}", b.name);
+    }
+}
+
+/// Groups are split to fit the read budget, not the cap: two segments of
+/// just under half the cap each, read in windows, charge a little more than
+/// the cap together (each adds its open's guesses), and must still merge into
+/// one, or a merge over `max_segments` rewrites every segment alone and the
+/// count never drops.
+#[tokio::test]
+async fn segments_of_half_the_cap_still_merge_in_pairs() {
+    let store: Arc<dyn ObjectStore> = common::memory();
+    let ns = segments_and_tail(store.clone(), 128, 4, 3000, 0).await;
+    let sizes = data_sizes(&*store).await;
+    let largest = sizes[0];
+    assert!(sizes[3] > 1024 * 1024, "{sizes:?}: read in windows");
+    let opts = CompactionOptions {
+        max_segments: 2,
+        max_segment_bytes: 2 * largest + 64 * 1024,
+    };
+    let merged = ns.compact(&opts).await.unwrap();
+    assert!(
+        matches!(
+            merged,
+            Compaction::Published {
+                merged_segments: 4,
+                ..
+            }
+        ),
+        "{merged:?}"
+    );
+    assert_eq!(live(&*store, "docs").await.0.len(), 2);
+}
+
 /// Sizes of every `data.bin` under the namespace "docs", largest first.
 async fn data_sizes(store: &dyn ObjectStore) -> Vec<u64> {
     let prefix = object_store::path::Path::from("docs/segments");

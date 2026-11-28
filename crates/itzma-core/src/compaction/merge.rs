@@ -32,6 +32,30 @@ pub(crate) const MERGE_WINDOW: u64 = 8 * 1024 * 1024;
 /// decoded costs little.
 const WHOLE_BELOW: u64 = 1024 * 1024;
 
+/// What opening a segment for ranged reads charges beyond its objects'
+/// bytes: the 64 KiB suffix guess, and room for a directory the guess did
+/// not hold and the header and peek, which read bytes the windows read again.
+const RANGED_OPEN_CHARGE: u64 = 128 * 1024;
+
+/// Whether a segment whose `data.bin` and `sparse.bin` hold `stored` bytes
+/// is read in windows of `window` rather than whole.
+fn reads_ranged(stored: u64, window: u64) -> bool {
+    stored > window.min(WHOLE_BELOW)
+}
+
+/// About what merging a segment with `data` and `sparse` bytes of objects
+/// charges its group's budget, read in windows of `window`: both objects,
+/// and the ranged open's guesses when it is read in windows. The merge
+/// planner sizes groups by it.
+pub(crate) fn charge_estimate(data: u64, sparse: u64, window: u64) -> u64 {
+    let stored = data.saturating_add(sparse);
+    if reads_ranged(stored, window) {
+        stored.saturating_add(RANGED_OPEN_CHARGE)
+    } else {
+        stored
+    }
+}
+
 /// Entries handed to the writer per trip to the compute pool.
 const WRITE_BATCH: usize = 4096;
 
@@ -250,11 +274,11 @@ pub(crate) enum Input<'a> {
 }
 
 impl<'a> Input<'a> {
-    /// Open segment `id` of `namespace`, whose `data.bin` the caller's
-    /// listing says is `size` bytes: read forward when it is version 2 and
-    /// bigger than [`WHOLE_BELOW`] (or `window`, if smaller), else decoded
-    /// whole with its sparse vectors. Everything is charged to `budget`, and
-    /// nothing goes through the decoded cache.
+    /// Open segment `id` of `namespace`, whose `data.bin` and `sparse.bin`
+    /// the caller's listing says hold `size` bytes together: read forward
+    /// when it is version 2 and bigger than [`WHOLE_BELOW`] (or `window`, if
+    /// smaller), else decoded whole with its sparse vectors. Everything is
+    /// charged to `budget`, and nothing goes through the decoded cache.
     ///
     /// # Errors
     ///
@@ -273,7 +297,7 @@ impl<'a> Input<'a> {
     ) -> Result<Input<'a>> {
         let path = segment::segment_path(namespace, id);
         let label = path.to_string();
-        if size > window.min(WHOLE_BELOW) {
+        if reads_ranged(size, window) {
             let segment =
                 RangedSegment::open(store, namespace, id, dim, budget, policy, None).await?;
             let sparse =

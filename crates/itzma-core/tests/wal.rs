@@ -447,6 +447,40 @@ async fn the_same_key_with_a_different_batch_is_a_conflict_and_writes_nothing() 
     }
 }
 
+/// A reused key whose batch is the same size as the original's is caught
+/// too: the bodies are compared once the lengths agree. A real retry, whose
+/// body is the same, still finds its write, whether the earlier object is
+/// found by the search or by a collision.
+#[tokio::test]
+async fn the_same_key_with_a_same_size_batch_is_a_conflict_and_writes_nothing() {
+    for b in common::backends() {
+        eprintln!("backend: {}", b.name);
+        wal::append_keyed(&*b.store, "ns", 1, &WriteKey::new("k"), upsert("a"))
+            .await
+            .unwrap();
+        let before = common::snapshot(&*b.store).await;
+        let other = vec![WalOp::Upsert(common::doc("b", &[1.0, 2.0]))];
+
+        for write in [WriteKey::retry("k", 1), WriteKey::new("k")] {
+            let err = wal::append_keyed(&*b.store, "ns", 1, &write, other.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ItzmaError::KeyConflict { key } if key == "k"),
+                "{err:?}"
+            );
+            assert_eq!(common::snapshot(&*b.store).await, before);
+        }
+        for write in [WriteKey::retry("k", 1), WriteKey::new("k")] {
+            let seq = wal::append_keyed(&*b.store, "ns", 1, &write, upsert("a"))
+                .await
+                .unwrap();
+            assert_eq!(seq, 1);
+        }
+        assert_eq!(common::snapshot(&*b.store).await, before);
+    }
+}
+
 #[tokio::test]
 async fn a_bad_key_or_an_empty_batch_is_refused_before_any_storage_call() {
     let store = common::memory();
