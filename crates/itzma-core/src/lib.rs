@@ -124,6 +124,11 @@
 #[doc = include_str!("../README.md")]
 pub struct ReadmeDoctest;
 
+// The repository README's Rust examples run too.
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+pub struct RootReadmeDoctest;
+
 pub mod attrs;
 mod bloom;
 mod bound;
