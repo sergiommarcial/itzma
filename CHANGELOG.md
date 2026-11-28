@@ -10,6 +10,8 @@ that section into the version's notes.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-28
+
 ### Fixed
 
 - An indexed sparse query summed a row's terms in a `HashMap`'s order, which
