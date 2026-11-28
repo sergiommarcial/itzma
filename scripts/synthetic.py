@@ -11,6 +11,10 @@ dataset's name.
     synthetic.py build --only NAME [NAME ...]      build some, leave the rest
     synthetic.py build ... --out DIR               write somewhere else
 
+A fix or invisible speedup with nothing to show is a registry entry with a
+`test_only` reason naming its test, instead of a builder. It builds no data and
+shows as "test only" in the index. A new API or feature never takes it.
+
 `small` is for tests (a temp dir, a second or two); `full` is for demos and
 benchmarks.
 """
@@ -48,7 +52,17 @@ class Dataset:
     name: str
     since: str
     summary: str
-    build: Callable[[Path, str, random.Random], Built]
+    build: Callable[[Path, str, random.Random], Built] | None = None
+    # `demo: none` in the release plan's words: a fix or invisible speedup with
+    # nothing to show. Names the test that covers it, builds no dataset, and
+    # shows as "test only" in the index. A new API or feature never takes it.
+    test_only: str = ""
+
+    def __post_init__(self) -> None:
+        if (self.build is None) == (not self.test_only):
+            raise SyntheticError(
+                f"{self.name}: give either a builder or a test_only reason, not both or neither"
+            )
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -120,6 +134,30 @@ REGISTRY: tuple[Dataset, ...] = (
         since="0.3.0",
         summary="Many small writes, one WAL object each, for the maintenance lease, bounded staleness and the IO gate",
         build=build_small_batches,
+    ),
+    Dataset(
+        name="sparse-score-order",
+        since="0.3.1",
+        summary="An indexed sparse query sums a row's terms in ascending term id, so it scores the flat path's bits",
+        test_only="same bits on every run; the test builds its own sparse data, `tests/sparse_query.rs`",
+    ),
+    Dataset(
+        name="write-key-body-compare",
+        since="0.3.1",
+        summary="A write key reused for a different batch of the same size is a conflict, not a retry",
+        test_only="a refusal with nothing to show; `tests/wal.rs`",
+    ),
+    Dataset(
+        name="merge-budget-fit",
+        since="0.3.1",
+        summary="Merge groups are sized by what each segment charges, so no group goes past the read budget",
+        test_only="a limit that is never reached; `tests/compaction.rs` and the planner's unit tests",
+    ),
+    Dataset(
+        name="hnsw-resume",
+        since="0.3.1",
+        summary="A widening HNSW query resumes its walk instead of starting a fresh search",
+        test_only="same rows as a fresh search, speedup not measured; unit tests in `src/index/hnsw.rs`",
     ),
 )
 
@@ -199,7 +237,12 @@ def write_index(out: Path) -> None:
     ]
     for dataset in REGISTRY:
         meta = metas.get(dataset.name)
-        if meta:
+        if dataset.test_only:
+            lines.append(
+                f"| {dataset.name} | {dataset.since} | - | - | {dataset.summary} "
+                f"(test only: {dataset.test_only}) |"
+            )
+        elif meta:
             lines.append(
                 f"| [{dataset.name}]({dataset.name}/README.md) | {meta['since']} | "
                 f"{meta['size']} | {meta['rows']} | {meta['summary']} |"
@@ -212,7 +255,12 @@ def build(names: list[str] | None, size: str, out: Path) -> list[dict]:
     """Build the named datasets, or all of them when `names` is None."""
     if size not in SIZES:
         raise SyntheticError(f"size must be one of {', '.join(SIZES)}")
-    chosen = list(REGISTRY) if names is None else [find(name) for name in names]
+    chosen = [d for d in REGISTRY if d.build] if names is None else [find(name) for name in names]
+    for dataset in chosen:
+        if dataset.test_only:
+            raise SyntheticError(
+                f"{dataset.name} is test only ({dataset.test_only}); it has no dataset"
+            )
     metas = [build_one(dataset, size, out) for dataset in chosen]
     write_index(out)
     return metas
@@ -232,7 +280,8 @@ def main(argv: list[str]) -> int:
     try:
         if args.command == "list":
             for dataset in REGISTRY:
-                print(f"{dataset.name:<24} {dataset.since:<7} {dataset.summary}")
+                kind = "  [test only]" if dataset.test_only else ""
+                print(f"{dataset.name:<24} {dataset.since:<7} {dataset.summary}{kind}")
             return 0
         for meta in build(None if args.all else args.only, args.size, args.out):
             print(f"{meta['name']}: {meta['rows']} rows ({meta['size']})")
