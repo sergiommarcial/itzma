@@ -82,3 +82,42 @@ def test_cli_builds_and_reports(
     assert "filters: 500 rows (small)" in capsys.readouterr().out
     assert synthetic.main(["build", "--only", "nope", "--out", str(tmp_path)]) == 1
     assert "no dataset named" in capsys.readouterr().err
+
+
+def test_a_test_only_entry_has_a_reason_and_no_builder() -> None:
+    entry = synthetic.Dataset(
+        name="x", since="0.3.1", summary="s", test_only="covered by tests/x.rs"
+    )
+    assert entry.build is None
+    with pytest.raises(synthetic.SyntheticError):
+        synthetic.Dataset(name="x", since="0.3.1", summary="s")
+    with pytest.raises(synthetic.SyntheticError):
+        synthetic.Dataset(
+            name="x", since="0.3.1", summary="s", test_only="why", build=lambda *_: None
+        )
+
+
+def test_every_test_only_entry_names_the_test_that_covers_it() -> None:
+    entries = [d for d in synthetic.REGISTRY if d.test_only]
+    assert entries
+    assert all(".rs" in d.test_only for d in entries)
+
+
+def test_build_all_skips_test_only_entries(tmp_path: Path) -> None:
+    built = {meta["name"] for meta in synthetic.build(None, "small", tmp_path)}
+    skipped = {d.name for d in synthetic.REGISTRY if d.test_only}
+    assert skipped and not built & skipped
+
+
+def test_a_test_only_entry_cannot_be_built_by_name(tmp_path: Path) -> None:
+    name = next(d.name for d in synthetic.REGISTRY if d.test_only)
+    with pytest.raises(synthetic.SyntheticError, match="test only"):
+        synthetic.build([name], "small", tmp_path)
+
+
+def test_the_index_lists_test_only_entries_beside_the_built_ones(tmp_path: Path) -> None:
+    synthetic.build(["filters"], "small", tmp_path)
+    lines = (tmp_path / "INDEX.md").read_text().splitlines()
+    for entry in (d for d in synthetic.REGISTRY if d.test_only):
+        row = next(line for line in lines if line.startswith(f"| {entry.name} |"))
+        assert "test only" in row and entry.since in row
