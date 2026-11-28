@@ -25,6 +25,14 @@ that section into the version's notes.
   are now sized by what each segment charges (both objects and the ranged
   open's guesses) and split to fit.
 
+### Changed
+
+- An HNSW query that has to widen its search now resumes its walk of the
+  graph where it stopped, instead of starting a fresh search with a bigger
+  `ef`. The rows returned are those a fresh search for that many returns,
+  apart from nodes at exactly the same distance, which may be expanded in a
+  different order. Not measured on a real store yet.
+
 ## [0.3.0] - 2026-11-27
 
 ### Security
