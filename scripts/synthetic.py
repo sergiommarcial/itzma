@@ -154,6 +154,18 @@ REGISTRY: tuple[Dataset, ...] = (
         test_only="a limit that is never reached; `tests/compaction.rs` and the planner's unit tests",
     ),
     Dataset(
+        name="align-behind-cache",
+        since="0.3.1",
+        summary="Block reads are rounded out to the fetch policy's align only behind a cache, so an uncached filter reads exact bytes",
+        test_only="bytes asserted in `tests/filter.rs`; the demo (cache on and off) moves to 0.4.0 with the site charts",
+    ),
+    Dataset(
+        name="block-verdicts",
+        since="0.3.1",
+        summary="On segment format 3 a filter skips blocks by zone map and evaluates the rest on columns, reading attributes only for matching rows",
+        test_only="bytes asserted in `tests/filter.rs` and `tests/filtered_query.rs`; the demo (sorted against shuffled attributes) moves to 0.4.0 with the site charts",
+    ),
+    Dataset(
         name="hnsw-resume",
         since="0.3.1",
         summary="A widening HNSW query resumes its walk instead of starting a fresh search",
