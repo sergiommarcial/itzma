@@ -362,8 +362,7 @@ async fn assert_sparse_matches_naive(ns: &Namespace, state: &BTreeMap<String, Do
     }
 }
 
-#[tokio::test]
-async fn a_filtered_sparse_query_equals_filter_then_rank_at_every_stage() {
+async fn sparse_stages(raise_to_3: bool) {
     for backend in cas_backends() {
         let ns = create(backend.store.clone()).await;
         let first: Vec<Document> = (0..40u32)
@@ -380,6 +379,9 @@ async fn a_filtered_sparse_query_equals_filter_then_rank_at_every_stage() {
         assert_sparse_matches_naive(&ns, &state_of(&batches)).await;
 
         ns.compact(&ROOMY).await.unwrap();
+        if raise_to_3 {
+            ns.upgrade_segment_format(3).await.unwrap();
+        }
         assert_sparse_matches_naive(&ns, &state_of(&batches)).await;
 
         ns.index_sparse(&IndexSparseOptions::default())
@@ -415,7 +417,21 @@ async fn a_filtered_sparse_query_equals_filter_then_rank_at_every_stage() {
             .await
             .unwrap();
         assert_sparse_matches_naive(&ns, &state).await;
+        if raise_to_3 {
+            let versions = common::live_segment_versions(&*backend.store).await;
+            assert!(versions.contains(&3), "{versions:?}");
+        }
     }
+}
+
+#[tokio::test]
+async fn a_filtered_sparse_query_equals_filter_then_rank_at_every_stage() {
+    sparse_stages(false).await;
+}
+
+#[tokio::test]
+async fn a_filtered_sparse_query_equals_filter_then_rank_across_versions_2_and_3() {
+    sparse_stages(true).await;
 }
 
 #[tokio::test]
@@ -641,6 +657,138 @@ async fn a_selective_filter_on_a_partially_probed_clustered_index_still_finds_ev
             assert_eq!(got, want, "seed {seed}, {}", backend.name);
         }
     }
+}
+
+fn indexed_typed() -> Schema {
+    Schema::new(DIM, Metric::L2).with_attrs(
+        AttrSchema::new()
+            .field("price", AttrType::Number)
+            .field("active", AttrType::Bool)
+            .field("filler", AttrType::Text),
+    )
+}
+
+/// Like `item`, but with a large non-indexed `filler` field, so a row's
+/// attributes are heavy enough that fetching every candidate's (instead of
+/// only the matching ones') makes a measurable difference in bytes read.
+fn padded_item(id: &str, price: f64, rng: &mut Lcg) -> Document {
+    let mut d = doc(id, &rng.vector(DIM));
+    d.attrs = Some(json!({
+        "price": price,
+        "active": price < 5.0,
+        "filler": "x".repeat(1000),
+    }));
+    d
+}
+
+/// `padded_item` with filler that does not compress away.
+fn random_padded_item(id: &str, price: f64, rng: &mut Lcg) -> Document {
+    let mut d = padded_item(id, price, rng);
+    let filler: String = (0..250)
+        .map(|_| format!("{:04x}", rng.below(65536)))
+        .collect();
+    if let Some(attrs) = d.attrs.as_mut() {
+        attrs["filler"] = json!(filler);
+    }
+    d
+}
+
+/// Builds and compacts the same 2000-document, heavy-attrs namespace over a
+/// fresh `CountingStore`, so a test can measure exactly one call's bytes. With
+/// `v3` its segment is version 3, with `sparse` every document
+/// carries two terms and the segment gets a sparse index.
+async fn heavy_namespace(
+    store: Arc<CountingStore>,
+    pad: fn(&str, f64, &mut Lcg) -> Document,
+    v3: bool,
+    sparse: bool,
+) -> Namespace {
+    let ns = Namespace::create(
+        store.clone() as Arc<dyn ObjectStore>,
+        "docs",
+        indexed_typed(),
+    )
+    .await
+    .unwrap()
+    .with_fetch_policy(itzma_core::FetchPolicy::local());
+    if v3 {
+        ns.upgrade_segment_format(3).await.unwrap();
+    }
+    let mut rng = Lcg(9);
+    let docs: Vec<Document> = (0..2000u32)
+        .map(|i| {
+            let mut d = pad(&format!("d{i:04}"), f64::from(i % 10), &mut rng);
+            if sparse {
+                d.sparse = Some(vec![(1 + i % 3, 1.0 + (i % 5) as f32), (10, 0.5)]);
+            }
+            d
+        })
+        .collect();
+    ns.upsert(docs).await.unwrap();
+    ns.compact(&ROOMY).await.unwrap();
+    // SQ8, whose partitions a filter that rules every row out never reads:
+    // the default, HNSW, walks its graph whatever the filter says.
+    ns.index(
+        &IndexOptions::default()
+            .min_rows(0)
+            .kind(itzma_core::IndexKind::Sq8),
+    )
+    .await
+    .unwrap();
+    if sparse {
+        ns.index_sparse(&IndexSparseOptions::default())
+            .await
+            .unwrap();
+    }
+    ns
+}
+
+/// Prices run 0 to 9, so no block of the segment can hold a price above 100:
+/// the zone maps say so, and a version 3 segment must answer without reading
+/// any attribute block.
+#[tokio::test]
+async fn a_filter_the_zone_maps_rule_out_reads_no_attribute_block() {
+    let options =
+        QueryOptions::default().filter(Some(Predicate::number("price", Compare::Gt, 100.0)));
+    let query = Lcg(1).vector(DIM);
+    let mut bytes = Vec::new();
+    for v3 in [false, true] {
+        let store = Arc::new(CountingStore::default());
+        let ns = heavy_namespace(store.clone(), random_padded_item, v3, false).await;
+        store.reset();
+        assert!(ns.query_with(&query, 5, &options).await.unwrap().is_empty());
+        bytes.push(store.bytes());
+    }
+    // 2,000 rows of about 1 KB of filler each.
+    assert!(
+        bytes[1] * 10 < bytes[0],
+        "version 2: {} bytes, version 3: {} bytes",
+        bytes[0],
+        bytes[1]
+    );
+}
+
+#[tokio::test]
+async fn a_sparse_filter_the_zone_maps_rule_out_reads_no_attribute_block() {
+    let options =
+        SparseQueryOptions::default().filter(Some(Predicate::number("price", Compare::Gt, 100.0)));
+    let mut bytes = Vec::new();
+    for v3 in [false, true] {
+        let store = Arc::new(CountingStore::default());
+        let ns = heavy_namespace(store.clone(), random_padded_item, v3, true).await;
+        store.reset();
+        let hits = ns
+            .query_sparse(&vec![(1, 1.0), (10, 1.0)], 5, &options)
+            .await;
+        assert!(hits.unwrap().is_empty());
+        bytes.push(store.bytes());
+    }
+    assert!(
+        bytes[1] * 10 < bytes[0],
+        "version 2: {} bytes, version 3: {} bytes",
+        bytes[0],
+        bytes[1]
+    );
 }
 
 /// An indexed segment, then an unindexed version 2 segment whose attribute

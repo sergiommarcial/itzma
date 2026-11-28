@@ -265,6 +265,22 @@ impl Texts {
         std::str::from_utf8(slice).unwrap_or_default()
     }
 
+    /// Whether `test` holds for each value, in order. A dictionary tests each
+    /// distinct entry once and looks the rest up by code.
+    pub(crate) fn matching(&self, test: impl Fn(&str) -> bool) -> Vec<bool> {
+        match self {
+            Self::Plain { ends, bytes } => (0..ends.len() - 1)
+                .map(|j| test(Self::entry(ends, bytes, j)))
+                .collect(),
+            Self::Dict { ends, bytes, codes } => {
+                let entries: Vec<bool> = (0..ends.len() - 1)
+                    .map(|k| test(Self::entry(ends, bytes, k)))
+                    .collect();
+                codes.iter().map(|&code| entries[code as usize]).collect()
+            }
+        }
+    }
+
     pub(crate) fn get(&self, j: usize) -> &str {
         match self {
             Self::Plain { ends, bytes } => Self::entry(ends, bytes, j),
@@ -418,6 +434,9 @@ pub(crate) struct ColumnBlock {
     rows: usize,
     objects: Bits,
     columns: Vec<Column>,
+    /// Which columns hold what was stored; a projected block keeps an empty
+    /// stand-in for the rest.
+    loaded: Vec<bool>,
 }
 
 fn set_ends(lens: &[usize]) -> Result<Vec<u32>> {
@@ -480,6 +499,7 @@ impl ColumnBlock {
             fields: fields.clone(),
             rows: n,
             objects,
+            loaded: vec![true; columns.len()],
             columns,
         })
     }
@@ -630,44 +650,9 @@ impl ColumnBlock {
         let mut ranges = Vec::with_capacity(fields.len());
         for field in fields.iter() {
             let start = r.pos;
-            let present = Bits::read(&mut r, rows, "present")?;
-            let valued = Bits::read(&mut r, rows, "valued")?;
-            if !present.within(&objects) {
-                return Err(r.corrupt(format!("{}: present outside objects", field.name)));
-            }
-            if !valued.within(&present) {
-                return Err(r.corrupt(format!("{}: valued outside present", field.name)));
-            }
-            let k = valued.count();
-            let values = match field.ty {
-                AttrType::Bool => {
-                    let bits = Bits::read(&mut r, rows, "bool")?;
-                    if !bits.within(&valued) {
-                        return Err(
-                            r.corrupt(format!("{}: bool set on a row with no value", field.name))
-                        );
-                    }
-                    Values::Bool(bits)
-                }
-                AttrType::Number => Values::Number(Numbers::read(&mut r, k)?),
-                AttrType::Text => Values::Text(Texts::read(&mut r, k)?),
-                AttrType::NumberSet => {
-                    let ends = Self::read_set_ends(&mut r, k)?;
-                    let items = Numbers::read(&mut r, ends[k] as usize)?;
-                    Values::NumberSet { ends, items }
-                }
-                AttrType::TextSet => {
-                    let ends = Self::read_set_ends(&mut r, k)?;
-                    let items = Texts::read(&mut r, ends[k] as usize)?;
-                    Values::TextSet { ends, items }
-                }
-            };
+            let column = Self::read_column(&mut r, field, rows, Some(&objects))?;
             ranges.push((start as u32, (r.pos - start) as u32));
-            columns.push(Column {
-                present,
-                valued,
-                values,
-            });
+            columns.push(column);
         }
         if r.remaining() != 0 {
             return Err(r.corrupt("attribute block has trailing bytes"));
@@ -677,10 +662,106 @@ impl ColumnBlock {
                 fields: fields.clone(),
                 rows,
                 objects,
+                loaded: vec![true; columns.len()],
                 columns,
             },
             ranges,
         ))
+    }
+
+    /// One column, as [`encode`](Self::encode) wrote it. `objects` is the
+    /// block's bitmap when the caller has it, and is only checked against.
+    fn read_column(
+        r: &mut Reader<'_>,
+        field: &Field,
+        rows: usize,
+        objects: Option<&Bits>,
+    ) -> Result<Column> {
+        let present = Bits::read(r, rows, "present")?;
+        let valued = Bits::read(r, rows, "valued")?;
+        if objects.is_some_and(|o| !present.within(o)) {
+            return Err(r.corrupt(format!("{}: present outside objects", field.name)));
+        }
+        if !valued.within(&present) {
+            return Err(r.corrupt(format!("{}: valued outside present", field.name)));
+        }
+        let k = valued.count();
+        let values = match field.ty {
+            AttrType::Bool => {
+                let bits = Bits::read(r, rows, "bool")?;
+                if !bits.within(&valued) {
+                    return Err(
+                        r.corrupt(format!("{}: bool set on a row with no value", field.name))
+                    );
+                }
+                Values::Bool(bits)
+            }
+            AttrType::Number => Values::Number(Numbers::read(r, k)?),
+            AttrType::Text => Values::Text(Texts::read(r, k)?),
+            AttrType::NumberSet => {
+                let ends = Self::read_set_ends(r, k)?;
+                let items = Numbers::read(r, ends[k] as usize)?;
+                Values::NumberSet { ends, items }
+            }
+            AttrType::TextSet => {
+                let ends = Self::read_set_ends(r, k)?;
+                let items = Texts::read(r, ends[k] as usize)?;
+                Values::TextSet { ends, items }
+            }
+        };
+        Ok(Column {
+            present,
+            valued,
+            values,
+        })
+    }
+
+    /// A block of `rows` rows holding only the columns in `parts` (a field's
+    /// position and the bytes [`encode`](Self::encode) wrote for it). The
+    /// others are empty stand-ins that [`is_loaded`](Self::is_loaded) reports
+    /// as such, and the rows cannot be rebuilt from it. The block's own
+    /// bitmap is not read, so `present` is not checked against it; a
+    /// ranged read trusts a column as it trusts a zone map.
+    ///
+    /// # Errors
+    ///
+    /// [`ItzmaError::CorruptSegment`] for a column that does not parse, has
+    /// trailing bytes or names a field the block does not have.
+    pub(crate) fn project(
+        path: &str,
+        fields: &Fields,
+        rows: usize,
+        parts: &[(usize, &[u8])],
+    ) -> Result<Self> {
+        let blank: Vec<Option<&Map<String, Value>>> = vec![None; rows];
+        let mut columns = Vec::with_capacity(fields.len());
+        for field in fields.iter() {
+            columns.push(Self::column(field, &blank)?);
+        }
+        let mut loaded = vec![false; fields.len()];
+        for &(at, bytes) in parts {
+            let field = fields
+                .get(at)
+                .ok_or_else(|| refuse(format!("column {at} is not a field")))?;
+            let mut r = Reader::new(path, bytes);
+            columns[at] = Self::read_column(&mut r, field, rows, None)?;
+            if r.remaining() != 0 {
+                return Err(r.corrupt(format!("{}: column has trailing bytes", field.name)));
+            }
+            loaded[at] = true;
+        }
+        Ok(Self {
+            fields: fields.clone(),
+            rows,
+            objects: Bits::new(rows),
+            columns,
+            loaded,
+        })
+    }
+
+    /// Whether column `at` holds what was stored, not a stand-in.
+    pub(crate) fn is_loaded(&self, at: usize) -> bool {
+        self.loaded.get(at).copied().unwrap_or(false)
     }
 
     fn read_set_ends(r: &mut Reader<'_>, k: usize) -> Result<Vec<u32>> {
@@ -820,6 +901,50 @@ mod tests {
             Some(json!({"n": 1e300, "s": ""})),
         ];
         round_trip(&every_type(), &rows);
+    }
+
+    /// A projection holds exactly the columns of the whole block it was cut
+    /// from, and refuses a column cut short, padded or flipped into nonsense
+    /// without panicking.
+    #[test]
+    fn a_projected_block_holds_the_columns_it_was_given() {
+        let fields = every_type();
+        let rows: Vec<Option<Value>> = (0..40)
+            .map(|i| {
+                Some(json!({"b": i % 3 == 0, "n": i, "s": format!("w{}", i % 5),
+                    "ss": ["a", "b"], "ns": [i]}))
+            })
+            .collect();
+        let whole = ColumnBlock::from_rows(&fields, &rows).unwrap();
+        let mut bytes = Vec::new();
+        let ranges = whole.encode(&mut bytes);
+        let part = |at: usize| {
+            let (from, len) = ranges[at];
+            (at, &bytes[from as usize..(from + len) as usize])
+        };
+        let picked = ColumnBlock::project("t", &fields, rows.len(), &[part(1), part(3)]).unwrap();
+        for at in 0..fields.len() {
+            assert_eq!(picked.is_loaded(at), at == 1 || at == 3);
+        }
+        assert_eq!(picked.columns()[1], whole.columns()[1]);
+        assert_eq!(picked.columns()[3], whole.columns()[3]);
+
+        let (from, len) = ranges[1];
+        let column = &bytes[from as usize..(from + len) as usize];
+        for cut in 0..column.len() {
+            assert!(
+                ColumnBlock::project("t", &fields, rows.len(), &[(1, &column[..cut])]).is_err()
+            );
+        }
+        let mut padded = column.to_vec();
+        padded.push(0);
+        assert!(ColumnBlock::project("t", &fields, rows.len(), &[(1, &padded)]).is_err());
+        assert!(ColumnBlock::project("t", &fields, rows.len(), &[(9, column)]).is_err());
+        for bit in 0..column.len() * 8 {
+            let mut flipped = column.to_vec();
+            flipped[bit / 8] ^= 1 << (bit % 8);
+            let _ = ColumnBlock::project("t", &fields, rows.len(), &[(1, &flipped)]);
+        }
     }
 
     #[test]

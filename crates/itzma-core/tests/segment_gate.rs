@@ -307,6 +307,7 @@ async fn at_level_3_folds_write_version_3_beside_older_segments() {
     for b in cas_backends() {
         eprintln!("backend: {}", b.name);
         let ns = create(b.store.clone()).await;
+        common::set_segment_format(&*b.store, 2).await;
         fold(&ns, 0..4, &ROOMY).await;
         ns.upgrade_segment_format(3).await.unwrap();
         fold(&ns, 4..8, &ROOMY).await;

@@ -37,6 +37,13 @@ that section into the version's notes.
   `ef`. The rows returned are those a fresh search for that many returns,
   apart from nodes at exactly the same distance, which may be expanded in a
   different order. Not measured on a real store yet.
+- On segment format 3 (`upgrade_segment_format(3)`), `filter` and filtered
+  `query_with` and `query_sparse` use what the segment already stores. A block
+  whose zone map rules the predicate out is read for its ids only, a block the
+  zone map cannot decide is evaluated on the columns the predicate names, and
+  only the rows that match have their attributes read. A top-level `And` runs
+  its most selective conjunct first. Answers are the same, and segment format
+  2 is unchanged. New namespaces still start at segment format 2.
 
 ## [0.3.0] - 2026-11-27
 

@@ -993,10 +993,51 @@ async fn filter_segment_at(batches: usize, level: u32, segments: usize) -> Names
     ns
 }
 
+/// Twenty thousand documents at segment format `level` with a `seq` that
+/// ascends with the id (a sorted field, so zone maps can rule blocks out), an
+/// `rnd` scattered over 0..1000 (a random one, so they cannot), and the
+/// `filter_segment` fields.
+async fn wide_segment_at(level: u32) -> Namespace {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let attrs = AttrSchema::new()
+        .field("seq", AttrType::Number)
+        .field("rnd", AttrType::Number)
+        .field("bucket", AttrType::Number)
+        .field("active", AttrType::Bool);
+    let ns = Namespace::create(
+        store,
+        "bench",
+        Schema::new(FILTER_DIM, Metric::L2).with_attrs(attrs),
+    )
+    .await
+    .expect("create");
+    ns.upgrade_segment_format(level).await.expect("level");
+    for b in 0..20 {
+        let docs = (b * BATCH..(b + 1) * BATCH)
+            .map(|n| Document {
+                id: format!("doc-{n:08}"),
+                vector: vec![0.0; FILTER_DIM],
+                attrs: Some(serde_json::json!({
+                    "seq": n,
+                    "rnd": (n * 2_654_435_761) % 1000,
+                    "bucket": n % 100,
+                    "active": n % 2 == 0,
+                })),
+                sparse: None,
+            })
+            .collect();
+        ns.upsert(docs).await.expect("upsert");
+    }
+    ns.compact(&CompactionOptions::default())
+        .await
+        .expect("compact");
+    ns
+}
+
 /// The same reads and merge over version 2 and version 3 segments:
-/// `filter` with the `filter/` group's two predicates, a whole `scan`, and a
+/// `filter` with the `filter/` group's predicates, a filtered query and a
 /// merge of eight segments. Version 3 rebuilds attributes from columns where
-/// version 2 parses JSON; zone maps are not used yet.
+/// version 2 parses JSON, and a filter skips blocks by their zone maps.
 fn columnar(c: &mut Criterion, rt: &Runtime) {
     let mut group = c.benchmark_group("columnar");
     group.sample_size(10);
@@ -1009,6 +1050,31 @@ fn columnar(c: &mut Criterion, rt: &Runtime) {
         for (kind, predicate) in [("loose", &loose), ("selective", &selective)] {
             group.bench_function(format!("filter/{kind}/20k/{name}"), |b| {
                 let ns = ns.get_or_init(|| rt.block_on(filter_segment_at(batches, level, 1)));
+                b.to_async(rt).iter(|| async {
+                    black_box(
+                        ns.filter(predicate, &FilterOptions::default())
+                            .await
+                            .expect("filter"),
+                    )
+                });
+            });
+        }
+        let wide = OnceCell::new();
+        let shapes = [
+            ("sorted", Predicate::number("seq", Compare::Lt, 2_000.0)),
+            ("random", Predicate::number("rnd", Compare::Eq, 7.0)),
+            (
+                "three",
+                Predicate::and(vec![
+                    Predicate::is_true("active"),
+                    Predicate::number("rnd", Compare::Lt, 500.0),
+                    Predicate::number("seq", Compare::Lt, 10_000.0),
+                ]),
+            ),
+        ];
+        for (kind, predicate) in &shapes {
+            group.bench_function(format!("filter/{kind}/20k/{name}"), |b| {
+                let ns = wide.get_or_init(|| rt.block_on(wide_segment_at(level)));
                 b.to_async(rt).iter(|| async {
                     black_box(
                         ns.filter(predicate, &FilterOptions::default())

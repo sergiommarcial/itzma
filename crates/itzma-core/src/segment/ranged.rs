@@ -33,16 +33,20 @@ use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt};
 
 use super::attr_rows::{AttrRows, Stored};
+use super::columns::ColumnBlock;
 use super::v2::{
     AttrLayout, BLOCK_ROWS, Directory, END_MAGIC, HEADER_LEN, TRAILER_LEN, VERSION, corrupt,
     read_block,
 };
+use super::zone::{ZoneEntry, decode_zone};
 use super::{MAGIC, Matrix, Reader, missing, segment_path};
 use crate::bloom::Bloom;
 use crate::budget::ReadBudget;
+use crate::columnar::Bitmap;
 use crate::decoded::{DecodedRef, What};
 use crate::error::{ItzmaError, Result};
 use crate::fetch::{self, FetchPolicy};
+use crate::predicate::{BlockZones, Predicate, Tri};
 
 /// How many bytes the opening suffix GET asks for. The directory of a segment
 /// of about 200 thousand rows fits, so opening is one round trip for most.
@@ -137,6 +141,9 @@ pub(crate) struct RangedSegment<'a> {
     blocks: StdMutex<HashMap<(Section, usize), Block>>,
     /// The attribute blocks read so far, kept like `blocks`.
     attr_blocks: StdMutex<HashMap<usize, Arc<AttrRows>>>,
+    /// The zone section's entries, one row per block and one entry per
+    /// field, fetched on first use.
+    zones: StdMutex<Option<Arc<Vec<Vec<ZoneEntry>>>>>,
 }
 
 /// One charged `GET` of `range`. An object the store does not have is
@@ -264,6 +271,7 @@ impl<'a> RangedSegment<'a> {
             loading: Mutex::new(()),
             blocks: StdMutex::new(HashMap::new()),
             attr_blocks: StdMutex::new(HashMap::new()),
+            zones: StdMutex::new(None),
         })
     }
 }
@@ -746,6 +754,28 @@ impl<'a> RangedSegment<'a> {
         first_block_after(&self.directory.tombstone_firsts, after)
     }
 
+    /// The ids of the documents of one block, in id order. One request, and
+    /// not the attribute block.
+    ///
+    /// # Errors
+    ///
+    /// [`ItzmaError::CorruptSegment`] for a block that does not exist or ids
+    /// that do not decode.
+    pub(crate) async fn id_block(&self, block: usize) -> Result<Vec<String>> {
+        let d = &self.directory;
+        let raw = if self.decoded.is_some() {
+            let ids = self
+                .cached_block(&d.id_offsets, self.doc_count, Section::Id, block)
+                .await?;
+            Vec::clone(&ids)
+        } else {
+            self.block(&d.id_offsets, self.doc_count, Section::Id, block)
+                .await?
+        };
+        let name = self.name();
+        raw.into_iter().map(|id| decode_id(&name, id)).collect()
+    }
+
     /// The ids and attributes of the documents of one block, in id order. Two
     /// requests, sent together. The vector matrix is not touched.
     ///
@@ -905,6 +935,259 @@ impl<'a> RangedSegment<'a> {
             return Ok(Held::Tombstone);
         }
         Ok(Held::No)
+    }
+
+    /// Every field's zone statistics, one row per id block (the entries of
+    /// [`decode_zone`]), or `None` when this segment keeps none: a version 2
+    /// segment or a free-form one. One GET of the zone section, charged to
+    /// the budget before the body is read and kept for the life of the handle
+    /// (and in the decoded cache when there is one).
+    ///
+    /// The statistics are trusted as the Bloom filter is: the whole decoder
+    /// recomputes and compares them, this path does not.
+    ///
+    /// # Errors
+    ///
+    /// [`ItzmaError::CorruptSegment`] for a zone section that does not
+    /// parse, [`ItzmaError::ReadBudgetExceeded`] before the read.
+    pub(crate) async fn zones(&self) -> Result<Option<Arc<Vec<Vec<ZoneEntry>>>>> {
+        let d = &self.directory;
+        let AttrLayout::Columns(fields) = &d.attrs else {
+            return Ok(None);
+        };
+        let held = |this: &Self| {
+            this.zones
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        };
+        if let Some(zones) = held(self) {
+            return Ok(Some(zones));
+        }
+        let _loading = self.loading.lock().await;
+        if let Some(zones) = held(self) {
+            return Ok(Some(zones));
+        }
+        let load = || async {
+            let (Some(&first), Some(&last)) = (d.zone_offsets.first(), d.zone_offsets.last())
+            else {
+                return Err(corrupt(
+                    &self.name(),
+                    "a version 3 segment has no zone section",
+                ));
+            };
+            let bytes = self.get(first..last).await?;
+            let mut zones = Vec::with_capacity(d.zone_offsets.len().saturating_sub(1));
+            for (block, pair) in d.zone_offsets.windows(2).enumerate() {
+                let rows = usize::try_from(self.doc_count)
+                    .unwrap_or(usize::MAX)
+                    .saturating_sub(block * BLOCK_ROWS)
+                    .min(BLOCK_ROWS);
+                let (from, to) = (pair[0] - first, pair[1] - first);
+                let slice = bytes
+                    .get(from as usize..to as usize)
+                    .ok_or_else(|| corrupt(&self.name(), "the zone section is short"))?;
+                zones.push(decode_zone(&self.name(), slice, fields, rows)?);
+            }
+            let weight = zones.iter().flatten().map(ZoneEntry::weight).sum();
+            Ok((zones, weight))
+        };
+        let zones = match self.decoded {
+            Some(decoded) => decoded.get_or_load(&self.path, What::Zones, load).await?,
+            None => Arc::new(load().await?.0),
+        };
+        *self.zones.lock().unwrap_or_else(PoisonError::into_inner) = Some(zones.clone());
+        Ok(Some(zones))
+    }
+
+    /// What the zone statistics say of `predicate` for each id block, or
+    /// `None` when this segment keeps none (see [`zones`](Self::zones)).
+    ///
+    /// # Errors
+    ///
+    /// As [`zones`](Self::zones).
+    pub(crate) async fn block_verdicts(&self, predicate: &Predicate) -> Result<Option<Vec<Tri>>> {
+        let AttrLayout::Columns(fields) = &self.directory.attrs else {
+            return Ok(None);
+        };
+        let Some(zones) = self.zones().await? else {
+            return Ok(None);
+        };
+        let total = usize::try_from(self.doc_count).unwrap_or(usize::MAX);
+        Ok(Some(
+            zones
+                .iter()
+                .enumerate()
+                .map(|(block, entries)| {
+                    let rows = total.saturating_sub(block * BLOCK_ROWS).min(BLOCK_ROWS);
+                    predicate.on_block(&BlockZones {
+                        fields,
+                        entries,
+                        rows,
+                    })
+                })
+                .collect(),
+        ))
+    }
+
+    /// Which of the listed rows `predicate` keeps, in the order asked, decided
+    /// from the zone statistics and the predicate's own columns: a block the
+    /// statistics rule out (or in) costs nothing past the zone section, and a
+    /// block they cannot decide costs the columns the predicate names, not
+    /// its attribute block. `None` when this segment keeps no
+    /// columns (a version 2 or free-form segment), whose rows the caller reads
+    /// whole.
+    ///
+    /// # Errors
+    ///
+    /// A row out of range or a damaged section is
+    /// [`ItzmaError::CorruptSegment`]; the read budget as ever.
+    pub(crate) async fn eligible_of(
+        &self,
+        predicate: &Predicate,
+        rows: &[u32],
+    ) -> Result<Option<Vec<bool>>> {
+        self.check_rows(rows)?;
+        let AttrLayout::Columns(fields) = &self.directory.attrs else {
+            return Ok(None);
+        };
+        let Some(zones) = self.zones().await? else {
+            return Ok(None);
+        };
+        let mut names = std::collections::BTreeSet::new();
+        predicate.fields_into(&mut names);
+        let Some(positions) = self.field_positions(names) else {
+            return Ok(None);
+        };
+        let mut wanted: Vec<usize> = rows.iter().map(|r| *r as usize / BLOCK_ROWS).collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let total = usize::try_from(self.doc_count).unwrap_or(usize::MAX);
+        let mut kept: BTreeMap<u32, bool> = BTreeMap::new();
+        for block in wanted {
+            let entries = zones
+                .get(block)
+                .ok_or_else(|| corrupt(&self.name(), "a zone block does not exist"))?;
+            let block_rows = total.saturating_sub(block * BLOCK_ROWS).min(BLOCK_ROWS);
+            let verdict = predicate.on_block(&BlockZones {
+                fields,
+                entries,
+                rows: block_rows,
+            });
+            let first = (block * BLOCK_ROWS) as u32;
+            let asked = rows
+                .iter()
+                .copied()
+                .filter(|&r| r as usize / BLOCK_ROWS == block);
+            match verdict {
+                Tri::Never => kept.extend(asked.map(|r| (r, false))),
+                Tri::Always => kept.extend(asked.map(|r| (r, true))),
+                Tri::Maybe => {
+                    let columns = self.columns_of(block, &positions).await?;
+                    let mut within = Bitmap::new(block_rows);
+                    let asked: Vec<u32> = asked.collect();
+                    asked.iter().for_each(|&r| within.set((r - first) as usize));
+                    let hits = predicate.on_columns(&columns, &within);
+                    kept.extend(
+                        asked
+                            .into_iter()
+                            .map(|r| (r, hits.get((r - first) as usize))),
+                    );
+                }
+            }
+        }
+        Ok(Some(rows.iter().map(|r| kept[r]).collect()))
+    }
+
+    /// The columns `wanted` (field positions) of attribute block `block`, as
+    /// a [`ColumnBlock`] whose other columns are stand-ins: one byte range
+    /// per column from the zone entries, through the planner so neighbours
+    /// share a request, each charged before it is sent. With a decoded cache
+    /// the whole block is read through it instead, so a block read once
+    /// serves every later filter.
+    ///
+    /// The column offsets are trusted as the zone statistics are; a column
+    /// that does not parse, or a range outside its block, is corrupt.
+    ///
+    /// # Errors
+    ///
+    /// [`ItzmaError::CorruptSegment`] for a segment without columns or zones,
+    /// a block that does not exist, or a column that does not decode.
+    pub(crate) async fn columns_of(
+        &self,
+        block: usize,
+        wanted: &[usize],
+    ) -> Result<Arc<ColumnBlock>> {
+        let d = &self.directory;
+        let AttrLayout::Columns(fields) = &d.attrs else {
+            return Err(corrupt(
+                &self.name(),
+                "this segment has no attribute columns",
+            ));
+        };
+        if self.decoded.is_some() {
+            let rows = self.attr_blocks_of(&[block], true).await?;
+            return match rows.into_iter().next().as_deref() {
+                Some(AttrRows::Columns(columns)) => Ok(columns.clone()),
+                _ => Err(corrupt(&self.name(), "an attribute block is not columns")),
+            };
+        }
+        let zones = self
+            .zones()
+            .await?
+            .ok_or_else(|| corrupt(&self.name(), "a version 3 segment has no zone section"))?;
+        let entries = zones
+            .get(block)
+            .ok_or_else(|| corrupt(&self.name(), format!("zone block {block} does not exist")))?;
+        let (Some(&start), Some(&end)) = (d.attr_offsets.get(block), d.attr_offsets.get(block + 1))
+        else {
+            return Err(corrupt(
+                &self.name(),
+                format!("attribute block {block} does not exist"),
+            ));
+        };
+        let ranges: Vec<Range<u64>> = wanted
+            .iter()
+            .map(|&at| {
+                let entry = entries.get(at).ok_or_else(|| {
+                    corrupt(&self.name(), "a zone block has no entry for a field")
+                })?;
+                let from = start + u64::from(entry.offset);
+                let to = from + u64::from(entry.len);
+                if to > end {
+                    return Err(corrupt(&self.name(), "a column lies outside its block"));
+                }
+                Ok(from..to)
+            })
+            .collect::<Result<_>>()?;
+        let fetched = self.fetch_planned(&ranges).await?;
+        let parts: Vec<(usize, &[u8])> = wanted
+            .iter()
+            .copied()
+            .zip(fetched.iter().map(|bytes| &bytes[..]))
+            .collect();
+        let rows = Self::rows_in(self.doc_count, block) as usize;
+        ColumnBlock::project(&self.name(), fields, rows, &parts).map(Arc::new)
+    }
+
+    /// The positions of `names` among the attribute fields, ascending, for
+    /// [`columns_of`](Self::columns_of). `None` when the segment has no
+    /// columns. A name that is not a field is left out: the caller's
+    /// predicate was checked against the schema.
+    pub(crate) fn field_positions<'n>(
+        &self,
+        names: impl IntoIterator<Item = &'n str>,
+    ) -> Option<Vec<usize>> {
+        let AttrLayout::Columns(fields) = &self.directory.attrs else {
+            return None;
+        };
+        let mut at: Vec<usize> = names
+            .into_iter()
+            .filter_map(|name| fields.iter().position(|f| f.name == name))
+            .collect();
+        at.sort_unstable();
+        at.dedup();
+        Some(at)
     }
 
     /// Whether the block of `firsts` that could hold `id` does.
@@ -2239,6 +2522,144 @@ mod tests {
         assert_eq!(
             format!("{} {}", Section::Id, Section::Tombstone),
             "id tombstone"
+        );
+    }
+
+    fn mixed_schema() -> crate::document::Schema {
+        crate::document::Schema::new(4, crate::Metric::L2)
+            .with_attrs(crate::attrs::AttrSchema::new().field("n", crate::attrs::AttrType::Number))
+    }
+
+    /// 600 documents whose number attribute `n` is their position.
+    fn mixed_layer() -> Layer {
+        let mut layer = layer_of(600, 0, 4);
+        let docs: Vec<Document> = layer.sorted_docs().into_iter().cloned().collect();
+        for (i, mut doc) in docs.into_iter().enumerate() {
+            doc.attrs = Some(json!({ "n": i }));
+            layer.apply(WalOp::Upsert(doc));
+        }
+        layer
+    }
+
+    #[tokio::test]
+    async fn a_ranged_open_fetches_the_zone_once_per_segment_and_charges_it() {
+        let layer = mixed_layer();
+        let bytes = crate::segment::encode_with_schema(&layer, &mixed_schema(), 3).expect("encode");
+        let (store, _) = put(bytes).await;
+        let budget = ReadBudget::unlimited();
+        let policy = FetchPolicy::local();
+        let seg = open(&store, 4, &budget, &policy).await.expect("open");
+        store.reset();
+        let before = budget.used();
+        seg.zones().await.expect("zones");
+        assert_eq!(store.requests(), 1);
+        assert_eq!(store.bytes(), budget.used() - before);
+        seg.zones().await.expect("zones");
+        assert_eq!(store.requests(), 1, "held for the life of the handle");
+    }
+
+    #[tokio::test]
+    async fn the_rows_a_segment_calls_eligible_are_the_rows_the_predicate_matches() {
+        use crate::predicate::{Compare, Predicate};
+        let layer = mixed_layer();
+        let bytes = crate::segment::encode_with_schema(&layer, &mixed_schema(), 3).expect("encode");
+        let (store, _) = put(bytes).await;
+        let budget = ReadBudget::unlimited();
+        let policy = FetchPolicy::local();
+        let seg = open(&store, 4, &budget, &policy).await.expect("open");
+        let n = |op, v| Predicate::number("n", op, v);
+        let predicates = [
+            n(Compare::Lt, 100.0),
+            n(Compare::Ge, 0.0),
+            n(Compare::Gt, 1000.0),
+            Predicate::and(vec![n(Compare::Ge, 200.0), n(Compare::Lt, 300.0)]),
+            Predicate::Not(Box::new(n(Compare::Eq, 7.0))),
+        ];
+        let rows: Vec<u32> = vec![599, 0, 7, 255, 256, 300, 511, 512, 100, 7];
+        for predicate in &predicates {
+            let got = seg
+                .eligible_of(predicate, &rows)
+                .await
+                .expect("eligible")
+                .expect("a version 3 segment");
+            let want: Vec<bool> = rows
+                .iter()
+                .map(|&r| predicate.matches(Some(&json!({ "n": r }))))
+                .collect();
+            assert_eq!(got, want, "{predicate:?}");
+        }
+        let all: Vec<u32> = (0..600).collect();
+        let got = seg
+            .eligible_of(&predicates[0], &all)
+            .await
+            .expect("eligible")
+            .expect("columns");
+        assert_eq!(got.iter().filter(|&&k| k).count(), 100);
+    }
+
+    #[tokio::test]
+    async fn a_block_the_zones_decide_costs_no_read_past_the_zone_section() {
+        use crate::predicate::{Compare, Predicate};
+        let layer = mixed_layer();
+        let bytes = crate::segment::encode_with_schema(&layer, &mixed_schema(), 3).expect("encode");
+        let (store, _) = put(bytes).await;
+        let budget = ReadBudget::unlimited();
+        let policy = FetchPolicy::local();
+        let seg = open(&store, 4, &budget, &policy).await.expect("open");
+        seg.zones().await.expect("zones");
+        store.reset();
+        let never = Predicate::number("n", Compare::Gt, 1000.0);
+        let always = Predicate::number("n", Compare::Ge, 0.0);
+        for predicate in [&never, &always] {
+            seg.eligible_of(predicate, &[3, 300, 599])
+                .await
+                .expect("eligible");
+        }
+        assert_eq!(store.requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_segment_without_columns_has_no_verdicts() {
+        let (store, _) = setup(300, 0, 4).await;
+        let budget = ReadBudget::unlimited();
+        let policy = FetchPolicy::local();
+        let seg = open(&store, 4, &budget, &policy).await.expect("open");
+        let predicate = crate::predicate::Predicate::is_true("active");
+        assert!(
+            seg.eligible_of(&predicate, &[0, 1])
+                .await
+                .expect("eligible")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_segment_without_zones_answers_none_and_reads_nothing() {
+        let (store, _) = setup(300, 0, 4).await;
+        let budget = ReadBudget::unlimited();
+        let policy = FetchPolicy::local();
+        let seg = open(&store, 4, &budget, &policy).await.expect("open");
+        store.reset();
+        assert!(seg.zones().await.expect("zones").is_none());
+        assert_eq!(store.requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_zone_section_over_the_budget_is_read_budget_exceeded() {
+        let layer = mixed_layer();
+        let bytes = crate::segment::encode_with_schema(&layer, &mixed_schema(), 3).expect("encode");
+        let (store, _) = put(bytes).await;
+        let policy = FetchPolicy::local();
+        let open_budget = ReadBudget::unlimited();
+        let probe = open(&store, 4, &open_budget, &policy).await.expect("open");
+        let spent = open_budget.used();
+        drop(probe);
+        let tight = ReadBudget::new(spent + 8);
+        let seg = open(&store, 4, &tight, &policy).await.expect("open");
+        let err = seg.zones().await.unwrap_err();
+        assert!(
+            matches!(err, ItzmaError::ReadBudgetExceeded { .. }),
+            "{err}"
         );
     }
 }
