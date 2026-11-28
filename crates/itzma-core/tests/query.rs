@@ -654,6 +654,7 @@ async fn budget_refuses_the_flat_scan_but_the_index_still_answers() {
 async fn the_indexed_path_reads_far_fewer_bytes_than_a_flat_scan() {
     let store = Arc::new(CountingStore::default());
     let ns = create(store.clone() as Arc<dyn ObjectStore>).await;
+    common::set_segment_format(&*store, 2).await;
     write(&ns, "a", 1, DEFAULT_MIN_ROWS * 30).await;
     ns.compact(&ROOMY).await.unwrap();
     // One partition: this compares a scan of every code with a flat read. A
@@ -1555,6 +1556,7 @@ async fn a_query_across_versions_2_and_3_matches_the_flat_scan_with_attributes()
             .await
             .unwrap()
             .with_fetch_policy(itzma_core::FetchPolicy::local());
+        common::set_segment_format(&*b.store, 2).await;
         let with_attrs = |prefix: &str, seed: u64| -> Vec<Document> {
             docs_of(prefix, seed, 300)
                 .into_iter()

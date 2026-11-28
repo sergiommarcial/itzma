@@ -14,6 +14,13 @@
 //! rest) but is still a value to `IsNull` and `IsNotNull`. This build cannot
 //! write one, so it only comes from a hand-made object.
 
+mod block;
+mod columns;
+mod passes;
+
+pub(crate) use block::{BlockZones, Tri};
+pub(crate) use passes::Passes;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

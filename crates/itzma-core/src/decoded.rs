@@ -66,6 +66,8 @@ pub(crate) enum What {
     SegmentMeta,
     /// A segment's Bloom filter.
     Bloom,
+    /// A segment's zone statistics, every field of every block.
+    Zones,
     /// One block of a segment's ids, attributes or tombstones.
     IdBlock(usize),
     AttrBlock(usize),

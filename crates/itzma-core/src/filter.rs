@@ -118,6 +118,7 @@ impl<'a> Scan<'a> {
             policy: self.policy,
             decoded: self.decoded,
             after: self.after,
+            predicate: Some(self.predicate),
         }
     }
 }

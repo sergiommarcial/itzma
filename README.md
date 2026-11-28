@@ -235,7 +235,7 @@ A batch with a sparse vector is written as WAL version 4 (5 with a key), which n
 
 **`recover`** writes a new manifest for a namespace that lost its own, from `schema.json`, the segment names and the WAL. It refuses if a manifest exists, and stops with `Unrecoverable` and the keys to restore if a range has no readable copy. It does not restore indexes; run `index` and `index_sparse` again.
 
-**Format levels.** The manifest records the newest WAL and segment formats the namespace may hold. A build that reads less refuses the namespace before touching it. `upgrade_wal_format(level)` and `upgrade_segment_format(level)` raise a level, one way. New namespaces start at WAL level 5 and segment level 2; `upgrade_segment_format(3)` turns on the typed attribute columns of segment format 3.
+**Format levels.** The manifest records the newest WAL and segment formats the namespace may hold. A build that reads less refuses the namespace before touching it. `upgrade_wal_format(level)` and `upgrade_segment_format(level)` raise a level, one way. New namespaces start at WAL level 5 and segment level 2; `upgrade_segment_format(3)` turns on the typed attribute columns of segment format 3. On those segments a filter skips blocks whose zone maps rule it out, evaluates the rest on the columns it names, and reads a row's attributes only if the row matches; the answer is the same as on segment format 2.
 
 ## Caching and read budgets
 

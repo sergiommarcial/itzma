@@ -533,12 +533,28 @@ async fn evaluate_candidates(
         }
         Some(predicate) => {
             let rows: Vec<u32> = kept.iter().map(|(row, _)| *row).collect();
-            let fetched = source.segment.attrs_of(&rows).await?;
-            kept.into_iter()
-                .zip(fetched)
-                .filter(|(_, attrs)| predicate.matches(attrs.as_ref()))
-                .map(|(pair, attrs)| (pair, Attrs::Have(attrs)))
-                .unzip()
+            // A version 3 segment decides from its zone maps and the
+            // predicate's columns, and the attributes of the rows that pass
+            // wait for `finish`.
+            match source.segment.eligible_of(predicate, &rows).await? {
+                Some(decided) => kept
+                    .into_iter()
+                    .zip(decided)
+                    .filter(|(_, eligible)| *eligible)
+                    .map(|(pair, _)| {
+                        let attrs = Attrs::Row(pair.0);
+                        (pair, attrs)
+                    })
+                    .unzip(),
+                None => {
+                    let fetched = source.segment.attrs_of(&rows).await?;
+                    kept.into_iter()
+                        .zip(fetched)
+                        .filter(|(_, attrs)| predicate.matches(attrs.as_ref()))
+                        .map(|(pair, attrs)| (pair, Attrs::Have(attrs)))
+                        .unzip()
+                }
+            }
         }
     };
     let kept_rows: Vec<u32> = kept.iter().map(|(row, _)| *row).collect();
