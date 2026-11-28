@@ -769,6 +769,29 @@ pub(crate) fn decode(path: &str, bytes: &[u8]) -> Result<WalEntry> {
     parse_body(path, &body, version, key)
 }
 
+/// The decompressed body of a binary object, without its header (key). Two
+/// encodings of one batch have the same body whatever their key or
+/// compression, which is how a keyed retry tells itself from a reused key.
+///
+/// # Errors
+///
+/// As for [`decode`], without parsing the body.
+pub(crate) fn body_of<'a>(path: &str, bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+    let mut head = Reader::new(path, bytes);
+    let header = read_header(&mut head)?;
+    let body_len = usize::try_from(header.body_len)
+        .map_err(|_| corrupt(path, "body_len does not fit in memory on this target"))?;
+    // The payload as a slice of `bytes`, not of the reader, whose lifetime
+    // is tied to `path` too.
+    let payload = &bytes[bytes.len() - head.rest().len()..];
+    match header.codec {
+        CODEC_RAW if payload.len() == body_len => Ok(Cow::Borrowed(payload)),
+        CODEC_RAW => Err(corrupt(path, "payload length differs from body_len")),
+        CODEC_ZSTD => Ok(Cow::Owned(inflate(path, payload, body_len)?)),
+        other => Err(corrupt(path, format!("unknown codec {other}"))),
+    }
+}
+
 /// Decompress a frame that must hold exactly `body_len` bytes. Nothing is
 /// allocated from a claimed length: the frame's recorded size must match the
 /// header first, and the output is read in growing chunks and stopped one byte

@@ -84,11 +84,18 @@ jobs:
           shared-key: tests
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: unit, integration, and doctests
-        run: cargo test --locked
-      # Stable only: criterion is a dev-dependency, so the test build above
-      # already proves it compiles on the 1.87 floor.
-      - name: benchmarks, run once each
         if: matrix.toolchain == 'stable'
+        run: cargo test --locked
+      # The floor claim is that everything compiles on 1.87, benches and
+      # tests included; the stable job runs the tests.
+      - name: everything builds on the floor
+        if: matrix.toolchain != 'stable'
+        run: cargo check --locked --all-targets
+      # Once each, on main and on the weekly run. A pull request's clippy
+      # (--all-targets) already compiles the benches, and running them takes
+      # about as long as the whole test step.
+      - name: benchmarks, run once each
+        if: matrix.toolchain == 'stable' && github.event_name != 'pull_request'
         run: cargo test --locked --bench core
       - name: read paths under the smallest gate
         if: matrix.toolchain == 'stable'
@@ -110,8 +117,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: start MinIO and create the bucket
         run: docker compose up -d --wait
+      # Not the doctests: none of them reaches a store.
       - name: storage tests against S3
-        run: cargo test --locked
+        run: cargo test --locked --tests
         env:
           ITZMA_TEST_S3_ENDPOINT: http://127.0.0.1:9000
       - name: MinIO logs

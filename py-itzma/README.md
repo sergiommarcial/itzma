@@ -60,7 +60,7 @@ ns.upsert(ids=ids, vectors=matrix, attrs=attr_dicts)  # numpy (any float dtype)
 ns.upsert(df)  # pyarrow, Polars or DuckDB table
 ```
 
-A big unkeyed write is split into batches. If one fails, the exception's `last_seq` tells you how far it got. Pass `key="..."` to make a write idempotent; a retry passes the same key and `retry_from=` the sequence number it started from.
+A big unkeyed write is split into batches. If one fails, the exception's `last_seq` tells you how far it got. Pass `key="..."` to make a write idempotent; a retry passes the same key and `retry_from=` the sequence number it started from. A key names one batch: reusing it for different documents raises `KeyConflict`, even when the batch is the same size.
 
 Filters are built from `attr(name)`, with comparison operators or the matching methods:
 

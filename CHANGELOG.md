@@ -10,6 +10,29 @@ that section into the version's notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- An indexed sparse query summed a row's terms in a `HashMap`'s order, which
+  changes from run to run, so float rounding could move a score by a bit
+  between two identical queries and differ from the flat path. Terms are now
+  summed in ascending term id.
+- A write key reused for a different batch of the same size was taken for a
+  retry, and the second batch was silently dropped. The bodies are now
+  compared when the lengths agree, and a different batch is `KeyConflict`.
+- A merge sized its groups by `data.bin` alone, so segments with heavy sparse
+  vectors, or many read in windows, could make a group whose read charge went
+  past the read budget that `CompactionOptions::validate` had accepted. Groups
+  are now sized by what each segment charges (both objects and the ranged
+  open's guesses) and split to fit.
+
+### Changed
+
+- An HNSW query that has to widen its search now resumes its walk of the
+  graph where it stopped, instead of starting a fresh search with a bigger
+  `ef`. The rows returned are those a fresh search for that many returns,
+  apart from nodes at exactly the same distance, which may be expanded in a
+  different order. Not measured on a real store yet.
+
 ## [0.3.0] - 2026-11-27
 
 ### Security

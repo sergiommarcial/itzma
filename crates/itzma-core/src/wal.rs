@@ -117,9 +117,11 @@ pub struct WalEntry {
 /// recognises it and returns that seq.
 ///
 /// A key names one batch. Using it for a different batch is
-/// [`ItzmaError::KeyConflict`] when the two bodies differ in length, and
-/// silently drops the second batch when they do not, so derive keys from the
-/// batch, for example `<job>/<batch number>`.
+/// [`ItzmaError::KeyConflict`]: the bodies are compared, first by length
+/// from the header, then, when the lengths agree, byte for byte after the
+/// earlier object is read whole. A key whose original object `gc` has fenced
+/// is not found at all, so derive keys from the batch, for example
+/// `<job>/<batch number>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteKey {
     /// 1 to 128 bytes. Checked when the write is made, not here.
@@ -155,24 +157,45 @@ impl WriteKey {
     }
 }
 
-/// The key and body length of the batch being written, which is what an
-/// earlier object has to match to count as this write.
+/// The key, body length and encoded object of the batch being written,
+/// which is what an earlier object has to match to count as this write.
 #[derive(Clone, Copy)]
 struct Ours<'a> {
     key: &'a str,
     body_len: u32,
+    object: &'a Bytes,
 }
 
 impl Ours<'_> {
-    /// `found` carries this write's key at `seq`. It is this write if the body
-    /// has the same length, and a reused key if not.
-    fn claim(self, seq: u64, found: &Peek) -> Result<u64> {
-        if found.body_len == self.body_len {
+    /// `found`, the header of the object at `path`, carries this write's key.
+    /// It is this write if its body is this batch's body: the lengths are
+    /// compared first, and only when they agree is the object read whole and
+    /// its body compared. An object fenced since its header was read cannot
+    /// be compared and counts as this write, as the length alone decided
+    /// before.
+    async fn claim(
+        self,
+        store: &dyn ObjectStore,
+        path: &Path,
+        seq: u64,
+        found: &Peek,
+    ) -> Result<u64> {
+        let conflict = || ItzmaError::KeyConflict {
+            key: self.key.to_string(),
+        };
+        if found.body_len != self.body_len {
+            return Err(conflict());
+        }
+        let stored = store.get(path).await?.bytes().await?;
+        if wal_codec::is_fence(&stored) {
+            return Ok(seq);
+        }
+        let theirs = wal_codec::body_of(path.as_ref(), &stored)?;
+        let ours = wal_codec::body_of("(encoding)", self.object)?;
+        if theirs == ours {
             Ok(seq)
         } else {
-            Err(ItzmaError::KeyConflict {
-                key: self.key.to_string(),
-            })
+            Err(conflict())
         }
     }
 }
@@ -314,8 +337,8 @@ pub(crate) async fn put_encoded(
 /// As for [`append`], plus:
 ///
 /// - [`ItzmaError::InvalidKey`] unless the key is 1 to 128 bytes.
-/// - [`ItzmaError::KeyConflict`] if an object with this key holds a batch of a
-///   different size. Nothing is written.
+/// - [`ItzmaError::KeyConflict`] if an object with this key holds a
+///   different batch. Nothing is written.
 /// - [`ItzmaError::CorruptWal`] or [`ItzmaError::UnsupportedFormat`] if a
 ///   header the search reads is damaged.
 ///
@@ -371,13 +394,14 @@ pub(crate) async fn put_encoded_keyed(
     let ours = Ours {
         key: &write.key,
         body_len: object.body_len,
+        object: &object.bytes,
     };
     if let Some(from) = write.search_from {
         if let Some(seq) = find_key(store, namespace, from, ours).await? {
             return Ok(seq);
         }
     }
-    put_next(store, namespace, hint, object.bytes, Some(ours)).await
+    put_next(store, namespace, hint, object.bytes.clone(), Some(ours)).await
 }
 
 /// Put `bytes` at the first free seq from `hint` on. With `ours`, a collision
@@ -422,8 +446,11 @@ async fn own_object_at(
     seq: u64,
     ours: Ours<'_>,
 ) -> Result<Option<u64>> {
-    match peek_at(store, &wal_path(namespace, seq)).await? {
-        Some(found) if found.key == ours.key => ours.claim(seq, &found).map(Some),
+    let path = wal_path(namespace, seq);
+    match peek_at(store, &path).await? {
+        Some(found) if found.key == ours.key => {
+            ours.claim(store, &path, seq, &found).await.map(Some)
+        }
         _ => Ok(None),
     }
 }
@@ -446,12 +473,15 @@ async fn find_key(
     found.sort_by_key(|(seq, _)| *seq);
 
     let mut heads = stream::iter(found)
-        .map(|(seq, path)| async move { Ok::<_, ItzmaError>((seq, peek_at(store, &path).await?)) })
+        .map(|(seq, path)| async move {
+            let head = peek_at(store, &path).await?;
+            Ok::<_, ItzmaError>((seq, path, head))
+        })
         .buffered(FETCH_CONCURRENCY);
-    while let Some((seq, head)) = heads.try_next().await? {
+    while let Some((seq, path, head)) = heads.try_next().await? {
         if let Some(found) = head {
             if found.key == ours.key {
-                return ours.claim(seq, &found).map(Some);
+                return ours.claim(store, &path, seq, &found).await.map(Some);
             }
         }
     }

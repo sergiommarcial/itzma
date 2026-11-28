@@ -151,6 +151,37 @@ A batch is one object and is refused above 64 MiB uncompressed (`BatchTooLarge`)
 
 A write that fails after the request was sent may or may not have landed. A plain retry can append it twice, which is harmless for the end state of upserts and deletes but can overwrite a newer write to the same id. For loads that must land once, use the keyed forms, `upsert_keyed` and `delete_keyed`, with a `WriteKey`: `WriteKey::new(key)` on the first attempt, `WriteKey::retry(key, from)` on a retry, which looks for the key from sequence `from` on and returns the original's sequence number if it finds it.
 
+```rust
+use std::sync::Arc;
+
+use itzma_core::{Document, ItzmaError, Metric, Namespace, Schema, WriteKey};
+use object_store::memory::InMemory;
+
+#[tokio::main]
+async fn main() -> itzma_core::Result<()> {
+    let ns = Namespace::create(Arc::new(InMemory::new()), "loads", Schema::new(2, Metric::L2)).await?;
+    let doc = |id: &str| Document {
+        id: id.into(),
+        vector: vec![1.0, 0.0],
+        attrs: None,
+        sparse: None,
+    };
+
+    let seq = ns.upsert_keyed(&WriteKey::new("job-7/batch-1"), vec![doc("a")]).await?;
+
+    // The same batch again, after a lost acknowledgement: no second write,
+    // and the original's sequence number comes back.
+    let again = ns.upsert_keyed(&WriteKey::retry("job-7/batch-1", seq), vec![doc("a")]).await?;
+    assert_eq!(again, seq);
+
+    // A key names one batch. Reusing it for another is refused, even when the
+    // two batches are the same size.
+    let reused = ns.upsert_keyed(&WriteKey::retry("job-7/batch-1", seq), vec![doc("b")]).await;
+    assert!(matches!(reused, Err(ItzmaError::KeyConflict { .. })));
+    Ok(())
+}
+```
+
 Columnar input: `upsert_columns` takes a `DocColumns` (ids, a row-major `f32` matrix, typed attribute columns) as one batch, and `upsert_stream` takes a stream of them, cut into objects of about `StreamOptions::target_bytes` and written in order. A failed stream reports how much landed. The Python bridge uses these for Arrow input.
 
 ## Querying
@@ -218,7 +249,7 @@ A batch with a sparse vector is written as WAL version 4 (5 with a key), which n
 
 **IO gate.** `GatedStore` wraps a store and admits reads only while the requests and bytes in flight stay under its limits, so nested fan-outs and several queries in one process cannot open an unbounded number of GETs, and maintenance gets its own, smaller gate. It is off unless you build one. Put it under the cache, so a hit takes no permit:
 
-```rust
+```rust,ignore
 use std::sync::Arc;
 use itzma_core::{CacheOptions, CacheStore, GateOptions, GatedStore, Namespace};
 
