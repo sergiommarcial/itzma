@@ -34,10 +34,26 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      ci_passed: ${{ steps.ci.outputs.passed }}
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.TAG }}
+      # A release is a merge commit that CI already ran on, on main. Running
+      # the same suite on the same commit again costs about 26 runner-minutes
+      # and tells nothing new, so the suite below runs only when no green
+      # push run for this commit exists.
+      - id: ci
+        name: did CI already pass on this commit?
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          passed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$sha" --event push --status success --json databaseId --jq 'length')
+          if [ "$passed" -gt 0 ]; then echo "passed=true" >> "$GITHUB_OUTPUT"; else echo "passed=false" >> "$GITHUB_OUTPUT"; fi
       - id: version
         run: |
           python3 scripts/release.py check "$TAG"
@@ -53,6 +69,7 @@ jobs:
 
   ci:
     needs: verify
+    if: needs.verify.outputs.ci_passed != 'true'
     uses: ./.github/workflows/ci.yml
     with:
       ref: ${{ inputs.tag || github.ref_name }}
@@ -118,6 +135,8 @@ jobs:
 
   crates-io:
     needs: [verify, ci, wheels, sdist]
+    # ci is skipped when it already passed on this commit.
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     environment: crates-io
     permissions:
