@@ -43,7 +43,11 @@ pub struct FetchPolicy {
     /// The width of a split grid cell (see [`split_above`](Self::split_above)).
     pub part_size: u64,
     /// Round a merged, unsplit range out to a multiple of this, so nearby
-    /// reads from different queries land on the same cache keys.
+    /// reads from different queries land on the same cache keys. A
+    /// [`Namespace`](crate::Namespace) uses it only after
+    /// [`with_cache`](crate::Namespace::with_cache); without a cache the
+    /// widened bytes would be read again by the next block and shared by
+    /// nothing.
     pub align: u64,
 }
 

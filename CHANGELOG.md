@@ -24,6 +24,11 @@ that section into the version's notes.
   past the read budget that `CompactionOptions::validate` had accepted. Groups
   are now sized by what each segment charges (both objects and the ranged
   open's guesses) and split to fit.
+- `FetchPolicy::align` rounded every small block read out to its grid even
+  when no cache sat under the handle, so each block fetched a window nobody
+  shared. In a test on 20,000 documents, a `filter` read about 1.9 times the
+  bytes it needed. A `Namespace` now applies `align` only after `with_cache`;
+  without a cache, reads are exact.
 
 ### Changed
 

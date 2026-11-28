@@ -640,3 +640,90 @@ async fn versions_2_and_3_together_answer_like_a_replay() {
         check_stage(&ns, &b.store, &oracles, "versions 2 and 3 and a tail").await;
     }
 }
+
+/// A segment's small block reads must not each be widened to the policy's
+/// `align` when no cache sits underneath, since nothing would share the
+/// widened window: the default policy read many times the columns a filter
+/// needs before alignment was tied to a cache. With a cache the alignment
+/// still applies.
+#[tokio::test]
+async fn an_uncached_filter_does_not_align_its_block_reads() {
+    let counting = Arc::new(CountingStore::default());
+    let ns = Namespace::create(counting.clone(), "docs", typed())
+        .await
+        .unwrap();
+    ns.upgrade_segment_format(3).await.unwrap();
+    let mut lcg = Lcg(11);
+    for chunk in 0..4 {
+        ns.upsert(batch(&mut lcg, chunk * 5_000, 5_000))
+            .await
+            .unwrap();
+    }
+    ns.compact(&itzma_core::CompactionOptions::default())
+        .await
+        .unwrap();
+    let cheap = Predicate::number("price", Compare::Lt, 20.0);
+    let mut read = Vec::new();
+    for policy in [
+        itzma_core::FetchPolicy::default(),
+        itzma_core::FetchPolicy::default().align(1),
+    ] {
+        let ns = Namespace::open(counting.clone(), "docs")
+            .await
+            .unwrap()
+            .with_fetch_policy(policy);
+        counting.reset();
+        ns.filter(&cheap, &FilterOptions::default()).await.unwrap();
+        read.push(counting.bytes());
+    }
+    assert_eq!(
+        read[0], read[1],
+        "the default policy read {} bytes, without alignment {}",
+        read[0], read[1]
+    );
+}
+
+/// With a cache under the handle alignment still applies: reads are rounded
+/// out to the policy's grid, so more bytes come from the origin than unaligned
+/// reads would fetch, and the extra bytes are what later reads share.
+#[tokio::test]
+async fn a_cached_filter_still_aligns_its_block_reads() {
+    let counting = Arc::new(CountingStore::default());
+    let ns = Namespace::create(counting.clone(), "docs", typed())
+        .await
+        .unwrap();
+    ns.upgrade_segment_format(3).await.unwrap();
+    let mut lcg = Lcg(11);
+    for chunk in 0..4 {
+        ns.upsert(batch(&mut lcg, chunk * 5_000, 5_000))
+            .await
+            .unwrap();
+    }
+    ns.compact(&itzma_core::CompactionOptions::default())
+        .await
+        .unwrap();
+    let cheap = Predicate::number("price", Compare::Lt, 20.0);
+    let mut read = Vec::new();
+    for policy in [
+        itzma_core::FetchPolicy::default(),
+        itzma_core::FetchPolicy::default().align(1),
+    ] {
+        let cache =
+            itzma_core::CacheStore::new(counting.clone(), itzma_core::CacheOptions::default())
+                .unwrap();
+        let ns = Namespace::open(counting.clone(), "docs")
+            .await
+            .unwrap()
+            .with_fetch_policy(policy)
+            .with_cache(Arc::new(cache));
+        counting.reset();
+        ns.filter(&cheap, &FilterOptions::default()).await.unwrap();
+        read.push(counting.bytes());
+    }
+    assert!(
+        read[0] > read[1],
+        "aligned reads fetched {} bytes, unaligned {}",
+        read[0],
+        read[1]
+    );
+}
