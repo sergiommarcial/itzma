@@ -16,6 +16,9 @@ that section into the version's notes.
   changes from run to run, so float rounding could move a score by a bit
   between two identical queries and differ from the flat path. Terms are now
   summed in ascending term id.
+- A write key reused for a different batch of the same size was taken for a
+  retry, and the second batch was silently dropped. The bodies are now
+  compared when the lengths agree, and a different batch is `KeyConflict`.
 
 ## [0.3.0] - 2026-11-27
 
