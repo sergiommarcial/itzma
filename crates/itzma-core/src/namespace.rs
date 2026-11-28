@@ -111,6 +111,12 @@ pub struct Namespace {
     /// Defaults to [`FetchPolicy::object_store`]; set it with
     /// [`with_fetch_policy`](Self::with_fetch_policy).
     fetch_policy: FetchPolicy,
+    /// What the readers use: `fetch_policy`, with its `align` dropped while no
+    /// cache sits under `query_store`, since widening a read only pays when a
+    /// later read can hit the widened key (see `refresh_read_policy`).
+    read_policy: FetchPolicy,
+    /// Whether [`with_cache`](Self::with_cache) was called.
+    cached: bool,
     /// Parsed structures kept between queries, set with
     /// [`with_decoded_cache`](Self::with_decoded_cache).
     decoded_cache: Option<Arc<DecodedCache>>,
@@ -285,6 +291,8 @@ impl Namespace {
             wal_level: AtomicU32::new(manifest.wal_format),
             read_budget: DEFAULT_READ_BUDGET,
             fetch_policy: FetchPolicy::object_store(),
+            read_policy: FetchPolicy::object_store().align(1),
+            cached: false,
             decoded_cache: None,
             views: view::Views::new(),
         }
@@ -343,7 +351,21 @@ impl Namespace {
     /// ```
     pub fn with_cache(mut self, cached: Arc<dyn ObjectStore>) -> Self {
         self.query_store = cached;
+        self.cached = true;
+        self.refresh_read_policy();
         self
+    }
+
+    /// Set `read_policy` from `fetch_policy` and whether a cache is attached.
+    /// [`FetchPolicy::align`] rounds reads out so nearby ones share a cache
+    /// key; with no cache each small block read just fetches a window the
+    /// next block fetches again.
+    fn refresh_read_policy(&mut self) {
+        self.read_policy = if self.cached {
+            self.fetch_policy
+        } else {
+            self.fetch_policy.align(1)
+        };
     }
 
     /// Keep what the query path parses (index heads and partitions, segment
@@ -449,8 +471,13 @@ impl Namespace {
     /// tuned for S3 and similar stores; pass [`FetchPolicy::local`] for an
     /// `InMemory` or `LocalFileSystem` store, where a request costs about as
     /// much as the bytes it reads.
+    ///
+    /// [`align`](FetchPolicy::align) takes effect only once
+    /// [`with_cache`](Self::with_cache) has attached a cache: without one a
+    /// widened read cannot be shared, and the extra bytes are pure cost.
     pub fn with_fetch_policy(mut self, policy: FetchPolicy) -> Self {
         self.fetch_policy = policy;
+        self.refresh_read_policy();
         self
     }
 
@@ -989,7 +1016,7 @@ impl Namespace {
             manifest.clone(),
             options,
             self.read_budget,
-            &self.fetch_policy,
+            &self.read_policy,
         )
         .await;
         match outcome {
@@ -1093,7 +1120,7 @@ impl Namespace {
                 manifest.indexes.get(id),
                 options,
                 self.read_budget,
-                &self.fetch_policy,
+                &self.read_policy,
             )
             .await;
             let outcome = match outcome {
@@ -1182,7 +1209,7 @@ impl Namespace {
                 manifest.sparse_indexes.get(id),
                 options,
                 self.read_budget,
-                &self.fetch_policy,
+                &self.read_policy,
             )
             .await;
             let outcome = match outcome {
@@ -1687,7 +1714,7 @@ impl Namespace {
             top_k,
             options,
             budget,
-            policy: &self.fetch_policy,
+            policy: &self.read_policy,
             registry: &Builtin,
             decoded: decoded.as_ref(),
         };
@@ -1783,7 +1810,7 @@ impl Namespace {
                 top_k,
                 filter: options.filter.as_ref(),
                 budget: &budget,
-                policy: &self.fetch_policy,
+                policy: &self.read_policy,
                 decoded: decoded.as_ref(),
             };
             let reader = self.reader(&budget);
@@ -1892,7 +1919,7 @@ impl Namespace {
                 limit: options.limit,
                 after: options.after.as_deref(),
                 budget: &budget,
-                policy: &self.fetch_policy,
+                policy: &self.read_policy,
                 decoded: decoded.as_ref(),
             };
             let reader = self.reader(&budget);
