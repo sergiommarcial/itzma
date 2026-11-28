@@ -178,6 +178,9 @@ jobs:
 
   pypi:
     needs: crates-io
+    # ci is skipped when it already passed; without this the skip would
+    # cascade down the chain.
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -193,6 +196,9 @@ jobs:
 
   github-release:
     needs: pypi
+    # ci is skipped when it already passed; without this the skip would
+    # cascade down the chain.
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
