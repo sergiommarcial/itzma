@@ -49,10 +49,13 @@ pub struct CompactionOptions {
     pub max_segments: usize,
     /// The most stored bytes one segment's `data.bin` may hold. A merge
     /// produces as many size-balanced, contiguous segments as this cap
-    /// requires, instead of collapsing everything into one. Only the data object's size counts, never an
-    /// index object beside it. A merge needs it at or under the handle's
-    /// read budget, since it reads each group under a budget of its own;
-    /// see [`validate`](Self::validate).
+    /// requires, instead of collapsing everything into one. The trigger looks
+    /// at `data.bin` only, never an index object beside it; a merge sizes its
+    /// groups by what each segment charges its budget, `sparse.bin` included,
+    /// so with heavy sparse vectors the outputs come out smaller than the cap.
+    /// A merge needs it at or under the handle's read budget, since it reads
+    /// each group under a budget of its own; see
+    /// [`validate`](Self::validate).
     pub max_segment_bytes: u64,
 }
 
@@ -67,9 +70,10 @@ impl CompactionOptions {
     /// [`ItzmaError::InvalidConfig`] when `max_segment_bytes` is above
     /// `read_budget`: a merge group that size could never be read.
     ///
-    /// Passing is necessary, not sufficient: a group can exceed the cap, and
-    /// is also charged its `sparse.bin`, so keep the budget well above the cap
-    /// (the defaults are 1 GiB and 128 MiB).
+    /// A merge sizes its groups by what each segment charges (`data.bin`,
+    /// `sparse.bin` and the guesses of a ranged open) and splits any group
+    /// over the cap, so once this passes every group fits the budget, unless
+    /// one segment alone charges more than it.
     pub fn validate(&self, read_budget: u64) -> Result<()> {
         if self.max_segment_bytes > read_budget {
             return Err(ItzmaError::InvalidConfig(
@@ -202,15 +206,50 @@ fn partition(sizes: &[u64], target_count: usize) -> Vec<usize> {
 /// helper only needs to be a reasonable planning estimate, never a source of
 /// truth).
 fn data_size(found: &std::collections::BTreeMap<String, gc::Found>, id: &str) -> u64 {
+    object_size(found, id, "data.bin")
+}
+
+/// [`data_size`] for any object of the segment's directory, `sparse.bin` in
+/// particular (0 for a segment without one).
+fn object_size(found: &std::collections::BTreeMap<String, gc::Found>, id: &str, name: &str) -> u64 {
     found
         .get(id)
         .and_then(|f| {
             f.objects
                 .iter()
-                .find(|(path, _)| path.filename() == Some("data.bin"))
+                .find(|(path, _)| path.filename() == Some(name))
         })
         .map(|(_, size)| *size)
         .unwrap_or(0)
+}
+
+/// `cuts` (from [`partition`]) with every group of more than one unit whose
+/// sizes add up to more than `limit` partitioned again, into as many groups
+/// as its sum over `limit` asks, until each fits or holds one unit. A merge
+/// charges each group to a budget of its own, so `limit` is that budget,
+/// not the cap: `partition` aims at the cap, and a group a little over it
+/// (each windowed segment adds its open's guesses) must still merge rather
+/// than fall apart into groups of one that rewrite the same ranges.
+/// Pure.
+fn fit(sizes: &[u64], cuts: Vec<usize>, limit: u64) -> Vec<usize> {
+    let cap = limit.max(1);
+    let mut out = Vec::with_capacity(cuts.len());
+    let mut start = 0;
+    for end in cuts {
+        let group = &sizes[start..end];
+        let sum: u64 = group.iter().sum();
+        if group.len() > 1 && sum > cap {
+            let count = usize::try_from(sum.div_ceil(cap))
+                .unwrap_or(usize::MAX)
+                .max(2);
+            let inner = fit(group, partition(group, count), cap);
+            out.extend(inner.into_iter().map(|cut| start + cut));
+        } else {
+            out.push(end);
+        }
+        start = end;
+    }
+    out
 }
 
 /// One compaction run against a manifest the caller has already loaded and
@@ -255,17 +294,22 @@ pub(crate) async fn run(
     struct Unit {
         lo: u64,
         hi: u64,
-        size: u64,
+        /// Its objects' bytes: what it adds to an output segment.
+        stored: u64,
+        /// What merging it charges its group's budget.
+        charge: u64,
     }
     let mut units: Vec<Unit> = live
         .iter()
         .map(|id| {
             let (lo, hi) = segment::parse_segment_id(id)
                 .expect("manifest invariant already validated by load_manifest");
+            let (data, sparse) = (data_size(&found, id), object_size(&found, id, "sparse.bin"));
             Unit {
                 lo,
                 hi,
-                size: data_size(&found, id),
+                stored: data.saturating_add(sparse),
+                charge: merge::charge_estimate(data, sparse, merge::MERGE_WINDOW),
             }
         })
         .collect();
@@ -273,10 +317,13 @@ pub(crate) async fn run(
         units.push(Unit {
             lo: folded + 1,
             hi: last_seq,
-            size: tail_size_estimate,
+            stored: tail_size_estimate,
+            charge: tail_size_estimate,
         });
     }
-    let total_bytes: u64 = units.iter().map(|u| u.size).sum();
+    // The outputs' count comes from what they will hold; the charges only
+    // decide whether a group fits its budget.
+    let total_bytes: u64 = units.iter().map(|u| u.stored).sum();
 
     let plan = plan(
         live.len(),
@@ -330,8 +377,9 @@ pub(crate) async fn run(
         }
         Plan::Merge { target_count } => {
             options.validate(read_budget)?;
-            let sizes: Vec<u64> = units.iter().map(|u| u.size).collect();
-            let cuts = partition(&sizes, target_count);
+            let stored: Vec<u64> = units.iter().map(|u| u.stored).collect();
+            let charges: Vec<u64> = units.iter().map(|u| u.charge).collect();
+            let cuts = fit(&charges, partition(&stored, target_count), read_budget);
             let merged_segments = live.len();
 
             let mut new_live = Vec::with_capacity(cuts.len());
@@ -358,7 +406,8 @@ pub(crate) async fn run(
                         schema.dim,
                         &group_budget,
                         policy,
-                        data_size(&found, &seg_ids[i]),
+                        data_size(&found, &seg_ids[i])
+                            + object_size(&found, &seg_ids[i], "sparse.bin"),
                         merge::MERGE_WINDOW,
                     )
                 }))
@@ -584,7 +633,7 @@ mod tests {
 
 #[cfg(test)]
 mod partition_tests {
-    use super::partition;
+    use super::{fit, partition};
 
     #[test]
     fn below_the_cap_makes_one_group() {
@@ -611,6 +660,29 @@ mod partition_tests {
     #[test]
     fn zero_units_returns_one_empty_group() {
         assert_eq!(partition(&[], 3), vec![0]);
+    }
+
+    #[test]
+    fn a_group_over_the_cap_is_split_until_each_fits() {
+        // Balanced into three, the middle group is 80 under a cap of 60.
+        let sizes = [40, 40, 40, 40];
+        assert_eq!(partition(&sizes, 3), vec![1, 3, 4]);
+        assert_eq!(fit(&sizes, partition(&sizes, 3), 60), vec![1, 2, 3, 4]);
+        // A unit over the cap alone stays a group of one.
+        assert_eq!(fit(&[10, 90, 10], vec![3], 50), vec![1, 2, 3]);
+        // Groups already under the cap are kept as they are.
+        assert_eq!(fit(&[10, 10, 10, 10], vec![2, 4], 20), vec![2, 4]);
+        for cap in 1..=50 {
+            let sizes = [7, 3, 9, 1, 4, 12, 2, 8];
+            let cuts = fit(&sizes, partition(&sizes, 2), cap);
+            let mut start = 0;
+            for &end in &cuts {
+                let sum: u64 = sizes[start..end].iter().sum();
+                assert!(end - start == 1 || sum <= cap, "cap {cap}: {cuts:?}");
+                start = end;
+            }
+            assert_eq!(start, sizes.len());
+        }
     }
 
     #[test]
