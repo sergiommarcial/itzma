@@ -10,6 +10,13 @@ that section into the version's notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- An indexed sparse query summed a row's terms in a `HashMap`'s order, which
+  changes from run to run, so float rounding could move a score by a bit
+  between two identical queries and differ from the flat path. Terms are now
+  summed in ascending term id.
+
 ## [0.3.0] - 2026-11-27
 
 ### Security

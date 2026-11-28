@@ -553,3 +553,54 @@ async fn an_unchanged_tail_is_listed_but_not_fetched_again() {
     assert_eq!(paths.len(), 1, "{paths:?}");
     assert!(paths[0].ends_with("manifest/current.json"), "{paths:?}");
 }
+
+/// Float addition is not associative, so the order an indexed query sums a
+/// row's terms in is part of its answer. It was the order of a `HashMap`,
+/// which differs on every run; it is now ascending term id, the order of a
+/// document whose terms are ascending, so the bits equal the flat path's.
+#[tokio::test]
+async fn an_indexed_query_scores_in_a_fixed_order_and_matches_the_flat_bits() {
+    let ns = create(common::memory()).await;
+    let weight = |d: u32, t: u32| {
+        0.1 + ((d * 7 + t * 13) % 11) as f32 * 0.37 + if t.is_multiple_of(5) { 1e4 } else { 0.0 }
+    };
+    let docs: Vec<Document> = (0..30u32)
+        .map(|d| {
+            let terms: Vec<(u32, f32)> = (0..40u32).map(|t| (t, weight(d, t))).collect();
+            sdoc(&format!("d{d:02}"), &terms)
+        })
+        .collect();
+    ns.upsert(docs).await.expect("upsert");
+    ns.compact(&ROOMY).await.expect("compact");
+    let query: SparseVector = (0..40u32)
+        .map(|t| {
+            (
+                t,
+                0.05 + ((t * 3) % 7) as f32 * 0.3 + if t.is_multiple_of(4) { 1e3 } else { 0.0 },
+            )
+        })
+        .collect();
+    let bits = |hits: Vec<itzma_core::Hit>| -> Vec<(String, u32)> {
+        hits.into_iter()
+            .map(|h| (h.id, h.distance.to_bits()))
+            .collect()
+    };
+    let flat = bits(
+        ns.query_sparse(&query, 30, &SparseQueryOptions::default())
+            .await
+            .expect("flat"),
+    );
+    assert_eq!(flat.len(), 30);
+    ns.index_sparse(&IndexSparseOptions::default())
+        .await
+        .expect("index_sparse");
+    // Every call builds its own `HashMap`, with its own random order.
+    for run in 0..60 {
+        let indexed = bits(
+            ns.query_sparse(&query, 30, &SparseQueryOptions::default())
+                .await
+                .expect("indexed"),
+        );
+        assert_eq!(indexed, flat, "run {run}");
+    }
+}

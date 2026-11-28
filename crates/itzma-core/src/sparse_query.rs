@@ -306,8 +306,15 @@ async fn evaluate_indexed(
     source: &Indexed<'_>,
     weights: &HashMap<u32, f32>,
 ) -> Result<Vec<Scored>> {
+    // Ascending term id, not the map's order: a row's score is summed in the
+    // order its terms' postings come, float addition is not associative, and
+    // a `HashMap`'s order changes from run to run. Ascending is the order of
+    // a document whose terms are ascending, so such a row scores the same
+    // bits here as on the flat path.
+    let mut ordered: Vec<(u32, f32)> = weights.iter().map(|(&t, &w)| (t, w)).collect();
+    ordered.sort_unstable_by_key(|&(term, _)| term);
     let mut postings: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
-    for (&term, &weight) in weights {
+    for (term, weight) in ordered {
         let Some(entry) = source.dir.find(term) else {
             continue;
         };
