@@ -640,3 +640,337 @@ async fn versions_2_and_3_together_answer_like_a_replay() {
         check_stage(&ns, &b.store, &oracles, "versions 2 and 3 and a tail").await;
     }
 }
+
+/// A segment's small block reads must not each be widened to the policy's
+/// `align` when no cache sits underneath, since nothing would share the
+/// widened window: the default policy read many times the columns a filter
+/// needs before alignment was tied to a cache. With a cache the alignment
+/// still applies.
+#[tokio::test]
+async fn an_uncached_filter_does_not_align_its_block_reads() {
+    let counting = Arc::new(CountingStore::default());
+    let ns = Namespace::create(counting.clone(), "docs", typed())
+        .await
+        .unwrap();
+    ns.upgrade_segment_format(3).await.unwrap();
+    let mut lcg = Lcg(11);
+    for chunk in 0..4 {
+        ns.upsert(batch(&mut lcg, chunk * 5_000, 5_000))
+            .await
+            .unwrap();
+    }
+    ns.compact(&itzma_core::CompactionOptions::default())
+        .await
+        .unwrap();
+    let cheap = Predicate::number("price", Compare::Lt, 20.0);
+    let mut read = Vec::new();
+    for policy in [
+        itzma_core::FetchPolicy::default(),
+        itzma_core::FetchPolicy::default().align(1),
+    ] {
+        let ns = Namespace::open(counting.clone(), "docs")
+            .await
+            .unwrap()
+            .with_fetch_policy(policy);
+        counting.reset();
+        ns.filter(&cheap, &FilterOptions::default()).await.unwrap();
+        read.push(counting.bytes());
+    }
+    assert_eq!(
+        read[0], read[1],
+        "the default policy read {} bytes, without alignment {}",
+        read[0], read[1]
+    );
+}
+
+/// With a cache under the handle alignment still applies: reads are rounded
+/// out to the policy's grid, so more bytes come from the origin than unaligned
+/// reads would fetch, and the extra bytes are what later reads share.
+#[tokio::test]
+async fn a_cached_filter_still_aligns_its_block_reads() {
+    let counting = Arc::new(CountingStore::default());
+    let ns = Namespace::create(counting.clone(), "docs", typed())
+        .await
+        .unwrap();
+    ns.upgrade_segment_format(3).await.unwrap();
+    let mut lcg = Lcg(11);
+    for chunk in 0..4 {
+        ns.upsert(batch(&mut lcg, chunk * 5_000, 5_000))
+            .await
+            .unwrap();
+    }
+    ns.compact(&itzma_core::CompactionOptions::default())
+        .await
+        .unwrap();
+    let cheap = Predicate::number("price", Compare::Lt, 20.0);
+    let mut read = Vec::new();
+    for policy in [
+        itzma_core::FetchPolicy::default(),
+        itzma_core::FetchPolicy::default().align(1),
+    ] {
+        let cache =
+            itzma_core::CacheStore::new(counting.clone(), itzma_core::CacheOptions::default())
+                .unwrap();
+        let ns = Namespace::open(counting.clone(), "docs")
+            .await
+            .unwrap()
+            .with_fetch_policy(policy)
+            .with_cache(Arc::new(cache));
+        counting.reset();
+        ns.filter(&cheap, &FilterOptions::default()).await.unwrap();
+        read.push(counting.bytes());
+    }
+    assert!(
+        read[0] > read[1],
+        "aligned reads fetched {} bytes, unaligned {}",
+        read[0],
+        read[1]
+    );
+}
+
+/// `count` documents whose price is their position (0, 1, 2 ...), so the
+/// blocks of a segment hold disjoint price ranges and a selective filter has
+/// blocks it can skip.
+fn ramp(from: usize, count: usize, price_of: impl Fn(usize) -> f64) -> Vec<Document> {
+    (from..from + count)
+        .map(|n| item(&format!("d{n:05}"), json!({"price": price_of(n)})))
+        .collect()
+}
+
+async fn ids_under(ns: &Namespace, limit: f64) -> Vec<String> {
+    all_pages(ns, &Predicate::number("price", Compare::Lt, limit), 10_000).await
+}
+
+/// A block whose zone map says no row matches still takes its place in the
+/// merge: a newer segment's non-matching copy hides an older match that sits
+/// in a block of its own, and an older block nothing matches in does not hide
+/// a newer match.
+#[tokio::test]
+async fn a_skipped_block_still_shadows_and_is_still_shadowed() {
+    for b in cas_backends() {
+        eprintln!("backend: {}", b.name);
+        let ns = Namespace::create(b.store.clone(), "docs", typed())
+            .await
+            .unwrap();
+        ns.upgrade_segment_format(3).await.unwrap();
+        // Older segment: three blocks of 256, prices 0..768.
+        ns.upsert(ramp(0, 768, |n| n as f64)).await.unwrap();
+        ns.compact(&ROOMY).await.unwrap();
+        assert_eq!(ids_under(&ns, 20.0).await.len(), 20);
+
+        // Newer segment: d00005 (a match, first block) and d00700 (not a
+        // match, last block) swap sides. The newer copies sit in blocks the
+        // filter can skip or must read, whichever way the walk goes.
+        ns.upsert(vec![
+            item("d00005", json!({"price": 900.0})),
+            item("d00700", json!({"price": 1.0})),
+        ])
+        .await
+        .unwrap();
+        ns.compact(&ROOMY).await.unwrap();
+        assert_eq!(common::live_segment_versions(&*b.store).await, [3, 3]);
+        let got = ids_under(&ns, 20.0).await;
+        assert!(!got.contains(&"d00005".to_owned()), "stale match came back");
+        assert!(got.contains(&"d00700".to_owned()), "newer match was lost");
+        assert_eq!(got.len(), 20);
+
+        // A tombstone in the tail removes a match from a block that is read;
+        // one removing a row of a skipped block changes nothing.
+        ns.delete(vec!["d00007".into(), "d00500".into()])
+            .await
+            .unwrap();
+        let got = ids_under(&ns, 20.0).await;
+        assert!(!got.contains(&"d00007".to_owned()));
+        assert_eq!(got.len(), 19);
+        // And the answer is the replay's.
+        let want = expected(&b.store, |d| {
+            d.attrs
+                .as_ref()
+                .and_then(|a| a["price"].as_f64())
+                .is_some_and(|p| p < 20.0)
+        })
+        .await;
+        assert_eq!(got, want);
+    }
+}
+
+/// Sorted data across versions 2 and 3 with a tail: the answer is the
+/// replay's for filters that skip most blocks and filters that skip none.
+#[tokio::test]
+async fn skipping_blocks_equals_a_replay_across_versions_2_and_3() {
+    for b in cas_backends() {
+        eprintln!("backend: {}", b.name);
+        let ns = Namespace::create(b.store.clone(), "docs", typed())
+            .await
+            .unwrap();
+        ns.upsert(ramp(0, 600, |n| n as f64)).await.unwrap();
+        ns.compact(&ROOMY).await.unwrap();
+        ns.upgrade_segment_format(2).await.unwrap();
+        ns.upsert(ramp(300, 600, |n| (n * 2) as f64)).await.unwrap();
+        ns.compact(&ROOMY).await.unwrap();
+        ns.upgrade_segment_format(3).await.unwrap();
+        ns.upsert(ramp(800, 600, |n| (n % 97) as f64))
+            .await
+            .unwrap();
+        ns.compact(&ROOMY).await.unwrap();
+        ns.delete((0..1400).step_by(13).map(|n| format!("d{n:05}")).collect())
+            .await
+            .unwrap();
+        ns.upsert(ramp(1300, 100, |n| n as f64 / 10.0))
+            .await
+            .unwrap();
+        assert_eq!(common::live_segment_versions(&*b.store).await, [2, 2, 3]);
+        let oracles: [Oracle; 3] = [
+            price_under_20(),
+            (Predicate::number("price", Compare::Gt, 1500.0), |d| {
+                d.attrs
+                    .as_ref()
+                    .and_then(|a| a["price"].as_f64())
+                    .is_some_and(|p| p > 1500.0)
+            }),
+            (Predicate::number("price", Compare::Ge, 0.0), |d| {
+                d.attrs.is_some()
+            }),
+        ];
+        check_stage(&ns, &b.store, &oracles, "sorted, three versions and a tail").await;
+    }
+}
+
+/// The same 5,000 prices, once in order and once shuffled, in format 3. A
+/// selective filter reads fewer bytes when the zone maps can rule blocks out.
+#[tokio::test]
+async fn a_selective_filter_on_sorted_data_reads_fewer_bytes_than_on_shuffled_data() {
+    let predicate = Predicate::number("price", Compare::Lt, 100.0);
+    let mut bytes = Vec::new();
+    for shuffled in [false, true] {
+        let store = Arc::new(CountingStore::default());
+        let ns = Namespace::create(store.clone() as Arc<dyn ObjectStore>, "docs", typed())
+            .await
+            .unwrap()
+            .with_fetch_policy(itzma_core::FetchPolicy::local());
+        ns.upgrade_segment_format(3).await.unwrap();
+        // 1237 shares no factor with 5000, so the stride visits every price once.
+        let docs = ramp(0, 5000, |n| {
+            if shuffled {
+                ((n * 1237) % 5000) as f64
+            } else {
+                n as f64
+            }
+        });
+        // Ids stay in order, so only the prices' placement differs.
+        ns.upsert(docs).await.unwrap();
+        ns.compact(&CompactionOptions::default()).await.unwrap();
+        store.reset();
+        let page = ns
+            .filter(&predicate, &FilterOptions::default().limit(10_000))
+            .await
+            .unwrap();
+        assert_eq!(page.rows.len(), 100);
+        bytes.push(store.bytes());
+    }
+    assert!(
+        bytes[0] * 5 < bytes[1] * 4,
+        "sorted read {} bytes, shuffled {}: the zone maps should spare the skipped blocks' attributes (their ids are still read)",
+        bytes[0],
+        bytes[1]
+    );
+}
+
+const WIDE: usize = 10;
+
+fn wide() -> Schema {
+    Schema::new(DIM, Metric::L2).with_attrs((0..WIDE).fold(AttrSchema::new(), |attrs, f| {
+        attrs.field(format!("f{f}"), AttrType::Number)
+    }))
+}
+
+/// Ten number fields; `f0` is 0 or 1000 by row parity, so every block's zone
+/// map spans 0 to 1000 and says "maybe" to anything between, and the others
+/// are distinct per row.
+fn wide_docs(count: usize) -> Vec<Document> {
+    (0..count)
+        .map(|n| {
+            let mut attrs = serde_json::Map::new();
+            attrs.insert("f0".into(), json!(if n % 2 == 0 { 0.0 } else { 1000.0 }));
+            for f in 1..WIDE {
+                attrs.insert(format!("f{f}"), json!((n * 31 + f * 7) as f64));
+            }
+            item(&format!("d{n:05}"), Value::Object(attrs))
+        })
+        .collect()
+}
+
+async fn wide_namespace(store: Arc<CountingStore>, count: usize) -> Namespace {
+    let ns = Namespace::create(store as Arc<dyn ObjectStore>, "docs", wide())
+        .await
+        .unwrap()
+        .with_fetch_policy(itzma_core::FetchPolicy::local());
+    ns.upgrade_segment_format(3).await.unwrap();
+    ns.upsert(wide_docs(count)).await.unwrap();
+    ns.compact(&CompactionOptions::default()).await.unwrap();
+    ns
+}
+
+/// A filter on one field of a ten-field namespace, over blocks whose zone
+/// maps cannot decide it, reads that field's column and nothing else of a
+/// block no row of which matches.
+#[tokio::test]
+async fn a_block_nothing_matches_in_costs_one_column_not_the_whole_block() {
+    let store = Arc::new(CountingStore::default());
+    let ns = wide_namespace(store.clone(), 2048).await;
+    let options = FilterOptions::default().limit(10_000);
+
+    // f9 >= 0 holds in every block, so the zone maps say "always": the whole
+    // attribute block is read for the rows it returns. That is the price of
+    // every attribute.
+    store.reset();
+    let everything = ns
+        .filter(&Predicate::number("f9", Compare::Ge, 0.0), &options)
+        .await
+        .unwrap();
+    assert_eq!(everything.rows.len(), 2048);
+    let whole = store.bytes();
+
+    store.reset();
+    let none = ns
+        .filter(&Predicate::number("f0", Compare::Eq, 500.0), &options)
+        .await
+        .unwrap();
+    assert!(none.rows.is_empty());
+    let projected = store.bytes();
+
+    // The zone maps rule out every block: ids, zones and the opening alone.
+    store.reset();
+    ns.filter(&Predicate::number("f0", Compare::Lt, -1.0), &options)
+        .await
+        .unwrap();
+    let floor = store.bytes();
+    assert!(
+        (projected - floor) * 3 < whole - floor,
+        "a filter nothing matches read {projected} bytes, {floor} of them unavoidable, against {whole} for every attribute: only f0's column should be fetched"
+    );
+}
+
+/// Rows that do match come back whole, every field as stored, whatever the
+/// projection read to find them.
+#[tokio::test]
+async fn rows_found_through_a_projection_carry_every_attribute() {
+    let store = Arc::new(CountingStore::default());
+    let ns = wide_namespace(store, 600).await;
+    let page = ns
+        .filter(
+            &Predicate::number("f0", Compare::Eq, 1000.0),
+            &FilterOptions::default().limit(10_000),
+        )
+        .await
+        .unwrap();
+    let want: Vec<Document> = wide_docs(600)
+        .into_iter()
+        .filter(|d| d.attrs.as_ref().is_some_and(|a| a["f0"] == json!(1000.0)))
+        .collect();
+    assert_eq!(page.rows.len(), want.len());
+    for (row, doc) in page.rows.iter().zip(&want) {
+        assert_eq!(row.id, doc.id);
+        assert_eq!(row.attrs, doc.attrs);
+    }
+}

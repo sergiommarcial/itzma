@@ -28,10 +28,16 @@ mod view;
 mod writer;
 mod zone;
 
+pub(crate) use columns::{Column, ColumnBlock, Field, Values};
+#[cfg(test)]
+pub(crate) use columns::{Texts, fields_of};
 pub(crate) use ranged::{DocWindow, Held, RangedSegment};
 pub(crate) use v2::BLOCK_ROWS;
 pub(crate) use view::SegmentView;
 pub(crate) use writer::{AttrIn, Chunks, SegmentWriter, attr_json, encode_attr_block};
+pub(crate) use zone::{TextZone, ZoneEntry, ZoneStats};
+#[cfg(test)]
+pub(crate) use zone::{decode_zone, encode_zone};
 
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -480,6 +486,10 @@ impl<'a> Reader<'a> {
 
     fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.array()?))
+    }
+
+    fn f64(&mut self) -> Result<f64> {
+        Ok(f64::from_le_bytes(self.array()?))
     }
 
     fn string(&mut self, what: &str) -> Result<String> {

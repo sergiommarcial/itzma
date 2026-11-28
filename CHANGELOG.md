@@ -24,6 +24,11 @@ that section into the version's notes.
   past the read budget that `CompactionOptions::validate` had accepted. Groups
   are now sized by what each segment charges (both objects and the ranged
   open's guesses) and split to fit.
+- `FetchPolicy::align` rounded every small block read out to its grid even
+  when no cache sat under the handle, so each block fetched a window nobody
+  shared. In a test on 20,000 documents, a `filter` read about 1.9 times the
+  bytes it needed. A `Namespace` now applies `align` only after `with_cache`;
+  without a cache, reads are exact.
 
 ### Changed
 
@@ -32,6 +37,13 @@ that section into the version's notes.
   `ef`. The rows returned are those a fresh search for that many returns,
   apart from nodes at exactly the same distance, which may be expanded in a
   different order. Not measured on a real store yet.
+- On segment format 3 (`upgrade_segment_format(3)`), `filter` and filtered
+  `query_with` and `query_sparse` use what the segment already stores. A block
+  whose zone map rules the predicate out is read for its ids only, a block the
+  zone map cannot decide is evaluated on the columns the predicate names, and
+  only the rows that match have their attributes read. A top-level `And` runs
+  its most selective conjunct first. Answers are the same, and segment format
+  2 is unchanged. New namespaces still start at segment format 2.
 
 ## [0.3.0] - 2026-11-27
 

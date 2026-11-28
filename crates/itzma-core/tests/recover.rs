@@ -625,6 +625,7 @@ async fn a_namespace_at_level_3_is_recovered_at_level_3() {
         let ns = Namespace::create(b.store.clone(), "docs", common::schema(DIM, L2))
             .await
             .unwrap();
+        common::set_segment_format(&*b.store, 2).await;
         ns.upsert(vec![doc("a", &[1.0, 0.0])]).await.unwrap();
         ns.compact(&ROOMY).await.unwrap();
         ns.upgrade_segment_format(3).await.unwrap();

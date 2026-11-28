@@ -360,12 +360,16 @@ async fn evaluate_indexed(
             .collect();
         // The attributes are fetched once per chunk for the live rows only, and
         // stay on the hit so `finish` does not fetch them again.
-        let fetched = match q.filter {
+        let rows: Vec<u32> = survivors.iter().map(|(row, _, _)| *row).collect();
+        // A version 3 segment decides from its zone maps and the predicate's
+        // columns, and the attributes of the rows that pass wait for `finish`.
+        let decided = match q.filter {
+            Some(predicate) => source.segment.eligible_of(predicate, &rows).await?,
             None => None,
-            Some(_) => {
-                let rows: Vec<u32> = survivors.iter().map(|(row, _, _)| *row).collect();
-                Some(source.segment.attrs_of(&rows).await?)
-            }
+        };
+        let fetched = match (q.filter, &decided) {
+            (Some(_), None) => Some(source.segment.attrs_of(&rows).await?),
+            _ => None,
         };
         for (n, (row, score, id)) in survivors.into_iter().enumerate() {
             let attrs = match (&fetched, q.filter) {
@@ -376,7 +380,12 @@ async fn evaluate_indexed(
                     }
                     Attrs::Have(value)
                 }
-                _ => Attrs::Row(row),
+                _ => {
+                    if decided.as_ref().is_some_and(|decided| !decided[n]) {
+                        continue;
+                    }
+                    Attrs::Row(row)
+                }
             };
             kept.push(Scored {
                 distance: -score,

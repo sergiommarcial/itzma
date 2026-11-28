@@ -105,9 +105,43 @@ impl Bitmap {
         self.words[i / 64] & (1 << (i % 64)) != 0
     }
 
-    #[cfg(test)]
+    /// How many bits are set.
     pub(crate) fn count(&self) -> usize {
         self.words.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// `len` bits, all set.
+    pub(crate) fn full(len: usize) -> Self {
+        let mut words = vec![u64::MAX; len.div_ceil(64)];
+        if !len.is_multiple_of(64) {
+            if let Some(last) = words.last_mut() {
+                *last = (1u64 << (len % 64)) - 1;
+            }
+        }
+        Self { words, len }
+    }
+
+    /// No bit is set.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.words.iter().all(|w| *w == 0)
+    }
+
+    /// Set every bit `other` sets. Both are the same length.
+    pub(crate) fn union_with(&mut self, other: &Bitmap) {
+        debug_assert_eq!(self.len, other.len);
+        self.words
+            .iter_mut()
+            .zip(&other.words)
+            .for_each(|(a, b)| *a |= b);
+    }
+
+    /// Clear every bit `other` sets. Both are the same length.
+    pub(crate) fn subtract(&mut self, other: &Bitmap) {
+        debug_assert_eq!(self.len, other.len);
+        self.words
+            .iter_mut()
+            .zip(&other.words)
+            .for_each(|(a, b)| *a &= !b);
     }
 }
 
@@ -141,5 +175,19 @@ mod tests {
         assert_eq!(bits.len(), 130);
         assert_eq!(bits.count(), 4);
         assert!(bits.get(63) && bits.get(64) && !bits.get(65));
+    }
+
+    #[test]
+    fn a_bitmap_combines_with_union_subtract_and_full() {
+        let mut full = Bitmap::full(130);
+        assert_eq!(full.count(), 130);
+        assert!(!full.is_empty() && Bitmap::new(130).is_empty() && Bitmap::full(0).is_empty());
+        let mut odd = Bitmap::new(130);
+        (1..130).step_by(2).for_each(|i| odd.set(i));
+        full.subtract(&odd);
+        assert_eq!(full.count(), 65);
+        assert!(full.get(0) && !full.get(1) && full.get(128));
+        full.union_with(&odd);
+        assert_eq!(full, Bitmap::full(130));
     }
 }

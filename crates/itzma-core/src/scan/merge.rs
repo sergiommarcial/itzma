@@ -13,9 +13,9 @@
 //! needs it, and the vector matrix is never read. A run of version 1 segments
 //! has no blocks and is decoded whole.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::future::try_join_all;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -23,11 +23,13 @@ use object_store::ObjectStore;
 use serde_json::Value;
 
 use crate::budget::ReadBudget;
+use crate::columnar::Bitmap;
 use crate::decoded::DecodedRef;
 use crate::error::Result;
 use crate::fetch::FetchPolicy;
 use crate::layer::{Layer, NewestWins};
-use crate::segment::RangedSegment;
+use crate::predicate::{Passes, Predicate, Tri};
+use crate::segment::{BLOCK_ROWS, RangedSegment};
 
 /// Requests in flight at once when the segments are opened.
 const FETCH_CONCURRENCY: usize = 16;
@@ -35,6 +37,10 @@ const FETCH_CONCURRENCY: usize = 16;
 /// What one source holds for one id.
 pub(crate) enum Body {
     Doc(Option<Value>),
+    /// A row the scan's predicate cannot match, known from its block's zone
+    /// map or its columns: its id is read so it still shadows an older
+    /// source's copy, and its attributes are not.
+    NonMatchingDoc,
     Tombstone,
 }
 
@@ -60,6 +66,10 @@ pub(crate) struct Open<'a> {
     /// decoded cache.
     pub(crate) decoded: Option<&'a DecodedRef>,
     pub(crate) after: Option<&'a str>,
+    /// The predicate a filter page applies, if any. With one, a version 3
+    /// segment's blocks are judged by their zone maps before any attribute is
+    /// read.
+    pub(crate) predicate: Option<&'a Predicate>,
 }
 
 /// A source of entries in strictly ascending id order.
@@ -92,6 +102,21 @@ pub(crate) struct SegmentSource<'a> {
     docs: Side,
     tombstones: Side,
     after: Option<String>,
+    /// What the segment's zone maps say of the predicate for each block, on a
+    /// version 3 segment. A `Never` block is read for its ids only.
+    verdicts: Option<Vec<Tri>>,
+    /// The predicate and the positions of the columns it reads, on a version 3
+    /// segment: a `Maybe` block is evaluated on those columns alone and only
+    /// the rows that match have their attributes read.
+    evaluate: Option<Evaluate<'a>>,
+}
+
+/// What evaluating a `Maybe` block needs: the predicate, the positions of the
+/// columns it reads, and the scan's one planner for its `And`.
+struct Evaluate<'a> {
+    predicate: &'a Predicate,
+    fields: Vec<usize>,
+    passes: Arc<Mutex<Passes>>,
 }
 
 impl Source<'_> {
@@ -135,12 +160,29 @@ impl Source<'_> {
         while s.docs.ran_dry() {
             let block = s.docs.next_block;
             s.docs.next_block += 1;
-            let rows = s.segment.doc_block(block).await?;
-            let entries = rows.into_iter().map(|(id, attrs)| Entry {
-                id,
-                body: Body::Doc(attrs),
-            });
-            push_sorted(&s.segment, &mut s.docs, entries, after.as_deref())?;
+            let verdict = s.verdicts.as_ref().and_then(|v| v.get(block)).copied();
+            let entries = match (verdict, &s.evaluate) {
+                (Some(Tri::Never), _) => non_matching_block(&s.segment, block).await?,
+                (Some(Tri::Maybe), Some(evaluate)) => {
+                    evaluated_block(&s.segment, evaluate, block).await?
+                }
+                _ => s
+                    .segment
+                    .doc_block(block)
+                    .await?
+                    .into_iter()
+                    .map(|(id, attrs)| Entry {
+                        id,
+                        body: Body::Doc(attrs),
+                    })
+                    .collect(),
+            };
+            push_sorted(
+                &s.segment,
+                &mut s.docs,
+                entries.into_iter(),
+                after.as_deref(),
+            )?;
         }
         while s.tombstones.ran_dry() {
             let block = s.tombstones.next_block;
@@ -320,6 +362,71 @@ impl<'a> Merge<'a> {
     }
 }
 
+/// The first row of document block `block`.
+fn first_row(block: usize) -> u32 {
+    u32::try_from(block * BLOCK_ROWS).unwrap_or(u32::MAX)
+}
+
+/// Document block `block` of a segment whose zone map rules the predicate out
+/// for every row: the ids alone, each `NonMatchingDoc`, so every row still
+/// shadows an older source's copy and none costs an attribute read.
+async fn non_matching_block(segment: &RangedSegment<'_>, block: usize) -> Result<Vec<Entry>> {
+    Ok(segment
+        .id_block(block)
+        .await?
+        .into_iter()
+        .map(|id| Entry {
+            id,
+            body: Body::NonMatchingDoc,
+        })
+        .collect())
+}
+
+/// Document block `block` of a version 3 segment whose zone maps could not
+/// decide the predicate: its ids and only the columns the predicate reads are
+/// fetched, the rows that match get their attributes read, and every other row
+/// is `NonMatchingDoc`. A block no row of which matches costs its ids and those
+/// columns, not its attribute block.
+async fn evaluated_block(
+    segment: &RangedSegment<'_>,
+    evaluate: &Evaluate<'_>,
+    block: usize,
+) -> Result<Vec<Entry>> {
+    let (ids, columns) = futures::try_join!(
+        segment.id_block(block),
+        segment.columns_of(block, &evaluate.fields)
+    )?;
+    if ids.len() != columns.rows() {
+        return Err(segment.corrupt("an id block and its attribute block differ in length"));
+    }
+    let hits =
+        evaluate
+            .predicate
+            .on_columns_planned(&columns, &Bitmap::full(ids.len()), &evaluate.passes);
+    let first = first_row(block);
+    let wanted: Vec<u32> = (0..ids.len())
+        .filter(|&i| hits.get(i))
+        .map(|i| first + i as u32)
+        .collect();
+    let attrs = if wanted.is_empty() {
+        Vec::new()
+    } else {
+        segment.attrs_of(&wanted).await?
+    };
+    let mut matched = wanted.iter().copied().zip(attrs).peekable();
+    Ok(ids
+        .into_iter()
+        .zip(first..)
+        .map(|(id, row)| {
+            let body = match matched.next_if(|(r, _)| *r == row) {
+                Some((_, attrs)) => Body::Doc(attrs),
+                None => Body::NonMatchingDoc,
+            };
+            Entry { id, body }
+        })
+        .collect())
+}
+
 /// Every live segment as a source, in order, opened in parallel.
 async fn open_sources<'a>(open: &Open<'a>, ids: &'a [String]) -> Result<Vec<Source<'a>>> {
     // Indexed by position, not mapped over borrowed values: see
@@ -330,10 +437,33 @@ async fn open_sources<'a>(open: &Open<'a>, ids: &'a [String]) -> Result<Vec<Sour
         .buffered(FETCH_CONCURRENCY)
         .try_collect()
         .await?;
-    Ok(opened
-        .into_iter()
-        .map(|segment| segment_source(segment, open.after))
-        .collect())
+    // One planner for the whole scan, so every segment's blocks teach the next
+    // block which conjunct rejects most.
+    let passes = Arc::new(
+        open.predicate
+            .map_or_else(|| Mutex::new(Passes::new(0)), Predicate::passes),
+    );
+    let mut sources = Vec::with_capacity(opened.len());
+    for segment in opened {
+        let verdicts = match open.predicate {
+            Some(predicate) => segment.block_verdicts(predicate).await?,
+            None => None,
+        };
+        let evaluate = open
+            .predicate
+            .filter(|_| verdicts.is_some())
+            .and_then(|predicate| {
+                let mut names = BTreeSet::new();
+                predicate.fields_into(&mut names);
+                segment.field_positions(names).map(|fields| Evaluate {
+                    predicate,
+                    fields,
+                    passes: Arc::clone(&passes),
+                })
+            });
+        sources.push(segment_source(segment, open.after, verdicts, evaluate));
+    }
+    Ok(sources)
 }
 
 /// Segment `id` opened for ranged reads.
@@ -351,7 +481,12 @@ async fn open_one<'a>(open: &Open<'a>, id: &str) -> Result<RangedSegment<'a>> {
 }
 
 /// A version 2 or 3 segment read from its first block past `after`.
-fn segment_source<'a>(segment: RangedSegment<'a>, after: Option<&str>) -> Source<'a> {
+fn segment_source<'a>(
+    segment: RangedSegment<'a>,
+    after: Option<&str>,
+    verdicts: Option<Vec<Tri>>,
+    evaluate: Option<Evaluate<'a>>,
+) -> Source<'a> {
     let (doc_start, tombstone_start) = match after {
         Some(after) => (
             segment.first_doc_block_after(after),
@@ -376,6 +511,8 @@ fn segment_source<'a>(segment: RangedSegment<'a>, after: Option<&str>) -> Source
         docs,
         tombstones,
         after: after.map(str::to_owned),
+        verdicts,
+        evaluate,
     }))
 }
 
@@ -492,6 +629,7 @@ mod tests {
                 id: e.id.clone(),
                 body: match &e.body {
                     Body::Doc(attrs) => Body::Doc(attrs.clone()),
+                    Body::NonMatchingDoc => Body::NonMatchingDoc,
                     Body::Tombstone => Body::Tombstone,
                 },
             })
@@ -545,6 +683,7 @@ mod tests {
             policy: &policy,
             decoded: None,
             after,
+            predicate: None,
         };
         let ids = vec!["seg".to_string()];
         let mut merge = Merge::open(&open, &ids, async { Ok(Arc::new(Layer::new())) })
